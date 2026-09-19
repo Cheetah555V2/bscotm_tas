@@ -52,6 +52,9 @@ var play_end_sent = false;
 var inject_count = 0;
 var record_after_play = false;
 var resume_from = 0;
+var poll_count = 0;
+var poll_rate = 0;
+var VERBOSE = true;
 
 // ---------------------------------------------------------------------
 // Player state
@@ -152,6 +155,7 @@ Interceptor.attach(gks, {
     },
     onLeave: function (retval) {
         if (!this.ret || !this.ret.equals(POLL_RET)) return;
+        poll_count++;
 
         if (this.vk === 0) {
             if (mode === "record") {
@@ -290,7 +294,19 @@ rpc.exports = {
         }
         return ptr(p);
     },
+
+    getPollRate: function () { return poll_rate; },
+    resetPollCounter: function () {
+        poll_count = 0;
+        poll_rate = 0;
+        return "ok";
+    },
 };
+
+setInterval(function () {
+    poll_rate = poll_count;
+    poll_count = 0;
+}, 1000);
 
 send({ type: "ready", base: base.toString(),
        poll_ret: POLL_RET.toString(),
@@ -413,6 +429,14 @@ class COTMHook:
         sched = {str(f): {str(k): 1 for k in v} for f, v in schedule.items()}
         return self.script.exports_sync.startPlayThenRecord(
             sched, total_frames, stop_at, resume_from)
+
+    def get_poll_rate(self) -> int:
+        """Polls per second from the game's input loop. 0 during loading,
+        ~5000-8000 at the title screen and in-game."""
+        return self.script.exports_sync.getPollRate()
+
+    def reset_poll_counter(self):
+        return self.script.exports_sync.resetPollCounter()
 
     # ---- mode control -----------------------------------------------------
     def start_record(self):

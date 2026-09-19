@@ -392,6 +392,7 @@ class MainWindow:
             engine.saves.restore(DEFAULT_BASELINE_DIR / self.baseline_id)
         engine.launch_game()
         engine.attach()
+        engine.resume()
         try:
             def on_progress(n):
                 self.msg_queue.put(("progress", None,
@@ -429,6 +430,7 @@ class MainWindow:
             engine.saves.restore(DEFAULT_BASELINE_DIR / self.baseline_id)
         engine.launch_game()
         engine.attach()
+        engine.resume()
         try:
             def on_tick(f):
                 st = engine.snapshot_status()

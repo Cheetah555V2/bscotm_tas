@@ -379,6 +379,12 @@ class Engine:
             self.launch_game()
             self.attach()
             self.resume()
+
+            # Wait for the game to finish booting before starting the prelude.
+            self.hook.reset_poll_counter()
+            if not self.wait_for_input_ready(timeout=20.0):
+                print("[!] Proceeding anyway; rewind may be misaligned.")
+            
             try:
                 snapshot = self.play(
                     movie,
@@ -470,6 +476,35 @@ class Engine:
         if not self.mem or self.module_base is None:
             return {}
         return self.mem.snapshot(self.module_base)
+
+    def wait_for_input_ready(self, timeout: float = 20.0,
+                             min_rate: int = 2000,
+                             verbose: bool = True) -> bool:
+        """
+        Block until the game's input poll is running at full speed.
+        The game polls ~0 times/sec during loading, and 5000-8000 times/sec
+        once the title screen is up. We use this as a "boot complete" signal.
+
+        Returns True if the rate reached min_rate within the timeout.
+        """
+        deadline = time.time() + timeout
+        stable_count = 0
+        while time.time() < deadline:
+            rate = self.hook.get_poll_rate()
+            if rate >= min_rate:
+                stable_count += 1
+                if stable_count >= 2:      # require 2 consecutive seconds
+                    if verbose:
+                        print(f"[+] Input poll stable at {rate}/s "
+                              f"— game is ready")
+                    return True
+            else:
+                stable_count = 0
+            time.sleep(0.3)
+        if verbose:
+            print(f"[!] Input poll never reached {min_rate}/s "
+                  f"within {timeout}s")
+        return False
 
 
 # ---------------------------------------------------------------------------
