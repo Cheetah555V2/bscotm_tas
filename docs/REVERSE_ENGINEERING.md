@@ -159,3 +159,287 @@ process.
 
 Pointer chain (CE XML order — deepest offset last in XML, **apply in
 reverse**: deref first, add last):
+
+```
+p0 = *(module_base + 0x48365C)
+p1 = *(p0 + 0x08)
+p2 = *(p1 + 0x6C)
+p3 = *(p2 + 0x20)
+p4 = *(p3 + 0x20)
+p5 = *(p4 + 0x08)
+p6 = *(p5 + 0x84) <- player struct base
+```
+
+
+Fields (offsets from `p6`):
+
+| Offset | Type | Field |
+|---|---|---|
+| `+0x1A0` | f32 | X velocity |
+| `+0x1A4` | f32 | Y velocity |
+| `+0x1AC` | f32 | X position (physics) |
+| `+0x1B0` | f32 | Y position (physics) |
+| `+0x3DC` | u8  | Health |
+| `+0x53C` | f32 | Invisibility timer |
+| `+0x5B8` | f32 | Render X (snaps to ±8 of physics X) |
+| `+0x5BC` | f32 | Render Y |
+
+The X/Y velocity values are plain floats. Walking speed is `±1.3333`.
+The `+0x1A0` float reads `-1`, `0`, or `+1` — this is a direction
+indicator, not the actual velocity (which is `1.3333`). The render
+coordinates at `+0x5B8` snap back toward the physics coordinates with
+a spring-like offset of ~8 units per frame.
+
+---
+
+## Frame pacing
+
+The game holds 60 fps through a mechanism we could **not** definitively
+identify. We were able to enumerate the relevant threads and their
+behaviour:
+
+### Pacer thread (`cotm.3dcc6e` entry)
+
+The pacer thread's top-level function is at `cotm.31ccc5`. It is a
+**task dispatcher** that:
+- Fires ~60 times per second during normal play
+- Fires 1–5 times/second during transitions (menu, stage load)
+- Holds no locks at the loop top (`cotm.2a48a0`)
+
+The loop body:
+
+```
+cotm.2a48a0 <-- loop top
+...
+cotm.2a4933 comiss xmm1, xmm0
+cotm.2a4936 jbe cotm.2a495c ; not enough time elapsed
+cotm.2a4938 cmp byte [esi], 1 ; <-- frame boundary
+cotm.2a493b jne cotm.2a494d
+cotm.2a493d ...
+cotm.2a4946 call cotm.293070 ; per-frame work
+cotm.2a494b jmp cotm.2a4964
+cotm.2a494d ...
+cotm.2a4955 call cotm.293070 ; per-frame work (alternate)
+cotm.2a495a jmp cotm.2a4964
+cotm.2a495c push 0
+cotm.2a495e call Sleep ; Sleep(0) — yields CPU
+cotm.2a4964 call cotm.2a4630 ; exit check
+cotm.2a496d test al, al
+cotm.2a496f je cotm.2a48a0 ; loop
+```
+
+
+`Sleep(0)` returns almost immediately, so the loop spins at high frequency
+checking the clock until the timer target expires. When the target expires,
+it runs the frame work once.
+
+### Per-frame work (`cotm.293070`)
+
+This function is called once per frame. It:
+- Reads timing via `QueryPerformanceCounter`/`QueryPerformanceFrequency`
+- Calls `cotm.352c00` to update the timestamp
+- Reads/writes various engine objects
+- Ends with `EnterCriticalSection`/`LeaveCriticalSection` pairs
+
+Putting a software breakpoint here causes an immediate crash. Putting a
+hardware breakpoint here also crashes when multiple threads are targeted.
+
+### Logic thread
+
+A second thread signals `SetEvent` 60 times/second from `cotm.29df7e`.
+Its stack includes `USER32!GetMessage` / `win32u!NtUserGetMessage`,
+suggesting it's driven by the Windows message pump. The full stack shows
+`user32!DispatchMessageW` calling into `cotm.2a342f` which calls
+`cotm.29df7e`.
+
+### Third thread
+
+A third thread signals `SetEvent` 60 times/second from `cotm.2932c5`. Its
+immediate caller is `cotm.2a494b`, so it lives on the pacer thread.
+
+### What consumes the 16.7 ms gap
+
+None of `Sleep`, `SleepEx`, `NtDelayExecution`, `QueryPerformanceCounter`,
+`WaitForSingleObject` at INFINITE, `NtSetTimer2`, or any DirectX Present
+call accounts for the 16.7 ms per frame. The gap is inside COTM.exe code
+between the two `SetEvent` sites. We could not pursue this further because
+every hook we attempted in that region crashed the process.
+
+**This is the biggest open question for anyone continuing this work.**
+
+---
+
+## Save file layout
+
+`exe/GameData00.bin` … `exe/GameData07.bin` = save slots 1–8.
+`exe/SystemData.bin` = mode unlocks + keybinds.
+
+### Critical facts
+
+- The game treats save-slot **file existence** as authoritative. Deleting
+  or renaming a `GameData*.bin` while the game is closed causes a
+  corruption prompt on next launch. **Always modify save files by
+  overwriting (same filename) or leave them alone.**
+- The game reads all save files **once at boot**, before any user
+  interaction. Loading a save in the menu is purely an in-memory selection.
+- The game writes save files on **clean exit** and possibly on level
+  transitions. There is no mid-level autosave. A save file does **not**
+  encode the player's current position within a stage — only level
+  progress, upgrades, and character unlocks.
+- Because of the above, **save-file snapshots cannot be used as TAS
+  checkpoints.** Re-launching with a "stage 1 start" save puts you at the
+  title screen; the game only enters Stage 1 when the player selects it
+  from the menu.
+
+### Corrupting a save
+
+If you accidentally delete a save file while the game is closed, the fix
+is to close the game and restore `GameData*.bin` from a backup. Do not
+launch the game with a missing file — the corruption prompt resets all
+data.
+
+---
+
+## Resource formats
+
+`Data/` files are named with the **MD5 hash of the original filename**:
+```
+hashlib.md5(b"Data/Title.ttb").hexdigest()
+-> f0ec225d271b4b35ad770f1c387f4102
+```
+
+### Decompiler
+
+The community tool at
+[github.com/Giza/inti-Creates-encdec-tool](https://github.com/Giza/inti-Creates-encdec-tool)
+decrypts all `Data/` files. Usage:
+
+```
+python inti_encdec.py d <filetype> <input_file> <output_file>
+```
+
+### Filetype → extension map
+
+| Type | Extension | Content |
+|---|---|---|
+| `txt` | `.ttb`, `.tb2` | Text resource (zlib-compressed after 4-byte header) |
+| `bft` | `.bfb` | BMP font (no `BM` magic — starts with u32 header fields) |
+| `obj` | `.osb` | Objects / sprite data |
+| `scroll` | `.scb` | Stage background |
+| `set` | `.stb` | Stage setup |
+| `snd` | `.bisar` | Sound index |
+| `json`, `json2` | (config) | Configuration |
+| `save1`, `save2`, `save3` | (save data) | `save3` requires SteamID |
+
+### Filename mapping
+
+After decryption, the original filename is found by hashing candidate
+names from `COTM.exe` strings. Known matches:
+
+- `f0ec225d271b4b35ad770f1c387f4102` = `Data/Title.ttb`
+- `000f0f5e14965b9995cbf6351a2aab3c` = `Data/GraphicText02_en.osb`
+- `122d8ea252533a501d9999e2301b2506` = `Data/GameOver.ttb`
+
+Many files (87 out of 383) could not be matched to a string in the
+executable — these are likely referenced by numeric ID or built from
+concatenated parts at runtime.
+
+---
+
+## Save/replay flow
+
+The rewind mechanism works by:
+
+1. Kill COTM.exe
+2. Launch a fresh copy (via `frida.spawn` so we can attach before boot)
+3. Wait for the input poll rate to stabilise (see below)
+4. Play the prelude (from title screen to first controllable frame)
+5. Play the movie up to the target frame
+6. Snapshot the state
+
+### Boot detection
+
+The input poll rate is used as a proxy for "the game is ready":
+
+- During the INTI logo and loading screens: 0 polls/second
+- Once the title screen is fully loaded: ~5000–8000 polls/second
+- During gameplay: same rate
+
+We wait for two consecutive seconds of `poll_rate > 2000` before starting
+the prelude. This is implemented via `getPollRate()` / `resetPollCounter()`
+RPC calls and `Engine.wait_for_input_ready()`.
+
+Without this wait, the prelude's first inputs (Enter presses) fire during
+the INTI logo screen and are consumed by nothing, causing the entire
+prelude to desync. Whether this happens depends on disk cache state —
+cold cache (slow) usually works, hot cache (fast) usually doesn't.
+
+---
+
+## What didn't work (summary)
+
+In addition to the anti-tamper findings above:
+
+- **Hooking `CreateFileW` on save files at runtime:** no reads happen
+  outside of boot. The game reads all saves once and caches them.
+- **Full-process memory snapshots (Hourglass-style):** 132 MB heap +
+  D3D9 + XAudio2 + DirectInput state written back into the live process
+  deadlocks 2 out of 15 threads within seconds. Snapshot/restore itself
+  takes <100 ms.
+- **Autosave-based checkpoints:** game only writes save files at level
+  transitions; there is no mid-level save to anchor on.
+- **QueryPerformanceCounter scaling (5×):** speeds up audio playback but
+  not game logic — the audio subsystem and game logic use separate time
+  bases, and QPC is only the audio one.
+- **Sleep/SleepEx/NtDelayExecution zeroing:** the game's 16.7 ms wait is
+  not in any Windows API — it's inside COTM.exe code we can't hook.
+
+---
+
+## Open questions for future work
+
+1. **What actually consumes the 16.7 ms per frame?** The pacer thread's
+   loop spins on `Sleep(0)` + QPC check. When the time target expires, it
+   calls `cotm.293070`. Between `cotm.293070` returning and the next loop
+   iteration, the elapsed time should be tiny. Yet each frame takes
+   16.7 ms. The time must be consumed inside `cotm.293070` or its
+   callees — but every attempt to break there crashes.
+
+2. **How does the game detect debug registers?** No VEH, no UEF, no
+   `NtGetContextThread` calls. The detection must happen below the API
+   level — a driver, a hardware feature, or a timing check we haven't
+   identified.
+
+3. **Can the pacer's timer check be spoofed?** The loop compares QPC
+   against a stored target. If we could read/write that target from
+   outside the process (via `ReadProcessMemory`/`WriteProcessMemory` on
+   a known static address), we might be able to shorten it. We didn't
+   locate a suitable static address during this work.
+
+4. **Where is the RNG state?** We never investigated. Likely an LCG or
+   Mersenne Twister in the game's data section, seeded from `timeGetTime`
+   or `QueryPerformanceCounter` at boot. Finding it would enable seeded
+   runs (useful for practice and for verifying determinism against a
+   known reference).
+
+5. **Is DirectInput the true input path for gamepads?** The game uses
+   `DirectInput8Create` (confirmed by import scan). We never hooked
+   `IDirectInputDevice8::GetDeviceState` because keyboard TAS was the
+   priority. A future controller-support effort would start there.
+
+---
+
+## Contributing
+
+If you have experience with Windows anti-tamper, kernel-mode debugging,
+or game engine internals and want to attack the frame-pacing or
+anti-tamper problems:
+
+- Open an issue describing your approach
+- The most valuable contribution would be identifying the 16.7 ms
+  consumer inside `cotm.293070`
+- Second-most valuable: explaining why hardware breakpoints trigger an
+  immediate access-violation at `EIP=0x0` when set on the pacer thread
+
+All findings should be reproducible from a fresh install of COTM v1.1.2
+and the tools listed at the top of this document.
