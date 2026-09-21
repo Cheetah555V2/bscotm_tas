@@ -366,6 +366,7 @@ class Engine:
                   target_frame: int,
                   prelude: Movie | None = None,
                   known_save_state: str | Path | None = None,
+                  keep_running: bool = False,
                   on_progress: Callable[[int, int], None] | None = None):
         if self.is_game_running():
             self.detach()
@@ -397,8 +398,9 @@ class Engine:
             finally:
                 try: self.detach()
                 except Exception: pass
-                try: self.kill_game()
-                except Exception: pass
+                if not keep_running:
+                    try: self.kill_game()
+                    except Exception: pass
         return snapshot or {}
 
     def resume(self):

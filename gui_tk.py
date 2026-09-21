@@ -469,6 +469,7 @@ class MainWindow:
         snapshot = engine.rewind_to(self.movie, target_frame=target,
                                     prelude=prelude,
                                     known_save_state=baseline_path,
+                                    keep_running=True,
                                     on_progress=on_progress)
         return snapshot or {}
 
