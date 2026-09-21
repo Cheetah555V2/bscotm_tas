@@ -54,7 +54,7 @@ var record_after_play = false;
 var resume_from = 0;
 var poll_count = 0;
 var poll_rate = 0;
-var VERBOSE = true;
+var VERBOSE = VERBOSE_PLACEHOLDER;
 
 // ---------------------------------------------------------------------
 // Player state
