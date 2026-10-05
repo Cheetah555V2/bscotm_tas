@@ -443,3 +443,31 @@ anti-tamper problems:
 
 All findings should be reproducible from a fresh install of COTM v1.1.2
 and the tools listed at the top of this document.
+---
+
+## Update: frame pacing solved (fast-forward)
+
+The "what consumes the 16.7 ms" question above has an answer: **two things
+together pace the game, and each alone is enough to hold 60 fps.**
+
+1. The game's own limiter reads `QueryPerformanceCounter` (about 1000 calls/s
+   from COTM.exe) and spins on `Sleep(0)` until a frame is due. It never calls
+   `timeGetTime` or `GetSystemTimeAsFileTime`.
+2. The D3D9 device is created with vsync (`Present` blocks until vblank).
+
+Scaling only QPC (the earlier experiment) changes nothing because vsync still
+holds 60 fps; removing only vsync changes nothing because the QPC limiter holds
+60 fps. Do both and the game runs as fast as one frame of work takes (~440
+frames/s on the dev machine).
+
+How (all in `src/hook.cpp`, nothing touches COTM.exe's `.text`):
+- IAT-patch QPC / `timeGetTime` / `GetSystemTimeAsFileTime` / `Sleep` /
+  `WaitForSingleObject(Ex)` in COTM.exe so only the game sees scaled time
+  (virtual = base + (real - base) * speed, re-based on every speed change).
+- IAT-patch `Direct3DCreate9`, then swap `IDirect3D9::CreateDevice` (slot 16 of
+  d3d9.dll's vtable) for a wrapper that sets `PresentationInterval` to
+  `D3DPRESENT_INTERVAL_IMMEDIATE`.
+
+Determinism check: the 1461-frame prelude ends at the same player state
+(HP 12, X 496, Y 1712) at 1x, 4x, 8x, 16x and 50x. The hook returns to 1x on the
+exact frame replay ends, so recording from the cursor is always real time.
