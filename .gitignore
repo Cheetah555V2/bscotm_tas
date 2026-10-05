@@ -18,3 +18,7 @@ Thumbs.db
 # Editor
 .vscode/
 .idea/
+# C++ build
+build/
+*.o
+bscotm_tas.ini

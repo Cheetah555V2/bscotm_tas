@@ -1,0 +1,193 @@
+#include "engine.h"
+#include "common.h"
+#include <tlhelp32.h>
+#include <string.h>
+
+#if !defined(BSCOTM_ALLOW_64BIT) && defined(_WIN64)
+#error "Build the host as 32-bit: it injects a 32-bit DLL into the 32-bit game."
+#endif
+
+static const wchar_t* const SAVE_FILES[] = {
+    L"GameData00.bin", L"GameData01.bin", L"GameData02.bin", L"GameData03.bin",
+    L"GameData04.bin", L"GameData05.bin", L"GameData06.bin", L"GameData07.bin",
+    L"SystemData.bin",
+};
+
+static std::wstring DirOf(const std::wstring& p) {
+    size_t i = p.find_last_of(L"\\/");
+    return i == std::wstring::npos ? L"." : p.substr(0, i);
+}
+
+static void MkDirs(const std::wstring& d) {
+    if (d.empty() || GetFileAttributesW(d.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    MkDirs(DirOf(d));
+    CreateDirectoryW(d.c_str(), nullptr);
+}
+
+// ---- saves -----------------------------------------------------------------
+// The game treats save-file existence as authoritative, so we only ever copy
+// over existing names; nothing is deleted or renamed.
+static int CopySaves(const std::wstring& from, const std::wstring& to) {
+    MkDirs(to);
+    int n = 0;
+    for (const wchar_t* f : SAVE_FILES)
+        if (CopyFileW((from + L"\\" + f).c_str(), (to + L"\\" + f).c_str(), FALSE)) n++;
+    return n;
+}
+
+bool SaveBaseline(const std::wstring& exe, const std::wstring& dir, std::string& err) {
+    if (GameRunning()) { err = "Close COTM.exe first: baselines are taken from the files on disk."; return false; }
+    if (!CopySaves(DirOf(exe), dir)) { err = "No save files found next to COTM.exe."; return false; }
+    return true;
+}
+
+// ---- process helpers -------------------------------------------------------
+static bool FindGamePid(DWORD* pid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W e{};
+    e.dwSize = sizeof e;
+    bool found = false;
+    for (BOOL ok = Process32FirstW(snap, &e); ok && !found; ok = Process32NextW(snap, &e))
+        if (!_wcsicmp(e.szExeFile, L"COTM.exe")) { *pid = e.th32ProcessID; found = true; }
+    CloseHandle(snap);
+    return found;
+}
+
+bool GameRunning() { DWORD pid; return FindGamePid(&pid); }
+
+void KillGame() {
+    DWORD pid;
+    while (FindGamePid(&pid)) {
+        HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+        if (!h) return;
+        TerminateProcess(h, 0);
+        WaitForSingleObject(h, 5000);
+        CloseHandle(h);
+    }
+}
+
+// Returns nullptr on success, else a short description of what failed.
+static const char* Inject(HANDLE proc, const std::wstring& dll) {
+    SIZE_T bytes = (dll.size() + 1) * sizeof(wchar_t);
+    void* mem = VirtualAllocEx(proc, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!mem) return "VirtualAllocEx failed";
+    const char* err = nullptr;
+    auto ll = (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
+    if (!WriteProcessMemory(proc, mem, dll.c_str(), bytes, nullptr)) {
+        err = "WriteProcessMemory failed";
+    } else if (HANDLE t = CreateRemoteThread(proc, nullptr, 0, ll, mem, 0, nullptr)) {
+        DWORD code = 0;
+        if (WaitForSingleObject(t, 20000) != WAIT_OBJECT_0) err = "LoadLibrary timed out";
+        else if (!GetExitCodeThread(t, &code) || !code) err = "LoadLibrary returned NULL (DLL missing or failed to load)";
+        CloseHandle(t);
+    } else {
+        err = "CreateRemoteThread failed";
+    }
+    VirtualFreeEx(proc, mem, 0, MEM_RELEASE);
+    return err;
+}
+
+// ---- the job ---------------------------------------------------------------
+RunResult RunJob(const RunParams& p, const RunCallbacks& cb) {
+    RunResult r;
+    auto report = [&](Phase ph, uint32_t f) { if (cb.progress) cb.progress(cb.ctx, ph, f); };
+    auto stopped = [&] { return cb.stop && *cb.stop; };
+
+    uint64_t total = (uint64_t)p.prelude.size() + p.target;
+    if (total >= MAX_FRAMES) { r.error = "Movie is too long for the shared frame buffer."; return r; }
+    if (p.target > p.movie.size()) { r.error = "Target is past the end of the movie."; return r; }
+
+    report(PH_LAUNCH, 0);
+    KillGame();
+    if (!p.baseline.empty()) {
+        if (!p.backup_dir.empty()) CopySaves(DirOf(p.exe), p.backup_dir);
+        CopySaves(p.baseline, DirOf(p.exe));
+    }
+
+    HANDLE map = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Shm), SHM_NAME);
+    if (!map) { r.error = "CreateFileMapping failed."; return r; }
+    Shm* s = (Shm*)MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    if (!s) { CloseHandle(map); r.error = "MapViewOfFile failed."; return r; }
+    memset(s, 0, sizeof(Shm));
+    s->magic = SHM_MAGIC;
+
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    std::wstring cwd = DirOf(p.exe);
+    std::wstring cmd = L"\"" + p.exe + L"\"";
+    auto cleanup = [&] {
+        if (pi.hProcess) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+        UnmapViewOfFile(s);
+        CloseHandle(map);
+    };
+
+    if (!CreateProcessW(p.exe.c_str(), &cmd[0], nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr,
+                        cwd.c_str(), &si, &pi)) {
+        r.error = "Could not start COTM.exe (check the game path).";
+        cleanup();
+        return r;
+    }
+    const char* ierr = Inject(pi.hProcess, p.dll);
+    if (ierr || !(s->status & ST_HOOKED)) {
+        r.error = ierr ? std::string("Could not inject bscotm_hook.dll: ") + ierr
+                       : (s->status & ST_HOOK_FAIL)
+                             ? "Hook DLL loaded, but GetAsyncKeyState was not found in the game's imports."
+                             : "Hook DLL loaded but could not open the shared memory.";
+        TerminateProcess(pi.hProcess, 0);
+        cleanup();
+        return r;
+    }
+    // Combined schedule: prelude, then movie[0 .. target). It is armed BEFORE the
+    // game runs, so frame 1 of the schedule is the game's own first frame marker.
+    // (Starting after a wall-clock "ready" wait made the start frame vary from
+    // boot to boot, which desynced the prelude.)
+    memcpy(s->keys, p.prelude.data(), p.prelude.size() * sizeof(uint16_t));
+    memcpy(s->keys + p.prelude.size(), p.movie.data(), p.target * sizeof(uint16_t));
+    s->frame = 0;
+    s->stop_at = (uint32_t)total;
+    s->then_record = p.record ? 1 : 0;
+    s->speed_milli = p.speed_milli;
+    s->speed_mask = p.speed_mask;
+    s->status &= ~(ST_PLAY_END | ST_RESUMED);
+    MemoryBarrier();
+    s->mode = M_PLAY;
+    ResumeThread(pi.hThread);
+    report(PH_BOOT, 0);
+    const DWORD boot_t0 = GetTickCount();
+
+    const uint32_t pre = (uint32_t)p.prelude.size();
+    bool recording = false;
+    for (;;) {
+        Sleep(30);
+        if (stopped()) break;
+        if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) { r.error = "The game exited."; break; }
+        uint32_t st = s->status;
+        if (!s->frame) {
+            if (GetTickCount() - boot_t0 > 90000) { r.error = "The game never started polling input."; break; }
+            continue;
+        }
+        if (!recording) {
+            uint32_t f = s->frame > pre ? s->frame - pre : 0;
+            report(PH_PLAY, f > p.target ? p.target : f);
+            if (st & ST_PLAY_END) { r.played = p.target; r.ok = true; break; }
+            if (st & ST_RESUMED) recording = true;
+        }
+        if (recording) report(PH_RECORD, s->rec_count > pre ? s->rec_count - pre : 0);
+    }
+
+    s->mode = M_IDLE;       // hand the keyboard back; the game keeps running
+    MemoryBarrier();
+    if (recording) {
+        uint32_t end = s->rec_count, begin = (uint32_t)total;
+        if (end > begin) r.recorded.assign(s->keys + begin, s->keys + end);
+        r.first = p.target;
+        r.ok = true;
+    } else if (!r.ok && r.error.empty()) {
+        r.error = "Stopped.";
+        r.played = s->frame > pre ? s->frame - pre : 0;
+    }
+    cleanup();      // the hook keeps its own view of the shared block
+    return r;
+}
