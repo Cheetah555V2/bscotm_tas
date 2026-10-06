@@ -471,3 +471,23 @@ How (all in `src/hook.cpp`, nothing touches COTM.exe's `.text`):
 Determinism check: the 1461-frame prelude ends at the same player state
 (HP 12, X 496, Y 1712) at 1x, 4x, 8x, 16x and 50x. The hook returns to 1x on the
 exact frame replay ends, so recording from the cursor is always real time.
+
+---
+
+## Update: window focus gates input
+
+The game ignores keyboard input while its window is not the active window, but keeps
+running logic and graphics. COTM.exe imports no focus query (`GetForegroundWindow`,
+`GetFocus`, `GetActiveWindow` are all absent from USER32), so the state comes from
+window messages (`WM_ACTIVATEAPP`, `WM_ACTIVATE`, `WM_KILLFOCUS`, ...) handled in its
+window procedure. This also affects injected input: with another window focused, the
+scripted `GetAsyncKeyState` results had no effect (player stayed at X 496 instead of
+moving to 549.33).
+
+Fix (in `src/hook.cpp`): IAT-patch `CreateWindowExA`, subclass the game's top-level
+window with `SetWindowLongA(GWL_WNDPROC)`, force `WM_ACTIVATEAPP`/`WM_NCACTIVATE` to
+TRUE and `WM_ACTIVATE` to `WA_ACTIVE`, drop `WM_KILLFOCUS`, and post one synthetic
+activation at creation. The game then behaves as always focused, so the hook gates live
+(non-injected) keys itself: they are only reported while `GetForegroundWindow()` is the
+game window. Verified: with Notepad focused the stepped result is identical (X 549.33,
+Y 1748.56), and keys typed into Notepad are not recorded.

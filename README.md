@@ -32,6 +32,11 @@ back. The whole tool is two small native files (no Python, no Frida):
   frame marker (before the frame's input is read) and releases it one frame per step.
   The virtual clock is frozen during the hold so the limiter does not see the pause
   as elapsed time. The game survives long holds (tested: 20 s).
+- **Focus.** The game only accepts input while its window is active, which it learns
+  from window messages (it imports no focus query). The hook wraps its window
+  procedure so it never sees a deactivation, so scripted input and frame advance work
+  even while the editor has focus. Live keys (recording, resume) are gated on the
+  game window really being in the foreground, so typing in the editor never leaks in.
 - Details and every finding: [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md).
 
 ## Build
@@ -83,6 +88,7 @@ otherwise use **File > Set game path**.
 | **Play** (F5) | Relaunch the game and play the whole movie in real time |
 | **Rewind to cursor** (F6, or double-click a frame number) | Relaunch, fast-forward to the cursor row, then **freeze** the game there |
 | **Frame advance** (`.`) | Run exactly one frame of the frozen game using the next grid row's inputs (hold `.` to auto-repeat) |
+| **Record here** (F12) | Unfreeze the game and record your live keyboard from the frozen frame (click the game window and play). **Stop** (F9) freezes the game again right after the last recorded frame, so you can keep stepping or record again |
 | **Resume live** (F11) | Unfreeze the game and take over with the keyboard (not recorded) |
 | **Record from cursor** (F7) | Play up to the cursor row, then record live from the next frame |
 | **Stop** (F9) | End the current run |
