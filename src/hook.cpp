@@ -108,6 +108,39 @@ static void* WINAPI H_D3dCreate(UINT ver) {
     return d3d;
 }
 
+// ---- focus ---------------------------------------------------------------------
+// The game only accepts input while its window is active (it learns that from window
+// messages; it imports no focus query), so scripted input stopped working the moment
+// the editor had focus. We wrap its window procedure so it never sees a deactivation
+// and tell it once that it is active. Live keys are then gated here instead, on the
+// window really being the foreground window, so typing in the editor cannot leak in.
+static HWND    GameWnd;
+static WNDPROC OrigProc;
+static bool    Focused = true;
+static HWND (WINAPI *R_Cwe)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+
+static LRESULT CALLBACK H_Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_ACTIVATEAPP: case WM_NCACTIVATE: w = TRUE; break;
+        case WM_ACTIVATE: w = WA_ACTIVE; break;
+        case WM_KILLFOCUS: return 0;
+    }
+    return CallWindowProcA(OrigProc, h, m, w, l);
+}
+
+static HWND WINAPI H_Cwe(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y, int w, int h,
+                         HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
+    HWND wnd = R_Cwe(ex, cls, name, style, x, y, w, h, parent, menu, inst, param);
+    if (wnd && !parent && !GameWnd) {       // the game's top-level window
+        GameWnd = wnd;
+        OrigProc = (WNDPROC)(uintptr_t)SetWindowLongA(wnd, GWL_WNDPROC, (LONG)(uintptr_t)H_Wnd);
+        PostMessageA(wnd, WM_ACTIVATEAPP, TRUE, 0);
+        PostMessageA(wnd, WM_ACTIVATE, WA_ACTIVE, 0);
+        PostMessageA(wnd, WM_SETFOCUS, 0, 0);
+    }
+    return wnd;
+}
+
 // ---- frame advance: block the game thread at a frame marker ----------------------
 // The game is stopped before frame f reads its input, so the host can still edit
 // keys[f - 1]. The virtual clock is frozen meanwhile; otherwise the limiter would
@@ -126,6 +159,7 @@ static void Hold(Shm* s, uint32_t f) {
     VirtBase = frozen;
     RealBase = q.QuadPart;
     LeaveCriticalSection(&Cs);
+    if (s->mode == M_RECORD) Cur = 0;       // recording starts from a clean frame
     s->paused = 0;
 }
 
@@ -163,15 +197,18 @@ static __attribute__((noinline)) SHORT WINAPI H_Gaks(int vk) {
     if ((uintptr_t)__builtin_return_address(0) != PollRet) return r;
     Shm* s = S;
     s->polls++;
-    if (vk == 0) { Marker(s); return r; }       // table index 0 = frame boundary
-    if ((unsigned)vk > 255 || BitOf[vk] == 0xFF) return r;
-    uint32_t b = BitOf[vk];
-    if (s->mode == M_RECORD) {
-        if (r & 0x8000) Cur |= 1u << b;
-    } else if (s->mode == M_PLAY) {
+    if (vk == 0) {                              // table index 0 = frame boundary
+        Focused = !GameWnd || GetForegroundWindow() == GameWnd;
+        Marker(s);
+        return r;
+    }
+    uint32_t b = ((unsigned)vk > 255) ? 0xFF : BitOf[vk];
+    if (b != 0xFF && s->mode == M_PLAY) {
         uint32_t f = s->frame;
         return ((s->keys[f ? f - 1 : 0] >> b) & 1) ? (SHORT)0x8000 : (SHORT)0;
     }
+    if (!Focused) return 0;                     // live keys only count in the focused game
+    if (b != 0xFF && s->mode == M_RECORD && (r & 0x8000)) Cur |= 1u << b;
     return r;
 }
 
@@ -231,6 +268,7 @@ static void Init() {
         PatchIat(exe, "kernel32.dll", "WaitForSingleObject", (void*)H_Wait, &R_Wait);
         PatchIat(exe, "kernel32.dll", "WaitForSingleObjectEx", (void*)H_WaitEx, &R_WaitEx);
     }
+    PatchIat(exe, "user32.dll", "CreateWindowExA", (void*)H_Cwe, &R_Cwe);
     PatchIat(exe, "d3d9.dll", "Direct3DCreate9", (void*)H_D3dCreate, &R_D3dCreate);
     S->status |= ok ? ST_HOOKED : ST_HOOK_FAIL;
 }
