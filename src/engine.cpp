@@ -88,14 +88,53 @@ static const char* Inject(HANDLE proc, const std::wstring& dll) {
     return err;
 }
 
+// ---- session ----------------------------------------------------------------
+bool Session::Alive() const { return proc && WaitForSingleObject(proc, 0) != WAIT_OBJECT_0; }
+
+uint32_t Session::Row() const {
+    if (!s || !s->paused) return (uint32_t)-1;
+    return s->paused - 1 - pre;
+}
+
+bool Session::Step(uint16_t keys) {
+    if (!s || !s->paused) return false;
+    uint32_t f = s->paused;
+    s->keys[f - 1] = keys;
+    MemoryBarrier();
+    s->advance = 1;
+    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 3000;) {
+        if (s->paused == f + 1) return true;
+        if (!Alive()) return false;
+        Sleep(1);
+    }
+    return false;
+}
+
+void Session::Release() {
+    if (s) {
+        s->mode = M_IDLE;
+        MemoryBarrier();
+        s->hold = 0;
+    }
+    Close();
+}
+
+void Session::Close() {
+    if (proc) { CloseHandle(thread); CloseHandle(proc); }
+    if (s) UnmapViewOfFile(s);
+    if (map) CloseHandle(map);
+    proc = thread = map = nullptr;
+    s = nullptr;
+}
+
 // ---- the job ---------------------------------------------------------------
-RunResult RunJob(const RunParams& p, const RunCallbacks& cb) {
+RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     RunResult r;
     auto report = [&](Phase ph, uint32_t f) { if (cb.progress) cb.progress(cb.ctx, ph, f); };
     auto stopped = [&] { return cb.stop && *cb.stop; };
 
     uint64_t total = (uint64_t)p.prelude.size() + p.target;
-    if (total >= MAX_FRAMES) { r.error = "Movie is too long for the shared frame buffer."; return r; }
+    if (total + 2 >= MAX_FRAMES) { r.error = "Movie is too long for the shared frame buffer."; return r; }
     if (p.target > p.movie.size()) { r.error = "Target is past the end of the movie."; return r; }
 
     report(PH_LAUNCH, 0);
@@ -105,10 +144,12 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb) {
         CopySaves(p.baseline, DirOf(p.exe));
     }
 
-    HANDLE map = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Shm), SHM_NAME);
-    if (!map) { r.error = "CreateFileMapping failed."; return r; }
-    Shm* s = (Shm*)MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
-    if (!s) { CloseHandle(map); r.error = "MapViewOfFile failed."; return r; }
+    Session ss;
+    ss.pre = (uint32_t)p.prelude.size();
+    ss.map = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Shm), SHM_NAME);
+    if (!ss.map) { r.error = "CreateFileMapping failed."; return r; }
+    Shm* s = ss.s = (Shm*)MapViewOfFile(ss.map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    if (!s) { ss.Close(); r.error = "MapViewOfFile failed."; return r; }
     memset(s, 0, sizeof(Shm));
     s->magic = SHM_MAGIC;
 
@@ -117,18 +158,14 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb) {
     PROCESS_INFORMATION pi{};
     std::wstring cwd = DirOf(p.exe);
     std::wstring cmd = L"\"" + p.exe + L"\"";
-    auto cleanup = [&] {
-        if (pi.hProcess) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
-        UnmapViewOfFile(s);
-        CloseHandle(map);
-    };
-
     if (!CreateProcessW(p.exe.c_str(), &cmd[0], nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr,
                         cwd.c_str(), &si, &pi)) {
         r.error = "Could not start COTM.exe (check the game path).";
-        cleanup();
+        ss.Close();
         return r;
     }
+    ss.proc = pi.hProcess;
+    ss.thread = pi.hThread;
     const char* ierr = Inject(pi.hProcess, p.dll);
     if (ierr || !(s->status & ST_HOOKED)) {
         r.error = ierr ? std::string("Could not inject bscotm_hook.dll: ") + ierr
@@ -136,7 +173,7 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb) {
                              ? "Hook DLL loaded, but GetAsyncKeyState was not found in the game's imports."
                              : "Hook DLL loaded but could not open the shared memory.";
         TerminateProcess(pi.hProcess, 0);
-        cleanup();
+        ss.Close();
         return r;
     }
     // Combined schedule: prelude, then movie[0 .. target). It is armed BEFORE the
@@ -146,8 +183,13 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb) {
     memcpy(s->keys, p.prelude.data(), p.prelude.size() * sizeof(uint16_t));
     memcpy(s->keys + p.prelude.size(), p.movie.data(), p.target * sizeof(uint16_t));
     s->frame = 0;
-    s->stop_at = (uint32_t)total;
     s->then_record = p.record ? 1 : 0;
+    if (p.hold) {
+        s->stop_at = 0xFFFFFFFFu;               // never leaves play mode by itself
+        s->hold_at = (uint32_t)total + 1;       // freeze before the first frame past the target
+    } else {
+        s->stop_at = (uint32_t)total;
+    }
     s->speed_milli = p.speed_milli;
     s->speed_mask = p.speed_mask;
     s->status &= ~(ST_PLAY_END | ST_RESUMED);
@@ -157,8 +199,8 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb) {
     report(PH_BOOT, 0);
     const DWORD boot_t0 = GetTickCount();
 
-    const uint32_t pre = (uint32_t)p.prelude.size();
-    bool recording = false;
+    const uint32_t pre = ss.pre;
+    bool recording = false, held = false;
     for (;;) {
         Sleep(30);
         if (stopped()) break;
@@ -171,13 +213,19 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb) {
         if (!recording) {
             uint32_t f = s->frame > pre ? s->frame - pre : 0;
             report(PH_PLAY, f > p.target ? p.target : f);
+            if (p.hold && s->paused) { held = true; r.played = p.target; r.ok = true; break; }
             if (st & ST_PLAY_END) { r.played = p.target; r.ok = true; break; }
             if (st & ST_RESUMED) recording = true;
         }
         if (recording) report(PH_RECORD, s->rec_count > pre ? s->rec_count - pre : 0);
     }
 
-    s->mode = M_IDLE;       // hand the keyboard back; the game keeps running
+    if (held && keep) {         // hand the frozen game over for frame advance
+        *keep = ss;
+        return r;
+    }
+    s->hold = 0;
+    s->mode = M_IDLE;           // hand the keyboard back; the game keeps running
     MemoryBarrier();
     if (recording) {
         uint32_t end = s->rec_count, begin = (uint32_t)total;
@@ -188,6 +236,6 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb) {
         r.error = "Stopped.";
         r.played = s->frame > pre ? s->frame - pre : 0;
     }
-    cleanup();      // the hook keeps its own view of the shared block
+    ss.Close();         // the hook keeps its own view of the shared block
     return r;
 }

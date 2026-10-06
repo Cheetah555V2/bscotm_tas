@@ -52,5 +52,9 @@ struct Shm {
     volatile uint32_t armed;        // record: first marker seen
     volatile uint32_t speed_milli;  // game clock speed, 1000 = 1x (dropped to 1x when play ends)
     volatile uint32_t speed_mask;   // which clocks run at that speed, see SPEED_*
+    volatile uint32_t hold;         // block the game at the next frame marker (frame advance)
+    volatile uint32_t hold_at;      // arm `hold` when this marker number is reached (0 = off)
+    volatile uint32_t advance;      // frames the host releases while held
+    volatile uint32_t paused;       // marker number the game is blocked at, 0 = running
     uint16_t keys[MAX_FRAMES];
 };

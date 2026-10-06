@@ -108,6 +108,27 @@ static void* WINAPI H_D3dCreate(UINT ver) {
     return d3d;
 }
 
+// ---- frame advance: block the game thread at a frame marker ----------------------
+// The game is stopped before frame f reads its input, so the host can still edit
+// keys[f - 1]. The virtual clock is frozen meanwhile; otherwise the limiter would
+// see the whole pause as elapsed time and run a burst of catch-up frames.
+static void Hold(Shm* s, uint32_t f) {
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    int64_t frozen = VNow(q.QuadPart);
+    s->paused = f;
+    while (s->hold) {
+        if (s->advance) { s->advance--; break; }
+        Sleep(1);
+    }
+    QueryPerformanceCounter(&q);
+    EnterCriticalSection(&Cs);
+    VirtBase = frozen;
+    RealBase = q.QuadPart;
+    LeaveCriticalSection(&Cs);
+    s->paused = 0;
+}
+
 // ---- input -----------------------------------------------------------------
 static void Marker(Shm* s) {
     uint32_t f = s->frame + 1;
@@ -129,6 +150,12 @@ static void Marker(Shm* s) {
             s->mode = M_IDLE;
         }
     }
+    if (s->hold_at && f == s->hold_at) {
+        s->hold_at = 0;
+        s->speed_milli = 1000;          // stepping is always real time
+        s->hold = 1;
+    }
+    if (s->hold) Hold(s, f);
 }
 
 static __attribute__((noinline)) SHORT WINAPI H_Gaks(int vk) {
