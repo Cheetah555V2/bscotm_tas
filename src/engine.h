@@ -42,12 +42,20 @@ struct Session {
     HANDLE map = nullptr, proc = nullptr, thread = nullptr;
     Shm* s = nullptr;
     uint32_t pre = 0;               // prelude length, so movie row = marker - 1 - pre
+    uint32_t rec_start = 0;         // keys[] index where the current live recording began
 
     bool Active() const { return s != nullptr; }
     bool Alive() const;
     uint32_t Row() const;           // movie row the held game runs next, or UINT_MAX if running
     // Runs one frame with `keys` as its input and holds again. False if it timed out.
     bool Step(uint16_t keys);
+    // Unfreezes the game and records the live keyboard (the game window must be
+    // focused). Frame numbers are movie rows starting at Row() at the time of the call.
+    bool StartRecording();
+    uint32_t RecCount() const;      // frames recorded so far
+    // Freezes the game again at the next frame boundary and returns the recorded
+    // frames; stepping can continue afterwards. False if the game did not freeze.
+    bool StopRecording(Frames& out);
     // Lets the game run free (live keyboard). The session is closed afterwards.
     void Release();
     void Close();                   // drops our handles; the game keeps running

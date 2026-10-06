@@ -110,6 +110,36 @@ bool Session::Step(uint16_t keys) {
     return false;
 }
 
+bool Session::StartRecording() {
+    if (!s || !s->paused) return false;
+    rec_start = s->paused - 1;
+    s->rec_count = rec_start;
+    s->armed = 1;                   // the frame we are about to run is the first one recorded
+    s->then_record = 0;
+    s->mode = M_RECORD;
+    MemoryBarrier();
+    s->hold = 0;                    // unfreeze
+    return true;
+}
+
+uint32_t Session::RecCount() const { return s && s->rec_count > rec_start ? s->rec_count - rec_start : 0; }
+
+bool Session::StopRecording(Frames& out) {
+    if (!s) return false;
+    s->hold = 1;                    // the hook flushes the last frame, then blocks
+    bool frozen = false;
+    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 3000;) {
+        if (s->paused) { frozen = true; break; }
+        if (!Alive()) break;
+        Sleep(1);
+    }
+    uint32_t end = s->rec_count;
+    out.clear();
+    if (end > rec_start) out.assign(s->keys + rec_start, s->keys + end);
+    if (frozen) { s->mode = M_PLAY; s->armed = 0; }
+    return frozen;
+}
+
 void Session::Release() {
     if (s) {
         s->mode = M_IDLE;
