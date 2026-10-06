@@ -32,7 +32,16 @@ back. The whole tool is two small native files (no Python, no Frida):
 
 ## Build
 
-The game is 32-bit, so the build needs a **32-bit** MinGW-w64 toolchain:
+### Download
+
+Prebuilt zips (exe + hook DLL) are attached to each
+[release](../../releases). Unzip anywhere and run `bscotm_tas.exe`; keep
+`bscotm_hook.dll` next to it.
+
+### Build it yourself
+
+The game is 32-bit, so the build needs a **32-bit** MinGW-w64 toolchain. With
+[MSYS2](https://www.msys2.org), in an MSYS2 shell:
 
 ```bash
 pacman -S --needed mingw-w64-i686-gcc mingw-w64-i686-make
@@ -44,8 +53,19 @@ Then, from the repo folder:
 build.bat
 ```
 
-(`build.bat` looks in `D:\Code_file\MSYS2\mingw32\bin`; set `MINGW32` to your
-toolchain's `bin` folder if it lives elsewhere.) Output goes to `build\`.
+`build.bat` finds the toolchain by itself: `%MINGW32%` (its `bin` folder), then
+`g++` on `PATH`, then the usual MSYS2 folders (`C:\msys64`, ...). If yours lives
+elsewhere, `set MINGW32=<path>\mingw32\bin` first. From an MSYS2 MINGW32 shell,
+plain `make` works too. Output goes to `build\`.
+
+### Publishing a release (maintainers)
+
+Pushing a tag builds on GitHub Actions and attaches the zip to a new release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## Using it
 

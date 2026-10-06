@@ -1,0 +1,50 @@
+name: build-and-release
+
+# Push a tag like v0.1.0 to build and publish a GitHub release with the zip.
+# Run manually (Actions > build-and-release) to just get the zip as an artifact.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up 32-bit MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          update: false
+          install: mingw-w64-i686-gcc make
+
+      - name: Build
+        shell: msys2 {0}
+        run: make
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = if ($env:GITHUB_REF_TYPE -eq 'tag') { "bscotm-tas-$env:GITHUB_REF_NAME-win32" } else { "bscotm-tas-dev-win32" }
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item build/bscotm_tas.exe, build/bscotm_hook.dll, README.md, LICENSE $name
+          Copy-Item docs -Destination $name -Recurse
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          "ZIP=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP }}
+          path: ${{ env.ZIP }}
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          generate_release_notes: true
