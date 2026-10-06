@@ -21,7 +21,7 @@ enum {
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
     IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
-    IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3,
+    IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME,
     IDC_BASE = 300, IDC_PRE,
 };
 const UINT WM_JOB_PROGRESS = WM_APP + 1;   // wParam = Phase, lParam = movie frame
@@ -38,7 +38,7 @@ struct Step   { std::vector<Splice> parts; int cur_before = 0, cur_after = 0; };
 
 struct App {
     HWND wnd = nullptr, grid = nullptr, status = nullptr, cbBase = nullptr, cbPre = nullptr;
-    HWND lblBase = nullptr, lblPre = nullptr, btn[5] = {};
+    HWND lblBase = nullptr, lblPre = nullptr, btn[6] = {};
     HFONT font = nullptr, fontB = nullptr;
     int dpi = 96;
 
@@ -57,7 +57,10 @@ struct App {
 
     int speed = 3;                // index into SPEEDS: fast-forward while replaying to the cursor
     HMENU speedMenu = nullptr;
-    bool busy = false, jobRecord = false, jobNew = false;
+    Session sess;                 // the frozen game frame advance steps (when Active)
+    Session jobSess;              // handed over by a finished hold job
+    bool pendingStep = false;     // step once the resync job finishes
+    bool busy = false, jobRecord = false, jobNew = false, jobHold = false;
     uint32_t jobTarget = 0;
     volatile LONG stop = 0;
     HANDLE thread = nullptr;
@@ -631,7 +634,7 @@ DWORD WINAPI JobThread(LPVOID a) {
     RunCallbacks cb;
     cb.progress = JobProgress;
     cb.stop = &A.stop;
-    RunResult* r = new RunResult(RunJob(j->p, cb));
+    RunResult* r = new RunResult(RunJob(j->p, cb, j->p.hold ? &A.jobSess : nullptr));
     delete j;
     PostMessageW(A.wnd, WM_JOB_DONE, 0, (LPARAM)r);
     return 0;
@@ -640,13 +643,15 @@ DWORD WINAPI JobThread(LPVOID a) {
 const uint32_t SPEEDS[4] = {1000, 4000, 16000, 50000};
 
 // realtime: ignore the fast-forward setting (watching a movie, not seeking).
-void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false) {
+// hold: leave the game frozen after `target` frames so it can be stepped.
+void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, bool hold = false) {
     if (A.busy || !EnsureGamePath()) return;
     if (!record && !Size()) { MessageBoxW(A.wnd, L"The movie is empty.", L"bscotm-tas", MB_ICONINFORMATION); return; }
     if (!A.exe.empty() && !Exists(A.toolDir + L"\\bscotm_hook.dll")) {
         MessageBoxW(A.wnd, L"bscotm_hook.dll must be next to bscotm_tas.exe.", L"bscotm-tas", MB_ICONERROR);
         return;
     }
+    A.sess.Close();         // the job kills the game; drop our handles first
     JobArgs* j = new JobArgs;
     RunParams& p = j->p;
     p.exe = A.exe;
@@ -670,9 +675,12 @@ void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false) {
     p.target = target;
     p.record = record;
     p.speed_milli = realtime ? 1000 : SPEEDS[A.speed];
-    p.speed_mask = p.speed_milli > 1000 ? SPEED_ALL : 0;
+    // The virtual clock is always on (identical to real time at 1x) so a frozen game
+    // can be thawed without a burst of catch-up frames.
+    p.speed_mask = p.speed_milli > 1000 ? SPEED_ALL : (SPEED_ALL & ~SPEED_NOVSYNC);
+    p.hold = hold;
 
-    A.jobRecord = record; A.jobNew = fresh; A.jobTarget = target;
+    A.jobRecord = record; A.jobNew = fresh; A.jobTarget = target; A.jobHold = hold;
     A.busy = true;
     A.stop = 0;
     EnableUi();
@@ -696,6 +704,8 @@ void OnJobProgress(Phase ph, uint32_t f) {
             break;
     }
 }
+
+void FrameAdvance();
 
 void OnJobDone(RunResult* r) {
     if (A.thread) { WaitForSingleObject(A.thread, 2000); CloseHandle(A.thread); A.thread = nullptr; }
@@ -725,7 +735,13 @@ void OnJobDone(RunResult* r) {
     } else if (r->ok) {
         A.reached = (int)r->played;
         SetCursorRow((int)r->played - 1, false);
-        SetMsg(L"Reached frame " + std::to_wstring(r->played) + L". The game is left running.");
+        if (A.jobHold) {
+            A.sess = A.jobSess;
+            A.jobSess = Session();
+            SetMsg(L"Game frozen after frame " + std::to_wstring(r->played) + L". Press . to advance a frame, F11 to resume live.");
+        } else {
+            SetMsg(L"Reached frame " + std::to_wstring(r->played) + L". The game is left running.");
+        }
     } else if (r->error == "Stopped.") {
         A.reached = (int)r->played;
         SetMsg(L"Stopped at frame " + std::to_wstring(r->played) + L".");
@@ -736,15 +752,60 @@ void OnJobDone(RunResult* r) {
     delete r;
     UpdateScroll(); UpdateStatus();
     SetFocus(A.grid);
+    if (A.pendingStep) {
+        A.pendingStep = false;
+        if (A.sess.Active()) FrameAdvance();
+    }
+}
+
+// ---- frame advance ----------------------------------------------------------
+// The frozen game is stopped before the movie row it would run next (sess.Row()).
+// Stepping feeds it that row's inputs and freezes it again.
+void FrameAdvance() {
+    if (A.busy) return;
+    if (!A.sess.Active() || !A.sess.Alive()) {
+        A.sess.Close();
+        SetMsg(L"No frozen game. Use Rewind to cursor (F6) first, then advance with '.'.");
+        return;
+    }
+    int row = (int)A.sess.Row();
+    if (row < 0) { SetMsg(L"The game is not frozen."); return; }
+    if (row > A.reached) {
+        // An edit before the game's position invalidated it: replay to the greenzone edge.
+        A.pendingStep = true;
+        StartJob(false, (uint32_t)A.reached, false, false, true);
+        if (!A.busy) A.pendingStep = false;
+        return;
+    }
+    if (row >= Size()) {
+        Step st; st.cur_before = A.cursor;
+        EnsureRows(st, row + 1);
+        Commit(st);
+    }
+    if (!A.sess.Step(A.movie.frames[row])) {
+        A.sess.Close();
+        SetMsg(L"The game stopped responding to frame advance.");
+        return;
+    }
+    A.reached = row + 1;
+    SetCursorRow(row, false);
+    SetMsg(L"Frame " + std::to_wstring(row + 1) + L" advanced.");
+}
+
+void ResumeLive() {
+    if (A.busy) return;
+    if (!A.sess.Active()) { SetMsg(L"No frozen game."); return; }
+    A.sess.Release();
+    SetMsg(L"Game resumed with the live keyboard (frames are not recorded).");
 }
 
 // ---- main window ----------------------------------------------------------
-const wchar_t* const BTN_TEXT[5] = {L"Record new", L"Play", L"Rewind to cursor", L"Record from cursor", L"Stop"};
-const int BTN_ID[5] = {IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP};
+const wchar_t* const BTN_TEXT[6] = {L"Record new", L"Play", L"Rewind to cursor", L"Record from cursor", L"Frame advance", L"Stop"};
+const int BTN_ID[6] = {IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STEP, IDM_STOP};
 
 void EnableUi() {
-    for (int i = 0; i < 4; i++) EnableWindow(A.btn[i], !A.busy);
-    EnableWindow(A.btn[4], A.busy);
+    for (int i = 0; i < 5; i++) EnableWindow(A.btn[i], !A.busy);
+    EnableWindow(A.btn[5], A.busy);
     EnableWindow(A.cbBase, !A.busy);
     EnableWindow(A.cbPre, !A.busy);
 }
@@ -778,6 +839,8 @@ void BuildMenu(HWND w) {
     add(r, IDM_REWIND, L"&Rewind to cursor\tF6");
     add(r, IDM_RECFROM, L"Record &from cursor\tF7");
     add(r, IDM_RECORD, L"Record &new movie\tF8");
+    add(r, IDM_STEP, L"Frame &advance\t.");
+    add(r, IDM_RESUME, L"Resume &live (unfreeze)\tF11");
     add(r, IDM_STOP, L"&Stop\tF9");
     AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
     A.speedMenu = CreatePopupMenu();
@@ -799,8 +862,8 @@ void Layout() {
     RECT sr;
     GetWindowRect(A.status, &sr);
     int sh = sr.bottom - sr.top, tb = S(38), x = S(6), y = S(5), bh = S(28);
-    const int bw[5] = {S(96), S(60), S(124), S(142), S(60)};
-    for (int i = 0; i < 5; i++) { MoveWindow(A.btn[i], x, y, bw[i], bh, TRUE); x += bw[i] + S(4); }
+    const int bw[6] = {S(96), S(60), S(124), S(142), S(110), S(60)};
+    for (int i = 0; i < 6; i++) { MoveWindow(A.btn[i], x, y, bw[i], bh, TRUE); x += bw[i] + S(4); }
     x += S(10);
     MoveWindow(A.lblBase, x, y + S(5), S(52), S(20), TRUE); x += S(54);
     MoveWindow(A.cbBase, x, y, S(130), S(200), TRUE); x += S(138);
@@ -826,7 +889,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 
             BuildMenu(w);
             A.status = CreateWindowExW(0, STATUSCLASSNAMEW, L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, w, nullptr, nullptr, nullptr);
-            for (int i = 0; i < 5; i++) {
+            for (int i = 0; i < 6; i++) {
                 A.btn[i] = CreateWindowExW(0, L"BUTTON", BTN_TEXT[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                            0, 0, 0, 0, w, (HMENU)(INT_PTR)BTN_ID[i], nullptr, nullptr);
                 SendMessageW(A.btn[i], WM_SETFONT, (WPARAM)A.font, TRUE);
@@ -854,13 +917,13 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_SIZE: if (A.status) Layout(); return 0;
-        case WM_GETMINMAXINFO: ((MINMAXINFO*)lp)->ptMinTrackSize = {S(860), S(300)}; return 0;
+        case WM_GETMINMAXINFO: ((MINMAXINFO*)lp)->ptMinTrackSize = {S(1000), S(300)}; return 0;
         case WM_SETFOCUS: SetFocus(A.grid); return 0;
         case WM_INITMENUPOPUP: {
             HMENU m = (HMENU)wp;
             auto en = [&](int id, bool on) { EnableMenuItem(m, id, MF_BYCOMMAND | (on ? MF_ENABLED : MF_GRAYED)); };
             for (int id : {IDM_NEW, IDM_OPEN, IDM_CUT, IDM_PASTE, IDM_PASTEINS, IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES,
-                           IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_RECORD, IDM_BASESAVE})
+                           IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_RECORD, IDM_BASESAVE, IDM_STEP, IDM_RESUME})
                 en(id, !A.busy);
             en(IDM_UNDO, !A.busy && !A.undo.empty());
             en(IDM_REDO, !A.busy && !A.redo.empty());
@@ -888,7 +951,9 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_INSERT: EditInsert(); break;
                 case IDM_DELFRAMES: EditDelete(); break;
                 case IDM_PLAY: StartJob(false, (uint32_t)Size(), false, true); break;
-                case IDM_REWIND: StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false); break;
+                case IDM_REWIND: StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true); break;
+                case IDM_STEP: FrameAdvance(); break;
+                case IDM_RESUME: ResumeLive(); break;
                 case IDM_RECFROM: StartJob(true, (uint32_t)std::min(A.cursor + 1, Size()), false); break;
                 case IDM_RECORD:
                     if (!A.busy && Size() && MessageBoxW(w, L"Replace the current movie with a new recording?\n(You can undo this.)",
@@ -930,7 +995,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
     INITCOMMONCONTROLSEX ic{sizeof ic, ICC_BAR_CLASSES};
     InitCommonControlsEx(&ic);
 
@@ -954,6 +1019,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
                              CW_USEDEFAULT, CW_USEDEFAULT, 1000, 720, nullptr, nullptr, inst, nullptr);
     if (!w) return 1;
     ShowWindow(w, show);
+    if (cmdline && *cmdline) {         // bscotm_tas.exe movie.bscotm
+        std::wstring a = cmdline;
+        if (a.size() > 1 && a.front() == L'"') a = a.substr(1, a.rfind(L'"') - 1);
+        LoadPath(a);
+    }
 
     struct { BYTE f; WORD k, c; } keys[] = {
         {FCONTROL | FVIRTKEY, 'N', IDM_NEW},      {FCONTROL | FVIRTKEY, 'O', IDM_OPEN},
@@ -964,6 +1034,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
         {FCONTROL | FVIRTKEY, 'A', IDM_SELALL},   {FVIRTKEY, VK_F5, IDM_PLAY},
         {FVIRTKEY, VK_F6, IDM_REWIND},            {FVIRTKEY, VK_F7, IDM_RECFROM},
         {FVIRTKEY, VK_F8, IDM_RECORD},            {FVIRTKEY, VK_F9, IDM_STOP},
+        {FVIRTKEY, VK_OEM_PERIOD, IDM_STEP},      {FVIRTKEY, VK_F11, IDM_RESUME},
     };
     ACCEL acc[sizeof keys / sizeof keys[0]];
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) acc[i] = ACCEL{keys[i].f, keys[i].k, keys[i].c};

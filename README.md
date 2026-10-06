@@ -28,6 +28,10 @@ back. The whole tool is two small native files (no Python, no Frida):
   vsync when the D3D9 device is created. Both are needed: the game paces itself on
   QPC *and* vsync. Frames stay deterministic (same end state at 1x and 50x), and
   the hook returns to real time exactly on the frame the replay ends.
+- **Frame advance.** The hook blocks the game thread inside the input poll at a
+  frame marker (before the frame's input is read) and releases it one frame per step.
+  The virtual clock is frozen during the hold so the limiter does not see the pause
+  as elapsed time. The game survives long holds (tested: 20 s).
 - Details and every finding: [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md).
 
 ## Build
@@ -77,9 +81,17 @@ otherwise use **File > Set game path**.
 |---|---|
 | **Record new** (F8) | Relaunch the game and record from its first frame |
 | **Play** (F5) | Relaunch the game and play the whole movie in real time |
-| **Rewind to cursor** (F6, or double-click a frame number) | Relaunch, fast-forward to the cursor row, then leave the game running |
+| **Rewind to cursor** (F6, or double-click a frame number) | Relaunch, fast-forward to the cursor row, then **freeze** the game there |
+| **Frame advance** (`.`) | Run exactly one frame of the frozen game using the next grid row's inputs (hold `.` to auto-repeat) |
+| **Resume live** (F11) | Unfreeze the game and take over with the keyboard (not recorded) |
 | **Record from cursor** (F7) | Play up to the cursor row, then record live from the next frame |
 | **Stop** (F9) | End the current run |
+
+Frame advance works like TAStudio: the game is held at a frame boundary, before the
+next frame reads its input, so you can still edit that row. Stepping past the end of
+the movie appends blank frames. If you edit a row *before* the game's position, the
+next advance first replays to the greenzone edge, then steps. Stepping forward only;
+to go back, move the cursor and Rewind (it replays from frame 1 at speed).
 
 Rewind and Record from cursor fast-forward at the speed chosen in
 **Run > Fast-forward speed** (default Max, 50x: a 1461-frame prelude takes about
