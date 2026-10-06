@@ -141,6 +141,41 @@ static HWND WINAPI H_Cwe(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, 
     return wnd;
 }
 
+// ---- worker threads ------------------------------------------------------------
+// The game starts short-lived threads for loading work and checks on them a frame
+// later. At 1x each finishes inside one 16 ms frame; at 50x a frame lasts ~0.3 ms, so
+// they would still be running and the game would see the result several frames later
+// (a menu became responsive at a different frame, and scripted input was lost). So every
+// frame boundary first waits for the threads started since the previous one.
+static HANDLE (WINAPI *R_Ct)(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
+static CRITICAL_SECTION ThCs;
+static HANDLE Pending[MAXIMUM_WAIT_OBJECTS];
+static int    NPending;
+
+static HANDLE WINAPI H_Ct(LPSECURITY_ATTRIBUTES a, SIZE_T sz, LPTHREAD_START_ROUTINE fn, LPVOID p, DWORD fl, LPDWORD id) {
+    HANDLE h = R_Ct(a, sz, fn, p, fl, id);
+    HANDLE d;
+    if (h && !(fl & CREATE_SUSPENDED) &&    // the game may close h at once, so keep our own copy
+        DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &d, SYNCHRONIZE, FALSE, 0)) {
+        EnterCriticalSection(&ThCs);
+        if (NPending < MAXIMUM_WAIT_OBJECTS) Pending[NPending++] = d; else CloseHandle(d);
+        LeaveCriticalSection(&ThCs);
+    }
+    return h;
+}
+
+static void JoinThreads() {
+    HANDLE list[MAXIMUM_WAIT_OBJECTS];
+    EnterCriticalSection(&ThCs);
+    int n = NPending;
+    memcpy(list, Pending, n * sizeof(HANDLE));
+    NPending = 0;
+    LeaveCriticalSection(&ThCs);
+    if (!n) return;
+    WaitForMultipleObjects(n, list, TRUE, 3000);    // bounded, in case a thread never ends
+    for (int i = 0; i < n; i++) CloseHandle(list[i]);
+}
+
 // ---- frame advance: block the game thread at a frame marker ----------------------
 // The game is stopped before frame f reads its input, so the host can still edit
 // keys[f - 1]. The virtual clock is frozen meanwhile; otherwise the limiter would
@@ -165,6 +200,7 @@ static void Hold(Shm* s, uint32_t f) {
 
 // ---- input -----------------------------------------------------------------
 static void Marker(Shm* s) {
+    JoinThreads();
     uint32_t f = s->frame + 1;
     s->frame = f;
     if (s->mode == M_RECORD) {
@@ -251,6 +287,8 @@ static void Init() {
 
     // Clock hooks are optional: a missing import just means that clock stays real.
     InitializeCriticalSection(&Cs);
+    InitializeCriticalSection(&ThCs);
+    PatchIat(exe, "kernel32.dll", "CreateThread", (void*)H_Ct, &R_Ct);
     LARGE_INTEGER f, q;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&q);
