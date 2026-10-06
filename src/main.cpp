@@ -19,7 +19,7 @@ namespace {
 enum {
     IDM_NEW = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEPRE, IDM_SETGAME, IDM_BASESAVE, IDM_EXIT,
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
-    IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES,
+    IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
     IDC_BASE = 300, IDC_PRE,
@@ -30,16 +30,20 @@ const UINT WM_JOB_DONE     = WM_APP + 2;   // lParam = RunResult*
 const COLORREF cBg = RGB(255, 255, 255), cHdr = RGB(236, 236, 240), cLine = RGB(222, 222, 228),
                cLine60 = RGB(140, 140, 155), cGreen = RGB(212, 240, 212), cGreenHead = RGB(140, 205, 140),
                cSel = RGB(204, 224, 255), cCursor = RGB(40, 90, 180), cPressed = RGB(52, 120, 200),
-               cPhantom = RGB(170, 170, 175);
+               cPhantom = RGB(170, 170, 175), cNote = RGB(255, 249, 212), cNoteText = RGB(90, 60, 0),
+               cFlag = RGB(235, 170, 20);
 
-// One undoable edit = a list of "replace range" operations.
-struct Splice { size_t pos; Frames oldv, newv; };
+typedef std::vector<std::string> Notes;   // UTF-8, parallel to the frames
+
+// One undoable edit = a list of "replace range" operations (frames and their notes).
+struct Splice { size_t pos; Frames oldv, newv; Notes oldn, newn; };
 struct Step   { std::vector<Splice> parts; int cur_before = 0, cur_after = 0; };
 
 struct App {
     HWND wnd = nullptr, grid = nullptr, status = nullptr, cbBase = nullptr, cbPre = nullptr;
     HWND lblBase = nullptr, lblPre = nullptr, btn[7] = {};
     HFONT font = nullptr, fontB = nullptr;
+    HWND notesWnd = nullptr, notesList = nullptr;   // the Notes list window (when open)
     int dpi = 96;
 
     Movie movie;
@@ -50,8 +54,9 @@ struct App {
     int top = 0;                  // first visible row
     std::vector<Step> undo, redo;
     Frames clip;
+    Notes clipNotes;
 
-    Step drag;                    // paint-drag in progress
+    Step drag;                   // paint-drag in progress
     bool dragging = false, selecting = false, dragVal = false;
     int dragCol = 0, dragRow = 0;
 
@@ -141,19 +146,39 @@ void Touch(size_t pos) {
     if ((int)pos < A.reached) A.reached = (int)pos;
 }
 
-void Replace(size_t pos, size_t oldlen, const Frames& nv) {
-    Frames& f = A.movie.frames;
-    f.erase(f.begin() + pos, f.begin() + pos + oldlen);
-    f.insert(f.begin() + pos, nv.begin(), nv.end());
+void RefreshNotesList();
+
+const std::string& NoteAt(int row) {
+    static const std::string none;
+    return row >= 0 && (size_t)row < A.movie.notes.size() ? A.movie.notes[row] : none;
 }
 
-void DoSplice(Step& st, size_t pos, size_t oldlen, Frames nv) {
+void Replace(size_t pos, size_t oldlen, const Frames& nv, const Notes& nn) {
     Frames& f = A.movie.frames;
+    Notes& n = A.movie.notes;
+    n.resize(f.size());
+    f.erase(f.begin() + pos, f.begin() + pos + oldlen);
+    f.insert(f.begin() + pos, nv.begin(), nv.end());
+    n.erase(n.begin() + pos, n.begin() + pos + oldlen);
+    n.insert(n.begin() + pos, nn.begin(), nn.end());
+}
+
+// Replace frames [pos, pos+oldlen) with nv. Without `nn` the notes of the replaced
+// range are kept in place (padded with empty ones / dropped if the range shrinks), so
+// editing inputs never disturbs notes while inserting and deleting frames moves them.
+void DoSplice(Step& st, size_t pos, size_t oldlen, Frames nv, const Notes* nn = nullptr) {
+    Frames& f = A.movie.frames;
+    A.movie.notes.resize(f.size());
     pos = std::min(pos, f.size());
     oldlen = std::min(oldlen, f.size() - pos);
-    Splice s{pos, Frames(f.begin() + pos, f.begin() + pos + oldlen), std::move(nv)};
-    Replace(pos, oldlen, s.newv);
-    Touch(pos);
+    const Notes& n = A.movie.notes;
+    Splice s{pos, Frames(f.begin() + pos, f.begin() + pos + oldlen), std::move(nv),
+             Notes(n.begin() + pos, n.begin() + pos + oldlen), Notes()};
+    s.newn = nn ? *nn : s.oldn;
+    s.newn.resize(s.newv.size());
+    Replace(pos, oldlen, s.newv, s.newn);
+    if (s.oldv != s.newv) Touch(pos);     // a note-only edit leaves the greenzone alone
+    else A.dirty = true;
     st.parts.push_back(std::move(s));
 }
 
@@ -169,20 +194,26 @@ void Commit(Step& st) {
     A.redo.clear();
     st = Step();
     UpdateTitle();
+    RefreshNotesList();
 }
 
 void RunStep(const Step& st, bool undo) {
     size_t lo = (size_t)-1;
+    A.dirty = true;
     if (undo) {
         for (auto it = st.parts.rbegin(); it != st.parts.rend(); ++it) {
-            Replace(it->pos, it->newv.size(), it->oldv);
-            lo = std::min(lo, it->pos);
+            Replace(it->pos, it->newv.size(), it->oldv, it->oldn);
+            if (it->oldv != it->newv) lo = std::min(lo, it->pos);
         }
     } else {
-        for (auto& p : st.parts) { Replace(p.pos, p.oldv.size(), p.newv); lo = std::min(lo, p.pos); }
+        for (auto& p : st.parts) {
+            Replace(p.pos, p.oldv.size(), p.newv, p.newn);
+            if (p.oldv != p.newv) lo = std::min(lo, p.pos);
+        }
     }
-    Touch(lo);
+    if (lo != (size_t)-1) Touch(lo);
     UpdateTitle();
+    RefreshNotesList();
     A.cursor = A.anchor = undo ? st.cur_before : st.cur_after;
     SetCursorRow(A.cursor, false);
 }
@@ -241,7 +272,10 @@ void EditDelete() {
 void EditCopy() {
     if (!Size()) return;
     int lo = SelLo(), hi = std::min(SelHi(), Size() - 1);
-    if (hi >= lo) A.clip.assign(A.movie.frames.begin() + lo, A.movie.frames.begin() + hi + 1);
+    if (hi < lo) return;
+    A.clip.assign(A.movie.frames.begin() + lo, A.movie.frames.begin() + hi + 1);
+    A.clipNotes.clear();
+    for (int r = lo; r <= hi; r++) A.clipNotes.push_back(NoteAt(r));
 }
 
 void EditCut() { EditCopy(); EditDelete(); }
@@ -250,9 +284,116 @@ void EditPaste(bool insert) {
     if (A.busy || A.clip.empty()) return;
     Step st; st.cur_before = A.cursor;
     size_t at = (size_t)std::min(A.cursor, Size());
-    if (insert) DoSplice(st, at, 0, A.clip);
-    else { EnsureRows(st, at + A.clip.size()); DoSplice(st, at, A.clip.size(), A.clip); }
+    if (insert) {
+        DoSplice(st, at, 0, A.clip, &A.clipNotes);
+    } else {            // overwrite: a pasted frame without a note keeps the note already there
+        EnsureRows(st, at + A.clip.size());
+        Notes nn = A.clipNotes;
+        for (size_t i = 0; i < nn.size(); i++) if (nn[i].empty()) nn[i] = NoteAt((int)(at + i));
+        DoSplice(st, at, A.clip.size(), A.clip, &nn);
+    }
     Commit(st); UpdateScroll(); UpdateStatus();
+}
+
+// ---- frame notes ------------------------------------------------------------
+// One note per frame. Setting an empty text removes it.
+void SetNote(int row, const std::string& text) {
+    if (A.busy || row < 0) return;
+    if (row < Size() && NoteAt(row) == text) return;
+    if (row >= Size() && text.empty()) return;
+    Step st; st.cur_before = A.cursor;
+    EnsureRows(st, row + 1);
+    Notes nn{text};
+    DoSplice(st, row, 1, Frames{A.movie.frames[row]}, &nn);
+    Commit(st);
+    InvalidateRect(A.grid, nullptr, FALSE);
+}
+
+bool SelectionHasNote() {
+    for (int r = SelLo(); r <= std::min(SelHi(), Size() - 1); r++)
+        if (!NoteAt(r).empty()) return true;
+    return false;
+}
+
+void RemoveNotesInSelection() {
+    if (A.busy || !Size() || !SelectionHasNote()) return;
+    int lo = SelLo(), hi = std::min(SelHi(), Size() - 1);
+    Step st; st.cur_before = A.cursor;
+    Notes none(hi - lo + 1);
+    DoSplice(st, lo, hi - lo + 1, Frames(A.movie.frames.begin() + lo, A.movie.frames.begin() + hi + 1), &none);
+    Commit(st);
+    InvalidateRect(A.grid, nullptr, FALSE);
+}
+
+// Small modal "enter text" box. Returns false on Cancel.
+struct NoteDlg { HWND wnd = nullptr, edit = nullptr; std::wstring text; bool ok = false, done = false; };
+
+LRESULT CALLBACK NoteDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    NoteDlg* d = (NoteDlg*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (msg) {
+        case WM_CREATE: SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW*)lp)->lpCreateParams); return 0;
+        case WM_COMMAND:
+            if (LOWORD(wp) == IDOK && d) {
+                int n = GetWindowTextLengthW(d->edit);
+                d->text.assign(n + 1, 0);
+                GetWindowTextW(d->edit, &d->text[0], n + 1);
+                d->text.resize(n);
+                d->ok = d->done = true;
+            } else if (LOWORD(wp) == IDCANCEL && d) {
+                d->done = true;
+            }
+            return 0;
+        case WM_CLOSE: if (d) d->done = true; return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+bool AskText(const std::wstring& title, const std::wstring& prompt, std::wstring& io) {
+    NoteDlg d;
+    d.text = io;
+    RECT pr;
+    GetWindowRect(A.wnd, &pr);
+    int w = S(480), h = S(140);
+    d.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"BscotmNote", title.c_str(), WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            (pr.left + pr.right - w) / 2, (pr.top + pr.bottom - h) / 2, w, h, A.wnd, nullptr, nullptr, &d);
+    if (!d.wnd) return false;
+    HWND lbl = CreateWindowExW(0, L"STATIC", prompt.c_str(), WS_CHILD | WS_VISIBLE, S(12), S(10), w - S(40), S(18), d.wnd, nullptr, nullptr, nullptr);
+    d.edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", io.c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                             S(12), S(32), w - S(40), S(24), d.wnd, nullptr, nullptr, nullptr);
+    HWND bo = CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                              w - S(12) - S(180), S(70), S(80), S(26), d.wnd, (HMENU)(INT_PTR)IDOK, nullptr, nullptr);
+    HWND bc = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                              w - S(12) - S(92), S(70), S(80), S(26), d.wnd, (HMENU)(INT_PTR)IDCANCEL, nullptr, nullptr);
+    for (HWND c : {lbl, d.edit, bo, bc}) SendMessageW(c, WM_SETFONT, (WPARAM)A.font, TRUE);
+    SendMessageW(d.edit, EM_SETLIMITTEXT, 200, 0);
+    EnableWindow(A.wnd, FALSE);
+    ShowWindow(d.wnd, SW_SHOW);
+    SetFocus(d.edit);
+    SendMessageW(d.edit, EM_SETSEL, 0, -1);
+    MSG m;
+    while (!d.done && GetMessageW(&m, nullptr, 0, 0) > 0) {
+        if (m.message == WM_KEYDOWN && (m.wParam == VK_RETURN || m.wParam == VK_ESCAPE) &&
+            (m.hwnd == d.edit || m.hwnd == d.wnd)) {
+            SendMessageW(d.wnd, WM_COMMAND, m.wParam == VK_RETURN ? IDOK : IDCANCEL, 0);
+            continue;
+        }
+        if (!IsDialogMessageW(d.wnd, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+    EnableWindow(A.wnd, TRUE);
+    DestroyWindow(d.wnd);
+    SetForegroundWindow(A.wnd);
+    if (d.ok) io = d.text;
+    return d.ok;
+}
+
+void EditNote() {
+    if (A.busy) return;
+    int row = A.cursor;
+    std::wstring t = W(NoteAt(row));
+    if (!AskText(L"Frame note", L"Note for frame " + std::to_wstring(row + 1) + L" (leave empty to remove):", t)) return;
+    for (wchar_t& c : t) if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
+    SetNote(row, U8(t));
+    SetFocus(A.grid);
 }
 
 void SelectAll() {
@@ -291,6 +432,7 @@ void PaintGrid(HWND h) {
     Fill(m, 0, 0, rc.right, hh, cHdr);
     SelectObject(m, A.fontB);
     Text(m, L"Frame", RECT{0, 0, fw - S(6), hh}, DT_RIGHT, RGB(0, 0, 0));
+    Text(m, L"Note", RECT{gw + S(6), 0, rc.right, hh}, DT_LEFT, RGB(0, 0, 0));
     for (int k = 0; k < NUM_KEYS; k++) {
         wchar_t lb[8];
         swprintf(lb, 8, L"%hs", KEYS[k].label);
@@ -311,6 +453,13 @@ void PaintGrid(HWND h) {
         swprintf(num, 16, L"%d", r + 1);
         Text(m, num, RECT{0, y, fw - S(6), y + rh}, DT_RIGHT, real ? RGB(0, 0, 0) : cPhantom);
         Fill(m, fw, y, gw, y + rh, sel ? cSel : cBg);
+        const std::string& note = NoteAt(r);
+        Fill(m, gw, y, rc.right, y + rh, sel ? cSel : (note.empty() ? cBg : cNote));
+        if (!note.empty()) {
+            Fill(m, S(2), y + S(4), S(8), y + rh - S(4), cFlag);       // flag next to the frame number
+            std::wstring wn = W(note);
+            Text(m, wn.c_str(), RECT{gw + S(6), y, rc.right - S(4), y + rh}, DT_LEFT | DT_END_ELLIPSIS, cNoteText);
+        }
 
         for (int k = 0; k < NUM_KEYS; k++) {
             if (!(mask >> k & 1)) continue;
@@ -321,13 +470,15 @@ void PaintGrid(HWND h) {
             Text(m, lb, RECT{x, y, x + kw, y + rh}, DT_CENTER, RGB(255, 255, 255));
         }
         for (int k = 0; k <= NUM_KEYS; k++) Fill(m, fw + k * kw, y, fw + k * kw + 1, y + rh, cLine);
-        Fill(m, 0, y + rh - 1, gw, y + rh, (r + 1) % 60 == 0 ? cLine60 : cLine);
+        Fill(m, gw, y, gw + 1, y + rh, cLine60);
+        Fill(m, 0, y + rh - 1, rc.right, y + rh, (r + 1) % 60 == 0 ? cLine60 : cLine);
         if (r == A.cursor) {
-            Fill(m, fw, y, gw, y + 2, cCursor);
-            Fill(m, fw, y + rh - 2, gw, y + rh, cCursor);
+            Fill(m, fw, y, rc.right, y + 2, cCursor);
+            Fill(m, fw, y + rh - 2, rc.right, y + rh, cCursor);
         }
     }
     Fill(m, fw - 1, hh, fw, rc.bottom, cLine60);
+    Fill(m, gw, hh, gw + 1, rc.bottom, cLine60);
 
     BitBlt(dc, 0, 0, rc.right, rc.bottom, m, 0, 0, SRCCOPY);
     SelectObject(m, oldbm);
@@ -359,9 +510,8 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
             if (A.busy || y < HdrH()) return 0;
             int row = RowAt(y), col = ColAt(x);
-            if (col >= NUM_KEYS) return 0;
             SetCapture(h);
-            if (col < 0) {
+            if (col < 0 || col >= NUM_KEYS) {       // frame number or note cell: select rows
                 A.selecting = true;
                 SetCursorRow(row, GetKeyState(VK_SHIFT) < 0);
                 return 0;
@@ -388,6 +538,25 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             A.dragging = A.selecting = false;
             ReleaseCapture();
             return 0;
+        case WM_RBUTTONUP: {
+            int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+            if (y < HdrH()) return 0;
+            int row = RowAt(y);
+            if (row < SelLo() || row > SelHi()) SetCursorRow(row, false);   // keep a selection the click is inside
+            else { A.cursor = row; UpdateScroll(); UpdateStatus(); }
+            HMENU pm = CreatePopupMenu();
+            std::wstring lbl = (NoteAt(row).empty() ? L"Add note to frame " : L"Edit note of frame ") + std::to_wstring(row + 1) + L"...";
+            bool hasNote = SelectionHasNote();
+            AppendMenuW(pm, MF_STRING | (A.busy ? MF_GRAYED : 0), IDM_NOTE_EDIT, lbl.c_str());
+            AppendMenuW(pm, MF_STRING | (A.busy || !hasNote ? MF_GRAYED : 0), IDM_NOTE_DEL, L"Remove note(s) in selection");
+            AppendMenuW(pm, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(pm, MF_STRING, IDM_NOTE_LIST, L"Notes list...");
+            POINT pt{x, y};
+            ClientToScreen(h, &pt);
+            TrackPopupMenu(pm, TPM_RIGHTBUTTON, pt.x, pt.y, 0, A.wnd, nullptr);
+            DestroyMenu(pm);
+            return 0;
+        }
         case WM_LBUTTONDBLCLK:
             if (!A.busy && ColAt((short)LOWORD(lp)) < 0 && (short)HIWORD(lp) >= HdrH()) {
                 SetCursorRow(RowAt((short)HIWORD(lp)), false);
@@ -428,6 +597,91 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
     }
     return DefWindowProcW(h, msg, wp, lp);
+}
+
+// ---- notes list window ---------------------------------------------------------
+// Every note with its frame number; double-click or Enter jumps the cursor there,
+// Delete removes the note.
+void RefreshNotesList() {
+    HWND lv = A.notesList;
+    if (!lv) return;
+    SendMessageW(lv, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(lv);
+    int n = 0;
+    for (int r = 0; r < (int)A.movie.notes.size(); r++) {
+        if (A.movie.notes[r].empty()) continue;
+        wchar_t b[16];
+        swprintf(b, 16, L"%d", r + 1);
+        LVITEMW it{};
+        it.mask = LVIF_TEXT | LVIF_PARAM;
+        it.iItem = n++;
+        it.pszText = b;
+        it.lParam = r;
+        int i = (int)SendMessageW(lv, LVM_INSERTITEMW, 0, (LPARAM)&it);
+        std::wstring w = W(A.movie.notes[r]);
+        ListView_SetItemText(lv, i, 1, (LPWSTR)w.c_str());
+    }
+    SendMessageW(lv, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(lv, nullptr, TRUE);
+}
+
+int NotesSelectedRow() {
+    int i = ListView_GetNextItem(A.notesList, -1, LVNI_SELECTED);
+    if (i < 0) return -1;
+    LVITEMW it{};
+    it.mask = LVIF_PARAM;
+    it.iItem = i;
+    return SendMessageW(A.notesList, LVM_GETITEMW, 0, (LPARAM)&it) ? (int)it.lParam : -1;
+}
+
+LRESULT CALLBACK NotesProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE:
+            if (A.notesList) MoveWindow(A.notesList, 0, 0, LOWORD(lp), HIWORD(lp), TRUE);
+            return 0;
+        case WM_NOTIFY: {
+            NMHDR* nh = (NMHDR*)lp;
+            if (nh->hwndFrom != A.notesList) break;
+            if (nh->code == NM_DBLCLK || (nh->code == LVN_KEYDOWN && ((NMLVKEYDOWN*)lp)->wVKey == VK_RETURN)) {
+                int row = NotesSelectedRow();
+                if (row >= 0) SetCursorRow(row, false);
+            } else if (nh->code == LVN_KEYDOWN && ((NMLVKEYDOWN*)lp)->wVKey == VK_DELETE) {
+                int row = NotesSelectedRow();
+                if (row >= 0) SetNote(row, "");
+            }
+            return 0;
+        }
+        case WM_CLOSE: DestroyWindow(h); return 0;
+        case WM_DESTROY: A.notesWnd = A.notesList = nullptr; return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowNotesList() {
+    if (A.notesWnd) { SetForegroundWindow(A.notesWnd); return; }
+    RECT pr;
+    GetWindowRect(A.wnd, &pr);
+    A.notesWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmNotes", L"Frame notes",
+                                 WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
+                                 pr.right - S(460), pr.top + S(90), S(440), S(360), A.wnd, nullptr, nullptr, nullptr);
+    if (!A.notesWnd) return;
+    A.notesList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                                  0, 0, 0, 0, A.notesWnd, nullptr, nullptr, nullptr);
+    SendMessageW(A.notesList, WM_SETFONT, (WPARAM)A.font, TRUE);
+    ListView_SetExtendedListViewStyle(A.notesList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    LVCOLUMNW c{};
+    c.mask = LVCF_TEXT | LVCF_WIDTH;
+    c.pszText = (LPWSTR)L"Frame";
+    c.cx = S(70);
+    SendMessageW(A.notesList, LVM_INSERTCOLUMNW, 0, (LPARAM)&c);
+    c.pszText = (LPWSTR)L"Note";
+    c.cx = S(330);
+    SendMessageW(A.notesList, LVM_INSERTCOLUMNW, 1, (LPARAM)&c);
+    RECT cr;
+    GetClientRect(A.notesWnd, &cr);
+    MoveWindow(A.notesList, 0, 0, cr.right, cr.bottom, TRUE);
+    RefreshNotesList();
 }
 
 // ---- files, paths, config ---------------------------------------------------
@@ -537,7 +791,7 @@ void LoadPath(const std::wstring& p) {
         int i = (int)SendMessageW(A.cbPre, CB_FINDSTRINGEXACT, 0, (LPARAM)W(A.movie.prelude_id).c_str());
         if (i >= 0) SendMessageW(A.cbPre, CB_SETCURSEL, i, 0);
     }
-    UpdateTitle(); UpdateScroll(); UpdateStatus();
+    UpdateTitle(); UpdateScroll(); UpdateStatus(); RefreshNotesList();
     SetMsg(L"Loaded " + p);
 }
 
@@ -590,7 +844,7 @@ void FileNew() {
     A.path.clear(); A.dirty = false;
     A.undo.clear(); A.redo.clear();
     A.cursor = A.anchor = A.top = A.reached = 0;
-    UpdateTitle(); UpdateScroll(); UpdateStatus();
+    UpdateTitle(); UpdateScroll(); UpdateStatus(); RefreshNotesList();
 }
 
 void FileOpen() {
@@ -721,7 +975,8 @@ void OnJobDone(RunResult* r) {
         } else {
             Step st; st.cur_before = A.cursor;
             if (A.jobNew) {
-                DoSplice(st, 0, Size(), r->recorded);
+                Notes none(r->recorded.size());
+                DoSplice(st, 0, Size(), r->recorded, &none);
                 A.path.clear();
                 A.movie.prelude.clear();
             } else {
@@ -890,6 +1145,10 @@ void BuildMenu(HWND w) {
     add(e, IDM_CLEAR, L"C&lear inputs\tDel");
     add(e, IDM_INSERT, L"&Insert frames\tIns");
     add(e, IDM_DELFRAMES, L"&Delete frames\tCtrl+Del");
+    AppendMenuW(e, MF_SEPARATOR, 0, nullptr);
+    add(e, IDM_NOTE_EDIT, L"Add / edit frame &note...");
+    add(e, IDM_NOTE_DEL, L"Remove notes in selection");
+    add(e, IDM_NOTE_LIST, L"Notes &list...");
     add(r, IDM_PLAY, L"&Play from start\tF5");
     add(r, IDM_REWIND, L"&Rewind to cursor\tF6");
     add(r, IDM_RECFROM, L"Record &from cursor\tF7");
@@ -979,8 +1238,10 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             HMENU m = (HMENU)wp;
             auto en = [&](int id, bool on) { EnableMenuItem(m, id, MF_BYCOMMAND | (on ? MF_ENABLED : MF_GRAYED)); };
             for (int id : {IDM_NEW, IDM_OPEN, IDM_CUT, IDM_PASTE, IDM_PASTEINS, IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES,
-                           IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_RECORD, IDM_BASESAVE, IDM_STEP, IDM_RESUME, IDM_RECHERE})
+                           IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_RECORD, IDM_BASESAVE, IDM_STEP, IDM_RESUME, IDM_RECHERE,
+                           IDM_NOTE_EDIT})
                 en(id, !A.busy);
+            en(IDM_NOTE_DEL, !A.busy && SelectionHasNote());
             en(IDM_UNDO, !A.busy && !A.undo.empty());
             en(IDM_REDO, !A.busy && !A.redo.empty());
             en(IDM_STOP, A.busy);
@@ -1006,6 +1267,9 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_CLEAR: EditClear(); break;
                 case IDM_INSERT: EditInsert(); break;
                 case IDM_DELFRAMES: EditDelete(); break;
+                case IDM_NOTE_EDIT: EditNote(); break;
+                case IDM_NOTE_DEL: RemoveNotesInSelection(); break;
+                case IDM_NOTE_LIST: ShowNotesList(); break;
                 case IDM_PLAY: StartJob(false, (uint32_t)Size(), false, true); break;
                 case IDM_REWIND: StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true); break;
                 case IDM_STEP: FrameAdvance(); break;
@@ -1061,7 +1325,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
-    INITCOMMONCONTROLSEX ic{sizeof ic, ICC_BAR_CLASSES};
+    INITCOMMONCONTROLSEX ic{sizeof ic, ICC_BAR_CLASSES | ICC_LISTVIEW_CLASSES};
     InitCommonControlsEx(&ic);
 
     WNDCLASSEXW g{sizeof g};
@@ -1071,6 +1335,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
     g.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     g.lpszClassName = L"TasGrid";
     RegisterClassExW(&g);
+
+    WNDCLASSEXW nd{sizeof nd};
+    nd.lpfnWndProc = NoteDlgProc;
+    nd.hInstance = inst;
+    nd.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    nd.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    nd.lpszClassName = L"BscotmNote";
+    RegisterClassExW(&nd);
+    nd.lpfnWndProc = NotesProc;
+    nd.lpszClassName = L"BscotmNotes";
+    RegisterClassExW(&nd);
 
     WNDCLASSEXW c{sizeof c};
     c.lpfnWndProc = MainProc;

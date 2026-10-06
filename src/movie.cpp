@@ -193,6 +193,16 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
     prelude_id = str("prelude_id");
     prelude_desc = str("prelude_description");
     Expand(*fr, frames);
+    notes.assign(frames.size(), std::string());
+    const J* nt = root.get("notes");        // sparse: [{"frame": 12, "text": "..."}], frame is 1-based
+    if (nt && nt->t == J::Arr)
+        for (const J& e : nt->v) {
+            const J* fn = e.get("frame");
+            const J* tx = e.get("text");
+            if (!fn || !tx || fn->t != J::Num || tx->t != J::Str) continue;
+            long idx = (long)fn->n - 1;
+            if (idx >= 0 && (size_t)idx < notes.size()) notes[idx] = tx->s;
+        }
     prelude.clear();
     const J* pf = root.get("prelude_frames");
     if (pf && pf->t == J::Arr) Expand(*pf, prelude);
@@ -223,7 +233,16 @@ bool Movie::Save(const std::wstring& path, std::string& err) const {
         if (used >> b & 1) { fprintf(f, "%s%d", first ? "" : ",", KEYS[b].vk); first = false; }
     fprintf(f, "],\"total_frames\":%u,\"frames\":", (unsigned)frames.size());
     WriteFrames(f, frames);
-    fputs("}", f);
+    fputs(",\"notes\":[", f);
+    first = true;
+    for (size_t i = 0; i < notes.size() && i < frames.size(); i++) {
+        if (notes[i].empty()) continue;
+        fprintf(f, "%s{\"frame\":%u,\"text\":", first ? "" : ",", (unsigned)i + 1);
+        Esc(f, notes[i]);
+        fputc('}', f);
+        first = false;
+    }
+    fputs("]}", f);
     if (fclose(f) != 0) { err = "write failed"; return false; }
     return true;
 }

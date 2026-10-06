@@ -119,6 +119,14 @@ captured against a different start point.
 - `Delete` clears inputs, `Insert` inserts blank frames, `Ctrl+Delete` removes
   frames, `Ctrl+C/X/V` copy/cut/paste (`Ctrl+Shift+V` pastes as insert),
   `Ctrl+Z/Y` undo/redo.
+- **Frame notes.** Right-click a row (or use the Edit menu) to add, edit or remove a
+  note for that frame. One note per frame; it shows in the **Note** column and as an
+  orange flag beside the frame number. **Notes list...** opens a window with every note;
+  double-click (or Enter) jumps the cursor to the frame, `Delete` removes the note.
+  Notes move with their frames on insert, delete, cut and paste, are covered by
+  undo/redo, and are saved in the `.bscotm` file (an optional `notes` field, so older
+  files still load). Painting or clearing inputs leaves notes alone; **Record new**
+  starts a movie without notes.
 - Green frame numbers are the "greenzone": frames the live game has been advanced
   through. Editing a frame invalidates the greenzone after it.
 
