@@ -131,6 +131,12 @@ captured against a different start point.
   undo/redo, and are saved in the `.bscotm` file (an optional `notes` field, so older
   files still load). Painting or clearing inputs leaves notes alone; **Record new**
   starts a movie without notes.
+- **RNG seed.** *Run > RNG seed...* sets a number (0 - 4294967295) that is saved in the
+  movie (`rng_seed`; empty = none). The game seeds its random generator from the Unix
+  time in seconds at launch, which is why a replay could give different drops from run
+  to run. With a seed set, the game sees a frozen clock at that time, so every launch
+  gets the same random numbers. The status bar shows the seed. Changing it restarts the
+  game on the next Rewind / frame advance. Details: `docs/REVERSE_ENGINEERING.md`.
 - Green frame numbers are the "greenzone": frames the live game has been advanced
   through. Editing a frame invalidates the greenzone after it.
 

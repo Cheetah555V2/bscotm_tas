@@ -192,6 +192,9 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
     created = str("created_utc");
     prelude_id = str("prelude_id");
     prelude_desc = str("prelude_description");
+    has_seed = false; seed = 0;
+    const J* sd = root.get("rng_seed");
+    if (sd && sd->t == J::Num && sd->n >= 0 && sd->n <= 4294967295.0) { has_seed = true; seed = (uint32_t)sd->n; }
     Expand(*fr, frames);
     notes.assign(frames.size(), std::string());
     const J* nt = root.get("notes");        // sparse: [{"frame": 12, "text": "..."}], frame is 1-based
@@ -221,7 +224,8 @@ bool Movie::Save(const std::wstring& path, std::string& err) const {
     Esc(f, author);
     fputs(",\"created_utc\":", f);
     Esc(f, created);
-    fputs(",\"rng_seed\":null,\"anchors\":[],\"prelude_id\":", f);
+    if (has_seed) fprintf(f, ",\"rng_seed\":%u", (unsigned)seed); else fputs(",\"rng_seed\":null", f);
+    fputs(",\"anchors\":[],\"prelude_id\":", f);
     if (prelude_id.empty()) fputs("null", f); else Esc(f, prelude_id);
     fputs(",\"prelude_description\":", f);
     Esc(f, prelude_desc);

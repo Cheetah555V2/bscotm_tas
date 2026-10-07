@@ -491,3 +491,67 @@ activation at creation. The game then behaves as always focused, so the hook gat
 (non-injected) keys itself: they are only reported while `GetForegroundWindow()` is the
 game window. Verified: with Notepad focused the stepped result is identical (X 549.33,
 Y 1748.56), and keys typed into Notepad are not recorded.
+
+---
+
+## RNG
+
+Method: the game's `.text` is decrypted at runtime, so the code was dumped from the running
+process and searched for PRNG constants; hardware execute breakpoints (debug registers set
+from the host, no code modified) logged calls; the hook logged who reads each clock.
+
+### The gameplay generator: xorshift128
+
+- State: four `uint32` at `*(COTM.exe + 0x48365C) + 0x2F4 / 0x2F8 / 0x2FC / 0x300` (x, y, z, w).
+  That global is the same game-manager object the player pointer chain starts from.
+- Next number: `exe+0x80280` (`ecx` = manager, arg = range, returns `w % range`); float
+  version `exe+0x802E0`. About 100 other sites step the same four words inline.
+  `t = x ^ (x << 11); x = y; y = z; z = w; w = w ^ (((w >> 11) ^ t) >> 8) ^ t`.
+- Seeding (a script command, `exe+0x2695EC..0x269622`): one 32-bit seed `s` gives
+  `x = s * 0x075BCD15, y = s * 0x0165EC15, z = s * 0x0034BF15, w = s * 0x0006F855` (invert
+  the multipliers mod 2^32 to recover `s` from a state). The constructor default is
+  Marsaglia's 123456789 / 362436069 / 521288629 / 88675123.
+- **The seed is the Unix time in seconds at launch**, read through the C runtime's `time()`.
+  Seeds recovered from consecutive launches were 1791366638, then +10, +9, +9, +9, +9 (the
+  seconds between launches). The runtime looks `GetSystemTimeAsFileTime` and
+  `GetSystemTimePreciseAsFileTime` up with `GetProcAddress` at run time, so patching the
+  import slots does not reach it; `GetProcAddress` itself is in the import table.
+- Item drops: the candle's break handler (`exe+0x7CB10`) looks up a drop table entry and
+  calls `exe+0x26CB80`, which builds cumulative weights and calls `exe+0x80280(total)`.
+  The result picks the item kind. Pickup (`exe+0x1FDE40..`) adds weapon points through
+  `exe+0x1FCCE0`. Weapon points ("Ammo") = byte at `*(*(exe+0x483660)+8)+0x1E` (max at +0x1D).
+- Measured: `test3.bscotm` to frame ~3715 gave 18 or 19 weapon points in different launches
+  (about 1 launch in 4), depending only on the launch second. Not the cause: wall clock via
+  `QueryPerformanceCounter`, process id, heap address, worker-thread overlap, game speed.
+
+### Seeding it from the tool
+
+The movie's `rng_seed` (a Unix time in seconds, or `null`) is written to the shared block
+(`Shm::rng_on`, `rng_time`) before the game starts. The hook then:
+- patches the exe's `GetProcAddress` import; when the game asks for
+  `GetSystemTimeAsFileTime` / `GetSystemTimePreciseAsFileTime` it gets a function that
+  returns the frozen seed time, and
+- makes the imported `GetSystemTimeAsFileTime` return the same time.
+
+With a seed set, the generator state at frame 1 is identical on every launch and the
+outcome repeats (seed 1701088878: 19 weapon points in 4/4 launches; 1701011101: 18 in 4/4).
+Time seeds one second apart behave almost identically, so use seeds far apart when searching.
+
+Other ways to interfere without patching code: write the four state words from the hook at a
+frame marker (the state is untouched until about frame 700 here), or put a hardware
+breakpoint on `exe+0x80280` to log every draw.
+
+### A second engine: Mersenne Twister (unused in stage 1)
+
+- Seed routine `exe+0x2C77B0` (`this` = engine, arg = seed): `state[0]=seed;
+  state[i] = 1812433253 * (state[i-1] ^ (state[i-1] >> 30)) + i`.
+- Next `exe+0x2C7800`: MT twist with parameters read from the object, tempering
+  `y ^= y>>11; y ^= (y<<7) & 0xFF3A58AD; y ^= (y<<15) & 0xFFFFDF8C; y ^= y>>18`. If never
+  seeded it seeds itself with 5489.
+- Object layout: `+0 n`, `+4 m`, `+8 matrix constant`, `+0xC upper mask`, `+0x10 lower mask`,
+  `+0x14 state`, `+0x20 index`; the engine lives at `owner+0xB0`.
+- Seed command `exe+0x2C7F00`: value `v <= 31` selects `table[v]` (32 values, 485 .. 31043,
+  at `exe+0x39AE38`), otherwise `v` is the seed.
+- 19 call sites (`exe+0x2C79xx .. 0x2C8Bxx`, random ranges/colours in script handlers).
+  **Zero calls** were observed in all of `test3.bscotm` (4838 frames) and 12000 frames of
+  `test.bscotm`, so it does not decide stage 1; later stages were not checked.

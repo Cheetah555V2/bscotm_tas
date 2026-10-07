@@ -216,6 +216,8 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     if (!s) { ss.Close(); r.error = "MapViewOfFile failed."; return r; }
     memset(s, 0, sizeof(Shm));
     s->magic = SHM_MAGIC;
+    s->rng_on = p.seeded ? 1 : 0;       // set before the game starts: it reads the clock during start-up
+    s->rng_time = p.seed;
 
     STARTUPINFOW si{};
     si.cb = sizeof si;
