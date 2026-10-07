@@ -19,6 +19,8 @@ struct RunParams {
     bool hold = false;          // after `target` frames, freeze the game for frame advance
     uint32_t speed_milli = 1000;    // clock speed while replaying (1000 = 1x)
     uint32_t speed_mask = 31;       // SPEED_* clocks that run at that speed
+    bool seeded = false;            // the game sees a frozen clock at Unix time `seed` (its RNG seed)
+    uint32_t seed = 0;
 };
 
 struct RunResult {
