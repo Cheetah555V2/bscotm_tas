@@ -256,13 +256,15 @@ static void Hold(Shm* s, uint32_t f) {
 static LONG CALLBACK TraceVeh(EXCEPTION_POINTERS* e) {
     if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT* c = e->ContextRecord;
-    if (!S->trace_addr || c->Eip != S->trace_addr) return EXCEPTION_CONTINUE_SEARCH;
+    if (!(c->Dr6 & 0xF)) return EXCEPTION_CONTINUE_SEARCH;       // not one of ours
     uint32_t i = S->trace_n++ & 8191;
     S->trace[i][0] = S->frame;
-    S->trace[i][1] = *(uint32_t*)c->Esp;
-    S->trace[i][2] = c->Ecx;
-    S->trace[i][3] = c->Eax;
-    c->EFlags |= 0x10000;                   // resume flag: do not trap on the same instruction again
+    S->trace[i][1] = c->Eip;                // execute breakpoint: the traced instruction; data write: the one after it
+    S->trace[i][2] = c->Eax; S->trace[i][3] = c->Ecx; S->trace[i][4] = c->Edx;
+    S->trace[i][5] = c->Ebx; S->trace[i][6] = c->Esi; S->trace[i][7] = c->Edi;
+    S->trace[i][8] = *(uint32_t*)c->Esp; S->trace[i][9] = *(uint32_t*)(c->Esp + 4);
+    if (S->trace_addr && c->Eip == S->trace_addr) c->EFlags |= 0x10000;    // resume flag for execute breakpoints
+    c->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 

@@ -61,7 +61,7 @@ struct Shm {
     // Hardware-breakpoint tracing: the host sets trace_addr, then a debug register on the game thread.
     volatile uint32_t trace_addr;   // address whose execution is logged (0 = off)
     volatile uint32_t trace_n;      // entries written so far (ring of 8192)
-    uint32_t trace[8192][4];        // per hit: frame marker, return address, ecx, eax
+    uint32_t trace[8192][10];       // per hit: frame, eip, eax, ecx, edx, ebx, esi, edi, [esp], [esp+4]
     // Who reads the clocks (diagnostic): source 1 = QPC, 2 = timeGetTime, 3 = FILETIME.
     volatile uint32_t ncallers;
     struct { volatile uint32_t src, ret, count; } callers[64];
