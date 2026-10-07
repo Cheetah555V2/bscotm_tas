@@ -528,3 +528,34 @@ gameplay randomness is deterministic given the inputs.
 **Open:** the generator behind item/weapon drops is not identified. A global-variable diff of
 heap and `.data` between frames was too noisy to isolate it; the next step is a data
 breakpoint on the counter the drop changes, then reading back to the decision.
+
+### RNG: what actually decides drops (findings, supersedes the Mersenne Twister notes above)
+
+The Mersenne Twister engine is real but is not used in stage 1. The generator the gameplay
+uses is a **xorshift128-style generator**:
+
+- State: four `uint32` at `*(COTM.exe + 0x48365C) + 0x2F4 / 0x2F8 / 0x2FC / 0x300` (x, y, z, w).
+  That global is the same game-manager object the player pointer chain starts from.
+- Next number: `exe+0x80280` (`ecx` = manager, arg = range, returns `w % range`); float
+  version `exe+0x802E0`. Many other functions step the same four words inline (about 100
+  sites). `t = x ^ (x << 11); x = y; y = z; z = w; w = w ^ (((w >> 11) ^ t) >> 8) ^ t`.
+- Seeding: one 32-bit seed `s`: `x = s * 0x075BCD15, y = s * 0x0165EC15, z = s * 0x0034BF15,
+  w = s * 0x0006F855` (code at `exe+0x2695EC..0x269622`, a script command). The
+  constructor default is Marsaglia's 123456789 / 362436069 / 521288629 / 88675123.
+- **The seed is the Unix time in seconds at launch**, read through the C runtime's `time()`.
+  Seeds recovered from consecutive launches were 1791366638, +10, +9, +9, +9, +9 (the
+  seconds between launches). The runtime looks `GetSystemTimeAsFileTime` and
+  `GetSystemTimePreciseAsFileTime` up with `GetProcAddress`, so patching the import slots
+  does not reach it.
+- Drops: the candle's break handler (`exe+0x7CB10`) looks up a drop table entry and calls
+  `exe+0x26CB80`, which builds cumulative weights and calls `exe+0x80280(total)`. The result
+  picks the item kind. Item pickup (`exe+0x1FDE40..`) adds weapon points through
+  `exe+0x1FCCE0`. Weapon points ("Ammo") = byte at `*(*(exe+0x483660)+8)+0x1E` (max at +0x1D).
+- Measured: the same movie to frame 3715 gave ammo 18 or 19 in different launches (about
+  1 in 4). Not the cause: wall clock via `QueryPerformanceCounter`, process id, heap address,
+  worker-thread overlap. Freezing the clock the game sees (hook `GetProcAddress` and hand
+  out a fixed time) made the generator state at frame 1 identical on every launch.
+
+Ways to interfere (all without patching game code): (1) give the game a chosen time through
+`GetProcAddress`; (2) write the four state words from the hook at a frame marker (host
+shared memory); (3) hardware breakpoints on `exe+0x80280` to log every draw.

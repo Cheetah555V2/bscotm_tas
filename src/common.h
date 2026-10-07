@@ -34,6 +34,8 @@ enum SpeedMask : uint32_t {
     SPEED_NOVSYNC = 16, // d3d9: force PresentationInterval IMMEDIATE when the device is created
     SPEED_NODRAW = 32,  // d3d9: skip Present/Clear/Draw* while fast-forwarding (see Shm::draw_from)
     SPEED_ALL = 63,
+    SPEED_FIXPID = 128,  // experiment: GetCurrentProcessId returns a constant
+    SPEED_DETCLOCK = 64, // experiment: QueryPerformanceCounter advances by a fixed step per call, independent of real time
 };
 
 #define SHM_NAME "Local\\bscotm_tas_shm"
@@ -61,7 +63,8 @@ struct Shm {
     // Hardware-breakpoint tracing: the host sets trace_addr, then a debug register on the game thread.
     volatile uint32_t trace_addr;   // address whose execution is logged (0 = off)
     volatile uint32_t trace_n;      // entries written so far (ring of 8192)
-    uint32_t trace[8192][10];       // per hit: frame, eip, eax, ecx, edx, ebx, esi, edi, [esp], [esp+4]
+    volatile uint32_t trace_lo, trace_hi;   // with trace_addr == 1: log game heap allocations made between these frame markers
+    uint32_t trace[8192][32];       // per hit: frame, eip, eax, ecx, edx, ebx, esi, edi, [esp], [esp+4]  (allocation log: frame, size, tid, return addresses)
     // Who reads the clocks (diagnostic): source 1 = QPC, 2 = timeGetTime, 3 = FILETIME.
     volatile uint32_t ncallers;
     struct { volatile uint32_t src, ret, count; } callers[64];

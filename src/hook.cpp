@@ -9,6 +9,9 @@
 #include <windows.h>
 #include <string.h>
 #include "common.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include "fixedheap.h"
 
 static Shm*      S;
 static uintptr_t PollRet;
@@ -52,8 +55,50 @@ static void NoteCaller(uint32_t src, void* ret) {
         if (S->callers[i].ret == (uint32_t)(uintptr_t)ret && S->callers[i].src == src) { InterlockedIncrement((volatile LONG*)&S->callers[i].count); return; }
     if (n < 64) { S->callers[n].src = src; S->callers[n].ret = (uint32_t)(uintptr_t)ret; S->callers[n].count = 1; S->ncallers = n + 1; }
 }
+// Experiment: the game resolves some kernel32 functions at run time (GetProcAddress), bypassing our import
+// patches. Log what it asks for, and hand out our own clock for the precise-time call.
+static FARPROC (WINAPI *R_Gpa)(HMODULE, LPCSTR);
+static void (WINAPI *R_FtPrecise)(FILETIME*);
+static void (WINAPI *R_FtDyn)(FILETIME*);
+static void WINAPI H_FtDyn(FILETIME* f) {
+    static const char* fixedEnv = getenv("BSCOTM_FIXTIME");
+    if (fixedEnv) {
+        uint64_t t = (uint64_t)strtoull(fixedEnv, nullptr, 10) * 10000000ull + 116444736000000000ull;
+        f->dwLowDateTime = (DWORD)t; f->dwHighDateTime = (DWORD)(t >> 32);
+        return;
+    }
+    R_FtDyn(f);
+}
+static void WINAPI H_FtPrecise(FILETIME* f) {
+    static const char* fixedEnv = getenv("BSCOTM_FIXTIME");
+    if (fixedEnv) {
+        uint64_t t = (uint64_t)strtoull(fixedEnv, nullptr, 10) * 10000000ull + 116444736000000000ull;
+        f->dwLowDateTime = (DWORD)t; f->dwHighDateTime = (DWORD)(t >> 32);
+        return;
+    }
+    R_FtPrecise(f);
+}
+static FARPROC WINAPI H_Gpa(HMODULE m, LPCSTR name) {
+    FARPROC p = R_Gpa(m, name);
+    if (!((uintptr_t)name >> 16)) return p;                 // ordinal
+    if (getenv("BSCOTM_LOGGPA")) { FILE* lf = fopen("C:/Users/cheetah/AppData/Local/Temp/claude/D--CodeFile-bscotmTAStool-bscotm-tas/896c3b4d-f788-46a5-8869-a231c49cc7fe/scratchpad/gpa.log", "a"); if (lf) { fprintf(lf, "%s\n", name); fclose(lf); } }
+    if (p && !_stricmp(name, "GetSystemTimePreciseAsFileTime")) { R_FtPrecise = (void (WINAPI*)(FILETIME*))p; return (FARPROC)H_FtPrecise; }
+    if (p && !_stricmp(name, "GetSystemTimeAsFileTime")) { R_FtDyn = (void (WINAPI*)(FILETIME*))p; return (FARPROC)H_FtDyn; }
+    return p;
+}
+static DWORD (WINAPI *R_Pid)(void);
+static DWORD WINAPI H_Pid() { return (S->speed_mask & SPEED_FIXPID) ? 0x1234 : R_Pid(); }
 static BOOL WINAPI H_Qpc(LARGE_INTEGER* o) {
     NoteCaller(1, __builtin_return_address(0));
+    if (S->speed_mask & SPEED_DETCLOCK) {            // deterministic clock: depends only on how often it is read
+        static int64_t det;
+        EnterCriticalSection(&Cs);
+        if (!det) det = Freq * 1000;
+        det += Freq / 3840;                          // 1/64 of a 60 fps frame per call
+        o->QuadPart = det;
+        LeaveCriticalSection(&Cs);
+        return TRUE;
+    }
     BOOL r = R_Qpc(o);
     if (r && (S->speed_mask & SPEED_QPC)) o->QuadPart = VNow(o->QuadPart);
     return r;
@@ -70,6 +115,12 @@ static DWORD WINAPI H_Tgt() {
 
 static void WINAPI H_Ft(FILETIME* f) {
     NoteCaller(3, __builtin_return_address(0));
+    static const char* fixedEnv = getenv("BSCOTM_FIXTIME");      // experiment: the game sees this Unix time (seconds), frozen
+    if (fixedEnv) {
+        uint64_t t = (uint64_t)strtoull(fixedEnv, nullptr, 10) * 10000000ull + 116444736000000000ull;
+        f->dwLowDateTime = (DWORD)t; f->dwHighDateTime = (DWORD)(t >> 32);
+        return;
+    }
     R_Ft(f);
     if (!(S->speed_mask & SPEED_FILETIME)) return;
     LARGE_INTEGER q;
@@ -205,6 +256,8 @@ static int    NPending;
 
 static HANDLE WINAPI H_Ct(LPSECURITY_ATTRIBUTES a, SIZE_T sz, LPTHREAD_START_ROUTINE fn, LPVOID p, DWORD fl, LPDWORD id) {
     HANDLE h = R_Ct(a, sz, fn, p, fl, id);
+    static const bool serial = getenv("BSCOTM_SERIAL") != nullptr;      // experiment: run each worker to completion first
+    if (serial && h && !(fl & CREATE_SUSPENDED)) WaitForSingleObject(h, 3000);
     HANDLE d;
     if (h && !(fl & CREATE_SUSPENDED) &&    // the game may close h at once, so keep our own copy
         DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &d, SYNCHRONIZE, FALSE, 0)) {
@@ -266,6 +319,22 @@ static LONG CALLBACK TraceVeh(EXCEPTION_POINTERS* e) {
     if (S->trace_addr && c->Eip == S->trace_addr) c->EFlags |= 0x10000;    // resume flag for execute breakpoints
     c->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Allocation log (experiment): who allocates what during a window of frames. Each entry:
+// frame, size, thread id, then up to 7 plausible return addresses found on the stack.
+static void AllocLogImpl(size_t n) {
+    if (S->trace_addr != 1 || S->frame < S->trace_lo || S->frame > S->trace_hi) return;
+    uint32_t i = S->trace_n++ & 8191;
+    uint32_t base = (uint32_t)(uintptr_t)GetModuleHandleW(NULL);
+    S->trace[i][0] = S->frame; S->trace[i][1] = (uint32_t)n; S->trace[i][2] = GetCurrentThreadId();
+    for (int k = 3; k < 32; k++) S->trace[i][k] = 0;
+    uint32_t* sp = (uint32_t*)__builtin_frame_address(0); int k = 3;
+    for (int w = 0; w < 600 && k < 32; w++) {
+        uint32_t v = sp[w];
+        if (v > base + 5 && v < base + 0x350000 && (*(uint8_t*)(v - 5) == 0xE8 || *(uint8_t*)(v - 6) == 0xFF || *(uint8_t*)(v - 2) == 0xFF || *(uint8_t*)(v - 3) == 0xFF))
+            S->trace[i][k++] = v - base;
+    }
 }
 
 // ---- input -----------------------------------------------------------------
@@ -355,6 +424,16 @@ static void Init() {
     PollRet = (uintptr_t)exe + POLL_RET_RVA;
 
     AddVectoredExceptionHandler(1, TraceVeh);
+    PatchIat(GetModuleHandleW(NULL), "kernel32.dll", "GetProcAddress", (void*)H_Gpa, &R_Gpa);
+    AllocLog = AllocLogImpl;
+    if (getenv("BSCOTM_FIXHEAP") && arena::Init()) {     // experiment: the game's heap at a fixed address
+        HMODULE ex = GetModuleHandleW(NULL);
+        PatchIat(ex, "kernel32.dll", "HeapAlloc", (void*)H_HeapAlloc, &R_HeapAlloc);
+        PatchIat(ex, "kernel32.dll", "HeapFree", (void*)H_HeapFree, &R_HeapFree);
+        PatchIat(ex, "kernel32.dll", "HeapReAlloc", (void*)H_HeapReAlloc, &R_HeapReAlloc);
+        PatchIat(ex, "kernel32.dll", "HeapSize", (void*)H_HeapSize, &R_HeapSize);
+    }
+    PatchIat(GetModuleHandleW(NULL), "kernel32.dll", "GetCurrentProcessId", (void*)H_Pid, &R_Pid);
     bool ok = PatchIat(exe, "user32.dll", "GetAsyncKeyState", (void*)H_Gaks, &R_Gaks);
 
     // Clock hooks are optional: a missing import just means that clock stays real.
