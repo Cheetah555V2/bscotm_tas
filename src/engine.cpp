@@ -144,6 +144,41 @@ void Session::AbortSteps() {
     s->speed_milli = 1000;
 }
 
+bool Session::SaveState(int slot) {
+    if (!s || !s->paused || slot < 0 || slot > 7 || !(s->features & FEAT_ARENA_OK)) return false;
+    s->snap_slot = slot;
+    s->snap_result = 0;
+    MemoryBarrier();
+    s->snap_cmd = 1;
+    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 10000;) {
+        if (!s->snap_cmd) return s->snap_result == 1;
+        if (!Alive()) return false;
+        Sleep(1);
+    }
+    return false;
+}
+
+int Session::StateRow(int slot) const {
+    if (!s || slot < 0 || slot > 7 || !s->snap_frame[slot]) return -1;
+    return (int)s->snap_frame[slot] - 1 - (int)pre;
+}
+
+bool Session::LoadState(int slot) {
+    if (!s || !s->paused || slot < 0 || slot > 7 || !s->snap_frame[slot]) return false;
+    uint32_t want = s->snap_frame[slot];
+    s->snap_slot = slot;
+    s->snap_result = 0;
+    MemoryBarrier();
+    s->snap_cmd = 2;
+    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 15000;) {
+        if (!s->snap_cmd && s->paused == want) return s->snap_result == 1;
+        if (!s->snap_cmd && s->snap_result == 2) return false;
+        if (!Alive()) return false;
+        Sleep(1);
+    }
+    return false;
+}
+
 bool Session::StartRecording() {
     if (!s || !s->paused) return false;
     rec_start = s->paused - 1;
@@ -216,6 +251,7 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     if (!s) { ss.Close(); r.error = "MapViewOfFile failed."; return r; }
     memset(s, 0, sizeof(Shm));
     s->magic = SHM_MAGIC;
+    s->features = p.savestates ? FEAT_SAVESTATE : 0;
 
     STARTUPINFOW si{};
     si.cb = sizeof si;

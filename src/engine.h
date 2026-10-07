@@ -17,6 +17,7 @@ struct RunParams {
     uint32_t target = 0;        // movie frames to play
     bool record = false;        // after `target` frames, keep recording until stopped
     bool hold = false;          // after `target` frames, freeze the game for frame advance
+    bool savestates = false;    // give the game a private heap so SaveState/LoadState work
     uint32_t speed_milli = 1000;    // clock speed while replaying (1000 = 1x)
     uint32_t speed_mask = 31;       // SPEED_* clocks that run at that speed
 };
@@ -52,6 +53,10 @@ struct Session {
     // Runs n frames in a row without blocking: keys[i] is the input of frame i. The game
     // runs at speed_milli (1000 = real time) and freezes again after the last one.
     bool BeginSteps(const uint16_t* keys, uint32_t n, uint32_t speed_milli);
+    // Savestates (need RunParams::savestates, the game frozen). Slots 0..7.
+    bool SaveState(int slot);
+    bool LoadState(int slot);       // leaves the game frozen at the marker the slot was saved at
+    int  StateRow(int slot) const;  // movie row the slot restores to, or -1 if empty
     int PollSteps();                // 1 = done (frozen again), 0 = running, -1 = failed
     uint32_t StepsDone() const;     // frames finished so far by the current batch
     void AbortSteps();              // stops the batch at the next frame boundary

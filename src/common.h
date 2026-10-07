@@ -25,6 +25,8 @@ static const uint32_t POLL_RET_RVA = 0x2A5960;
 enum Mode   : uint32_t { M_IDLE = 0, M_RECORD = 1, M_PLAY = 2 };
 enum Status : uint32_t { ST_HOOKED = 1, ST_PLAY_END = 2, ST_RESUMED = 4, ST_HOOK_FAIL = 8 };
 
+enum Feature : uint32_t { FEAT_SAVESTATE = 1, FEAT_ARENA_OK = 2, FEAT_ARENA_FAIL = 4 };
+
 // Clocks the hook can speed up (it patches COTM.exe's own imports of these).
 enum SpeedMask : uint32_t {
     SPEED_QPC = 1,      // kernel32!QueryPerformanceCounter
@@ -58,5 +60,10 @@ struct Shm {
     volatile uint32_t advance;      // frames the host releases while held
     volatile uint32_t paused;       // marker number the game is blocked at, 0 = running
     volatile uint32_t draw_from;    // SPEED_NODRAW: skip drawing until 2 frames before this marker (0 = never skip)
+    volatile uint32_t features;     // FEAT_* bits: host sets FEAT_SAVESTATE before injection, hook adds FEAT_ARENA_OK/FAIL
+    volatile uint32_t snap_cmd;     // host -> hook (while held): 1 = save slot, 2 = load slot; hook clears it when done
+    volatile uint32_t snap_slot;
+    volatile uint32_t snap_result;  // 1 = ok, 2 = failed
+    volatile uint32_t snap_frame[8];// marker number each slot was saved at (0 = empty)
     uint16_t keys[MAX_FRAMES];
 };

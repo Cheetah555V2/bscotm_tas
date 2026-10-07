@@ -491,3 +491,53 @@ activation at creation. The game then behaves as always focused, so the hook gat
 (non-injected) keys itself: they are only reported while `GetForegroundWindow()` is the
 game window. Verified: with Notepad focused the stepped result is identical (X 549.33,
 Y 1748.56), and keys typed into Notepad are not recorded.
+
+---
+
+## Update: in-process savestate prototype (branch `savestate-prototype`)
+
+Goal: save the game at a frame and put it back later, so a rewind does not replay from
+frame 1. Switched on with `RunParams::savestates` (off by default, nothing in the GUI).
+
+**What was built** (`src/savestate.h`, `src/hook.cpp`, `Session::SaveState/LoadState`):
+
+- The game allocates only through `HeapAlloc/HeapFree/HeapReAlloc/HeapSize` (static CRT,
+  imported from kernel32). Those import slots are patched to a private arena whose
+  bookkeeping lives inside it, so "the game's heap" is one block of memory.
+- A save, taken while the game is frozen at a frame marker, copies: the used part of the
+  arena, the exe's writable sections (`.data`/`.tls`, never `.bind`), the main thread's stack
+  from the poll call upwards, the callee-saved registers and SEH chain head, the virtual
+  clock and the marker number.
+- A load switches to a private stack, copies everything back and re-enters the poll
+  function from its first instruction (an asm stub records `ebx/esi/edi/ebp/esp` at every
+  call from the poll site). The game then handles that marker again and freezes there.
+- Other threads are suspended and the arena lock held while memory is copied. The game's own
+  threads are tracked (`CreateThread` hook) and parked at their next `Sleep`/`Wait`.
+- XAudio2 source voices are wrapped in stand-in objects (`CoCreateInstance` +
+  `CreateSourceVoice` hooks): a voice created after a save is destroyed before the restore,
+  one destroyed after the save is recreated behind the same pointer. `StopEngine` brackets
+  every copy so no callback runs into game memory half way.
+
+**What works:** the player position, hp and marker number come back exactly (frame 2000:
+x 1015.99, y 1712.00, hp 12). A save takes about 60-140 ms, a load 250-900 ms.
+
+**What does not:** running on after a load is not reliable. Measured on a stage 1 test movie
+(save at frame 2000, run on, load, run again): full success 1/6 with a 1-frame gap, 0/6
+with a 300-frame gap; the rest were crashes (mostly in the game's own code, dereferencing a
+pointer that is junk after the restore) or hangs on a game critical section.
+
+**Why (best explanation):** a savestate only captures what lives in the game's memory.
+Everything outside it keeps moving: the game's other threads (one loops on `Sleep(8)`, most
+likely music streaming) keep their own stacks and local state, XAudio2 voices and their
+queues, D3D resources, and kernel objects (events, critical-section internals). After a
+restore the game's memory describes one moment and those pieces another. Each failure that
+was chased down (callbacks into freed callback objects, locks left taken by a suspended
+thread, a double free after a thread finished a job the restored game still thinks is
+pending) pointed at this; fixing one only exposed the next. A hand-made "no audio" run is
+not possible: the game exits without XAudio2.
+
+**Options left:** (a) keep investing: capture and restore the streaming thread and audio
+queues, track D3D object lifetimes, shadow event states; uncertain and large. (b) Use
+the speed route instead: fast-forward now reaches roughly 1000-1500 frames per second
+(drawing skipped, key polls answered directly), so a 20-minute movie replays in about
+a minute. 
