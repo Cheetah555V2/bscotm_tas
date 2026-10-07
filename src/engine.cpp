@@ -118,6 +118,7 @@ bool Session::BeginSteps(const uint16_t* keys, uint32_t n, uint32_t speed_milli)
     step_target = f + n;
     step_seen = s->frame;
     step_tick = GetTickCount();
+    s->draw_from = step_target;
     s->speed_milli = speed_milli;
     MemoryBarrier();
     s->advance = n;
@@ -253,6 +254,7 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     } else {
         s->stop_at = (uint32_t)total;
     }
+    s->draw_from = (uint32_t)total + 1;         // draw again just before the end, so the last picture is real
     s->speed_milli = p.speed_milli;
     s->speed_mask = p.speed_mask;
     s->status &= ~(ST_PLAY_END | ST_RESUMED);

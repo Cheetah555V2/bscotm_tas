@@ -88,10 +88,52 @@ static DWORD WINAPI H_WaitEx(HANDLE h, DWORD ms, BOOL a) { return R_WaitEx(h, Sh
 static void* (WINAPI *R_D3dCreate)(UINT);
 static HRESULT (WINAPI *R_CreateDevice)(void*, UINT, UINT, HWND, DWORD, DWORD*, void**);
 
+// With SPEED_NODRAW the frames nobody will see are not drawn at all: Present, Clear and the
+// Draw* calls (all in d3d9.dll, not game code) return success without doing anything, which
+// is most of the per-frame cost. The last 2 frames before the host's stopping point are drawn
+// normally so the frozen picture is correct.
+static bool SkipDraw() {
+    return (S->speed_mask & SPEED_NODRAW) && S->draw_from && Speed() > 1000 && S->frame + 2 < S->draw_from;
+}
+typedef HRESULT (__stdcall *PFN_Present)(void*, const void*, const void*, HWND, const void*);
+typedef HRESULT (__stdcall *PFN_Clear)(void*, DWORD, const void*, DWORD, DWORD, float, DWORD);
+typedef HRESULT (__stdcall *PFN_DP)(void*, UINT, UINT, UINT);
+typedef HRESULT (__stdcall *PFN_DIP)(void*, UINT, INT, UINT, UINT, UINT, UINT);
+typedef HRESULT (__stdcall *PFN_DPUP)(void*, UINT, UINT, const void*, UINT);
+typedef HRESULT (__stdcall *PFN_DIPUP)(void*, UINT, UINT, UINT, UINT, const void*, UINT, const void*, UINT);
+static PFN_Present R_Present; static PFN_Clear R_Clear; static PFN_DP R_Dp; static PFN_DIP R_Dip;
+static PFN_DPUP R_Dpup; static PFN_DIPUP R_Dipup;
+static HRESULT __stdcall H_Present(void* d, const void* a, const void* b, HWND w, const void* c) { return SkipDraw() ? 0 : R_Present(d, a, b, w, c); }
+static HRESULT __stdcall H_Clear(void* d, DWORD n, const void* r, DWORD f, DWORD c, float z, DWORD s) { return SkipDraw() ? 0 : R_Clear(d, n, r, f, c, z, s); }
+static HRESULT __stdcall H_Dp(void* d, UINT t, UINT s, UINT n) { return SkipDraw() ? 0 : R_Dp(d, t, s, n); }
+static HRESULT __stdcall H_Dip(void* d, UINT t, INT b, UINT mi, UINT nv, UINT si, UINT pc) { return SkipDraw() ? 0 : R_Dip(d, t, b, mi, nv, si, pc); }
+static HRESULT __stdcall H_Dpup(void* d, UINT t, UINT pc, const void* v, UINT st) { return SkipDraw() ? 0 : R_Dpup(d, t, pc, v, st); }
+static HRESULT __stdcall H_Dipup(void* d, UINT t, UINT mi, UINT nv, UINT pc, const void* i, UINT fmt, const void* v, UINT st) {
+    return SkipDraw() ? 0 : R_Dipup(d, t, mi, nv, pc, i, fmt, v, st);
+}
+
+static void PatchDevice(void* dev) {
+    void** vt = *(void***)dev;
+    struct { int slot; void* hook; void* real; } t[] = {
+        {17, (void*)H_Present, &R_Present}, {43, (void*)H_Clear, &R_Clear}, {81, (void*)H_Dp, &R_Dp},
+        {82, (void*)H_Dip, &R_Dip}, {83, (void*)H_Dpup, &R_Dpup}, {84, (void*)H_Dipup, &R_Dipup},
+    };
+    for (auto& e : t) {
+        if (*(void**)e.real) continue;                  // already patched (shared vtable)
+        DWORD old;
+        if (!VirtualProtect(&vt[e.slot], 4, PAGE_READWRITE, &old)) continue;
+        *(void**)e.real = vt[e.slot];
+        vt[e.slot] = e.hook;
+        VirtualProtect(&vt[e.slot], 4, old, &old);
+    }
+}
+
 static HRESULT WINAPI H_CreateDevice(void* self, UINT ad, UINT type, HWND wnd, DWORD fl, DWORD* pp, void** out) {
     // D3DPRESENT_PARAMETERS: PresentationInterval is the 14th DWORD.
     if ((S->speed_mask & SPEED_NOVSYNC) && pp) pp[13] = 0x80000000u;   // D3DPRESENT_INTERVAL_IMMEDIATE
-    return R_CreateDevice(self, ad, type, wnd, fl, pp, out);
+    HRESULT hr = R_CreateDevice(self, ad, type, wnd, fl, pp, out);
+    if (hr == 0 && out && *out) PatchDevice(*out);
+    return hr;
 }
 
 static void* WINAPI H_D3dCreate(UINT ver) {
@@ -230,20 +272,21 @@ static void Marker(Shm* s) {
 }
 
 static __attribute__((noinline)) SHORT WINAPI H_Gaks(int vk) {
-    SHORT r = R_Gaks(vk);
-    if ((uintptr_t)__builtin_return_address(0) != PollRet) return r;
+    if ((uintptr_t)__builtin_return_address(0) != PollRet) return R_Gaks(vk);
     Shm* s = S;
     s->polls++;
     if (vk == 0) {                              // table index 0 = frame boundary
         Focused = !GameWnd || GetForegroundWindow() == GameWnd;
         Marker(s);
-        return r;
+        return 0;
     }
     uint32_t b = ((unsigned)vk > 255) ? 0xFF : BitOf[vk];
-    if (b != 0xFF && s->mode == M_PLAY) {
+    if (s->mode == M_PLAY) {                    // scripted: never ask Windows (81 system calls a frame)
+        if (b == 0xFF) return 0;
         uint32_t f = s->frame;
         return ((s->keys[f ? f - 1 : 0] >> b) & 1) ? (SHORT)0x8000 : (SHORT)0;
     }
+    SHORT r = R_Gaks(vk);
     if (!Focused) return 0;                     // live keys only count in the focused game
     if (b != 0xFF && s->mode == M_RECORD && (r & 0x8000)) Cur |= 1u << b;
     return r;
