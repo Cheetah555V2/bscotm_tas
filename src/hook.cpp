@@ -46,13 +46,21 @@ static int64_t VNow(int64_t real) {
     return v;
 }
 
+static void NoteCaller(uint32_t src, void* ret) {
+    uint32_t n = S->ncallers;
+    for (uint32_t i = 0; i < n && i < 64; i++)
+        if (S->callers[i].ret == (uint32_t)(uintptr_t)ret && S->callers[i].src == src) { InterlockedIncrement((volatile LONG*)&S->callers[i].count); return; }
+    if (n < 64) { S->callers[n].src = src; S->callers[n].ret = (uint32_t)(uintptr_t)ret; S->callers[n].count = 1; S->ncallers = n + 1; }
+}
 static BOOL WINAPI H_Qpc(LARGE_INTEGER* o) {
+    NoteCaller(1, __builtin_return_address(0));
     BOOL r = R_Qpc(o);
     if (r && (S->speed_mask & SPEED_QPC)) o->QuadPart = VNow(o->QuadPart);
     return r;
 }
 
 static DWORD WINAPI H_Tgt() {
+    NoteCaller(2, __builtin_return_address(0));
     DWORD r = R_Tgt();
     if (!(S->speed_mask & SPEED_MMTIME)) return r;
     LARGE_INTEGER q;
@@ -61,6 +69,7 @@ static DWORD WINAPI H_Tgt() {
 }
 
 static void WINAPI H_Ft(FILETIME* f) {
+    NoteCaller(3, __builtin_return_address(0));
     R_Ft(f);
     if (!(S->speed_mask & SPEED_FILETIME)) return;
     LARGE_INTEGER q;
@@ -241,6 +250,22 @@ static void Hold(Shm* s, uint32_t f) {
     s->paused = 0;
 }
 
+// ---- tracing -----------------------------------------------------------------------
+// The host can put a hardware execute breakpoint on any game address (no code is modified).
+// Each hit is logged into the shared block and execution carries on.
+static LONG CALLBACK TraceVeh(EXCEPTION_POINTERS* e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = e->ContextRecord;
+    if (!S->trace_addr || c->Eip != S->trace_addr) return EXCEPTION_CONTINUE_SEARCH;
+    uint32_t i = S->trace_n++ & 8191;
+    S->trace[i][0] = S->frame;
+    S->trace[i][1] = *(uint32_t*)c->Esp;
+    S->trace[i][2] = c->Ecx;
+    S->trace[i][3] = c->Eax;
+    c->EFlags |= 0x10000;                   // resume flag: do not trap on the same instruction again
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
 // ---- input -----------------------------------------------------------------
 static void Marker(Shm* s) {
     JoinThreads();
@@ -327,6 +352,7 @@ static void Init() {
     HMODULE exe = GetModuleHandleW(NULL);
     PollRet = (uintptr_t)exe + POLL_RET_RVA;
 
+    AddVectoredExceptionHandler(1, TraceVeh);
     bool ok = PatchIat(exe, "user32.dll", "GetAsyncKeyState", (void*)H_Gaks, &R_Gaks);
 
     // Clock hooks are optional: a missing import just means that clock stays real.

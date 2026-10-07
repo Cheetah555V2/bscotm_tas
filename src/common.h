@@ -58,5 +58,12 @@ struct Shm {
     volatile uint32_t advance;      // frames the host releases while held
     volatile uint32_t paused;       // marker number the game is blocked at, 0 = running
     volatile uint32_t draw_from;    // SPEED_NODRAW: skip drawing until 2 frames before this marker (0 = never skip)
+    // Hardware-breakpoint tracing: the host sets trace_addr, then a debug register on the game thread.
+    volatile uint32_t trace_addr;   // address whose execution is logged (0 = off)
+    volatile uint32_t trace_n;      // entries written so far (ring of 8192)
+    uint32_t trace[8192][4];        // per hit: frame marker, return address, ecx, eax
+    // Who reads the clocks (diagnostic): source 1 = QPC, 2 = timeGetTime, 3 = FILETIME.
+    volatile uint32_t ncallers;
+    struct { volatile uint32_t src, ret, count; } callers[64];
     uint16_t keys[MAX_FRAMES];
 };

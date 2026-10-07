@@ -491,3 +491,40 @@ activation at creation. The game then behaves as always focused, so the hook gat
 (non-injected) keys itself: they are only reported while `GetForegroundWindow()` is the
 game window. Verified: with Notepad focused the stepped result is identical (X 549.33,
 Y 1748.56), and keys typed into Notepad are not recorded.
+
+---
+
+## RNG investigation (branch `rng-investigation`)
+
+Method: the game's `.text` is decrypted at runtime, so the code was dumped from the running
+process and searched for PRNG constants; hardware execute breakpoints (debug registers set
+from the host, no code modified) logged calls; the hook logs who reads each clock.
+
+**The one generator found: a parameterised Mersenne Twister variant.**
+- Seed routine `exe+0x2C77B0` (`this` = engine, arg = seed): `state[0]=seed;
+  state[i] = 1812433253 * (state[i-1] ^ (state[i-1] >> 30)) + i`.
+- Next number `exe+0x2C7800` (`ecx` = engine): standard MT twist using fields of the object,
+  tempering `y ^= y>>11; y ^= (y<<7) & 0xFF3A58AD; y ^= (y<<15) & 0xFFFFDF8C; y ^= y>>18`.
+  If the index is `n+1` (never seeded) it seeds itself with 5489 first.
+- Engine object layout: `+0 n`, `+4 m`, `+8 matrix constant`, `+0xC upper mask`, `+0x10 lower
+  mask`, `+0x14 state array`, `+0x20 index`.
+- Seeding command handler `exe+0x2C7F00` (script command, args `(cmd, owner)`): the command's
+  value `v`; if `v <= 31` the seed is `table[v]` (32 fixed values, 485 .. 31043, at
+  `exe+0x39AE38` in the dumped build) otherwise `v` itself. The engine pointer is `owner+0xB0`,
+  the chosen id is stored at `owner+0x3C`.
+- Users: 19 call sites of `next()` between `exe+0x2C79xx` and `exe+0x2C8Bxx` (random byte
+  ranges / colours inside script-command handlers, i.e. scripted effects or behaviours).
+- Observed use: **zero calls** on the main thread during the whole of `test3.bscotm` (cold boot
+  to a stage 1 playthrough, 4838 frames) and 12000 frames of `test.bscotm`; no engine object
+  exists in memory in those frames. So this generator is not what decides stage 1 gameplay.
+
+**What was ruled out:** no CRT `rand` (no 214013/2531011), no other LCG, xorshift32, PCG,
+splitmix or murmur constants in the code, no `rand_s` / `CryptGenRandom` import. The only
+clock the game's own code reads is `QueryPerformanceCounter` (frame pacing); `timeGetTime`
+and `GetSystemTimeAsFileTime` are never called from game code in play. Results are identical
+across launches (different process ids and clock origins) and speeds, so whatever drives the
+gameplay randomness is deterministic given the inputs.
+
+**Open:** the generator behind item/weapon drops is not identified. A global-variable diff of
+heap and `.data` between frames was too noisy to isolate it; the next step is a data
+breakpoint on the counter the drop changes, then reading back to the decision.
