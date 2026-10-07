@@ -32,7 +32,8 @@ enum SpeedMask : uint32_t {
     SPEED_FILETIME = 4, // kernel32!GetSystemTimeAsFileTime
     SPEED_SLEEP = 8,    // Sleep / WaitForSingleObject(Ex) with a finite timeout
     SPEED_NOVSYNC = 16, // d3d9: force PresentationInterval IMMEDIATE when the device is created
-    SPEED_ALL = 31,
+    SPEED_NODRAW = 32,  // d3d9: skip Present/Clear/Draw* while fast-forwarding (see Shm::draw_from)
+    SPEED_ALL = 63,
 };
 
 #define SHM_NAME "Local\\bscotm_tas_shm"
@@ -56,5 +57,6 @@ struct Shm {
     volatile uint32_t hold_at;      // arm `hold` when this marker number is reached (0 = off)
     volatile uint32_t advance;      // frames the host releases while held
     volatile uint32_t paused;       // marker number the game is blocked at, 0 = running
+    volatile uint32_t draw_from;    // SPEED_NODRAW: skip drawing until 2 frames before this marker (0 = never skip)
     uint16_t keys[MAX_FRAMES];
 };

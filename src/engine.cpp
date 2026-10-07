@@ -110,6 +110,40 @@ bool Session::Step(uint16_t keys) {
     return false;
 }
 
+bool Session::BeginSteps(const uint16_t* keys, uint32_t n, uint32_t speed_milli) {
+    if (!s || !s->paused || !n || s->paused - 1 + n > MAX_FRAMES) return false;
+    uint32_t f = s->paused;
+    for (uint32_t i = 0; i < n; i++) s->keys[f - 1 + i] = keys[i];
+    step_start = f;
+    step_target = f + n;
+    step_seen = s->frame;
+    step_tick = GetTickCount();
+    s->draw_from = step_target;
+    s->speed_milli = speed_milli;
+    MemoryBarrier();
+    s->advance = n;
+    return true;
+}
+
+uint32_t Session::StepsDone() const {
+    uint32_t at = s->paused ? s->paused : s->frame;
+    return at > step_start ? at - step_start : 0;
+}
+
+int Session::PollSteps() {
+    if (s->paused == step_target) { s->speed_milli = 1000; return 1; }
+    if (!Alive()) return -1;
+    if (s->frame != step_seen) { step_seen = s->frame; step_tick = GetTickCount(); }
+    else if (GetTickCount() - step_tick > 5000) return -1;      // no frame for 5 s
+    return 0;
+}
+
+void Session::AbortSteps() {
+    s->advance = 0;
+    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 3000 && !s->paused && Alive();) Sleep(1);
+    s->speed_milli = 1000;
+}
+
 bool Session::StartRecording() {
     if (!s || !s->paused) return false;
     rec_start = s->paused - 1;
@@ -220,6 +254,7 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     } else {
         s->stop_at = (uint32_t)total;
     }
+    s->draw_from = (uint32_t)total + 1;         // draw again just before the end, so the last picture is real
     s->speed_milli = p.speed_milli;
     s->speed_mask = p.speed_mask;
     s->status &= ~(ST_PLAY_END | ST_RESUMED);

@@ -27,7 +27,10 @@ back. The whole tool is two small native files (no Python, no Frida):
   `WaitForSingleObject`, again through the game's own import slots) and drops
   vsync when the D3D9 device is created. Both are needed: the game paces itself on
   QPC *and* vsync. Frames stay deterministic (same end state at 1x and 50x), and
-  the hook returns to real time exactly on the frame the replay ends.
+  the hook returns to real time exactly on the frame the replay ends. While
+  fast-forwarding it also skips drawing (D3D `Present`/`Clear`/`Draw*` return at once,
+  except for the last 2 frames so the frozen picture is real) and answers the game's
+  key polls without asking Windows: about 1000 frames per second instead of 340.
 - **Frame advance.** The hook blocks the game thread inside the input poll at a
   frame marker (before the frame's input is read) and releases it one frame per step.
   The virtual clock is frozen during the hold so the limiter does not see the pause
@@ -88,6 +91,7 @@ otherwise use **File > Set game path**.
 | **Play** (F5) | Relaunch the game and play the whole movie in real time |
 | **Rewind to cursor** (F6, or double-click a frame number) | Relaunch, fast-forward to the cursor row, then **freeze** the game there |
 | **Frame advance** (`.`) | Run exactly one frame of the frozen game using the next grid row's inputs (hold `.` to auto-repeat) |
+| **Run to cursor** (F4, or right-click a row > *Run game to frame N*) | Advance the frozen game through many frames at once, up to the cursor row, using the grid's inputs (past the end of the movie it appends blank frames). Runs at the fast-forward speed and gives the same result as stepping one by one (500 frames in about 1 s instead of 15 s). **Stop** (F9) cancels and freezes at the next frame. If the game is already at or past the cursor, use Rewind |
 | **Record here** (F12) | Unfreeze the game and record your live keyboard from the frozen frame (click the game window and play). **Stop** (F9) freezes the game again right after the last recorded frame, so you can keep stepping or record again |
 | **Resume live** (F11) | Unfreeze the game and take over with the keyboard (not recorded) |
 | **Record from cursor** (F7) | Play up to the cursor row, then record live from the next frame |
