@@ -58,5 +58,7 @@ struct Shm {
     volatile uint32_t advance;      // frames the host releases while held
     volatile uint32_t paused;       // marker number the game is blocked at, 0 = running
     volatile uint32_t draw_from;    // SPEED_NODRAW: skip drawing until 2 frames before this marker (0 = never skip)
+    volatile uint32_t rng_on;       // 1 = the game sees a frozen clock at Unix time rng_time (that is its RNG seed)
+    volatile uint32_t rng_time;     // Unix time in seconds; the game seeds its xorshift128 generator from it at launch
     uint16_t keys[MAX_FRAMES];
 };

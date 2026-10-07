@@ -60,7 +60,24 @@ static DWORD WINAPI H_Tgt() {
     return T0ms + (DWORD)((VNow(q.QuadPart) - V0) * 1000 / Freq);
 }
 
+// RNG seed: the game seeds its generator from the Unix time at launch. Its static C runtime reads the
+// clock through GetProcAddress (not through its imports), so hand out our clock from there too.
+static void SeedTime(FILETIME* f) {
+    uint64_t t = (uint64_t)S->rng_time * 10000000ull + 116444736000000000ull;
+    f->dwLowDateTime = (DWORD)t; f->dwHighDateTime = (DWORD)(t >> 32);
+}
+static FARPROC (WINAPI *R_Gpa)(HMODULE, LPCSTR);
+static void WINAPI H_FtSeed(FILETIME* f) { SeedTime(f); }
+static FARPROC WINAPI H_Gpa(HMODULE m, LPCSTR name) {
+    FARPROC p = R_Gpa(m, name);
+    if (p && S->rng_on && ((uintptr_t)name >> 16) &&
+        (!_stricmp(name, "GetSystemTimePreciseAsFileTime") || !_stricmp(name, "GetSystemTimeAsFileTime")))
+        return (FARPROC)H_FtSeed;
+    return p;
+}
+
 static void WINAPI H_Ft(FILETIME* f) {
+    if (S->rng_on) { SeedTime(f); return; }
     R_Ft(f);
     if (!(S->speed_mask & SPEED_FILETIME)) return;
     LARGE_INTEGER q;
@@ -350,6 +367,7 @@ static void Init() {
         PatchIat(exe, "kernel32.dll", "WaitForSingleObject", (void*)H_Wait, &R_Wait);
         PatchIat(exe, "kernel32.dll", "WaitForSingleObjectEx", (void*)H_WaitEx, &R_WaitEx);
     }
+    PatchIat(exe, "kernel32.dll", "GetProcAddress", (void*)H_Gpa, &R_Gpa);
     PatchIat(exe, "user32.dll", "CreateWindowExA", (void*)H_Cwe, &R_Cwe);
     PatchIat(exe, "d3d9.dll", "Direct3DCreate9", (void*)H_D3dCreate, &R_D3dCreate);
     S->status |= ok ? ST_HOOKED : ST_HOOK_FAIL;

@@ -19,7 +19,7 @@ namespace {
 enum {
     IDM_NEW = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEPRE, IDM_SETGAME, IDM_BASESAVE, IDM_EXIT,
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
-    IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO,
+    IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO, IDM_RNGSEED,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
     IDC_BASE = 300, IDC_PRE,
@@ -105,10 +105,11 @@ void SetMsg(const std::wstring& m) { SendMessageW(A.status, SB_SETTEXTW, 0, (LPA
 
 void UpdateStatus() {
     int n = Size();
-    wchar_t b[128];
+    wchar_t b[192], sd[40] = L"";
+    if (A.movie.has_seed) swprintf(sd, 40, L"   seed %u", (unsigned)A.movie.seed);
     double t = (A.cursor + 1) / 60.0, tt = n / 60.0;
-    swprintf(b, 128, L"Frame %d / %d   (%d:%05.2f / %d:%05.2f)   game at %d", n ? A.cursor + 1 : 0, n,
-             (int)t / 60, t - 60 * ((int)t / 60), (int)tt / 60, tt - 60 * ((int)tt / 60), A.reached);
+    swprintf(b, 192, L"Frame %d / %d   (%d:%05.2f / %d:%05.2f)   game at %d%ls", n ? A.cursor + 1 : 0, n,
+             (int)t / 60, t - 60 * ((int)t / 60), (int)tt / 60, tt - 60 * ((int)tt / 60), A.reached, sd);
     SendMessageW(A.status, SB_SETTEXTW, 1, (LPARAM)b);
 }
 
@@ -396,6 +397,37 @@ void EditNote() {
     if (!AskText(L"Frame note", L"Note for frame " + std::to_wstring(row + 1) + L" (leave empty to remove):", t)) return;
     for (wchar_t& c : t) if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
     SetNote(row, U8(t));
+    SetFocus(A.grid);
+}
+
+// The RNG seed is the Unix time (seconds) the game sees at launch; it seeds the game's generator.
+// Changing it makes the live game stale, so the next frame advance replays from the start.
+void EditSeed() {
+    if (A.busy) return;
+    std::wstring t = A.movie.has_seed ? std::to_wstring(A.movie.seed) : L"";
+    if (!AskText(L"RNG seed", L"Seed (a number 0 - 4294967295; leave empty for the real clock = random every launch):", t)) return;
+    while (!t.empty() && t.back() == L' ') t.pop_back();
+    size_t b = t.find_first_not_of(L' ');
+    t = b == std::wstring::npos ? L"" : t.substr(b);
+    bool has = !t.empty();
+    uint64_t v = 0;
+    if (has) {
+        if (t.size() > 10 || t.find_first_not_of(L"0123456789") != std::wstring::npos) has = false;
+        else v = _wcstoui64(t.c_str(), nullptr, 10);
+        if (!has || v > 4294967295ull) {
+            MessageBoxW(A.wnd, L"The seed must be a whole number from 0 to 4294967295.", L"RNG seed", MB_ICONERROR);
+            return;
+        }
+    }
+    if (has == A.movie.has_seed && (!has || (uint32_t)v == A.movie.seed)) return;
+    A.movie.has_seed = has;
+    A.movie.seed = (uint32_t)v;
+    A.dirty = true;
+    A.reached = 0;
+    InvalidateRect(A.grid, nullptr, FALSE);
+    UpdateTitle(); UpdateStatus();
+    SetMsg(has ? L"RNG seed " + std::to_wstring(A.movie.seed) + L". Rewind (F6) to restart the game with it."
+               : L"RNG seed removed: the game uses the real clock. Rewind (F6) to restart it.");
     SetFocus(A.grid);
 }
 
@@ -941,6 +973,8 @@ void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, b
     // can be thawed without a burst of catch-up frames.
     p.speed_mask = p.speed_milli > 1000 ? SPEED_ALL : (SPEED_ALL & ~SPEED_NOVSYNC);
     p.hold = hold;
+    p.seeded = A.movie.has_seed;
+    p.seed = A.movie.seed;
 
     A.jobRecord = record; A.jobNew = fresh; A.jobTarget = target; A.jobHold = hold;
     A.busy = true;
@@ -1238,6 +1272,7 @@ void BuildMenu(HWND w) {
     add(r, IDM_RESUME, L"Resume &live (unfreeze)\tF11");
     add(r, IDM_STOP, L"&Stop\tF9");
     AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
+    add(r, IDM_RNGSEED, L"RNG see&d...");
     A.speedMenu = CreatePopupMenu();
     add(A.speedMenu, IDM_SPEED0, L"Real time (1x)");
     add(A.speedMenu, IDM_SPEED1, L"4x");
@@ -1319,7 +1354,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             auto en = [&](int id, bool on) { EnableMenuItem(m, id, MF_BYCOMMAND | (on ? MF_ENABLED : MF_GRAYED)); };
             for (int id : {IDM_NEW, IDM_OPEN, IDM_CUT, IDM_PASTE, IDM_PASTEINS, IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES,
                            IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_RECORD, IDM_BASESAVE, IDM_STEP, IDM_RESUME, IDM_RECHERE,
-                           IDM_NOTE_EDIT, IDM_RUNTO})
+                           IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED})
                 en(id, !A.busy);
             en(IDM_NOTE_DEL, !A.busy && SelectionHasNote());
             en(IDM_UNDO, !A.busy && !A.undo.empty());
@@ -1350,6 +1385,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_NOTE_EDIT: EditNote(); break;
                 case IDM_NOTE_DEL: RemoveNotesInSelection(); break;
                 case IDM_NOTE_LIST: ShowNotesList(); break;
+                case IDM_RNGSEED: EditSeed(); break;
                 case IDM_PLAY: StartJob(false, (uint32_t)Size(), false, true); break;
                 case IDM_REWIND: StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true); break;
                 case IDM_STEP: FrameAdvance(); break;
