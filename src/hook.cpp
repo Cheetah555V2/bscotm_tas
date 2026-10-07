@@ -186,7 +186,8 @@ static void Hold(Shm* s, uint32_t f) {
     int64_t frozen = VNow(q.QuadPart);
     s->paused = f;
     while (s->hold) {
-        if (s->advance) { s->advance--; break; }
+        uint32_t a = s->advance;        // atomic: the host may reset it to abort a batch
+        if (a && InterlockedCompareExchange((volatile LONG*)&s->advance, (LONG)(a - 1), (LONG)a) == (LONG)a) break;
         Sleep(1);
     }
     QueryPerformanceCounter(&q);

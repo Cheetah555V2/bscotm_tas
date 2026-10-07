@@ -49,6 +49,13 @@ struct Session {
     uint32_t Row() const;           // movie row the held game runs next, or UINT_MAX if running
     // Runs one frame with `keys` as its input and holds again. False if it timed out.
     bool Step(uint16_t keys);
+    // Runs n frames in a row without blocking: keys[i] is the input of frame i. The game
+    // runs at speed_milli (1000 = real time) and freezes again after the last one.
+    bool BeginSteps(const uint16_t* keys, uint32_t n, uint32_t speed_milli);
+    int PollSteps();                // 1 = done (frozen again), 0 = running, -1 = failed
+    uint32_t StepsDone() const;     // frames finished so far by the current batch
+    void AbortSteps();              // stops the batch at the next frame boundary
+    uint32_t step_target = 0, step_start = 0, step_seen = 0, step_tick = 0;
     // Unfreezes the game and records the live keyboard (the game window must be
     // focused). Frame numbers are movie rows starting at Row() at the time of the call.
     bool StartRecording();

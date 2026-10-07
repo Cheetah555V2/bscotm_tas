@@ -19,7 +19,7 @@ namespace {
 enum {
     IDM_NEW = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEPRE, IDM_SETGAME, IDM_BASESAVE, IDM_EXIT,
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
-    IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST,
+    IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
     IDC_BASE = 300, IDC_PRE,
@@ -41,7 +41,7 @@ struct Step   { std::vector<Splice> parts; int cur_before = 0, cur_after = 0; };
 
 struct App {
     HWND wnd = nullptr, grid = nullptr, status = nullptr, cbBase = nullptr, cbPre = nullptr;
-    HWND lblBase = nullptr, lblPre = nullptr, btn[7] = {};
+    HWND lblBase = nullptr, lblPre = nullptr, btn[8] = {};
     HFONT font = nullptr, fontB = nullptr;
     HWND notesWnd = nullptr, notesList = nullptr;   // the Notes list window (when open)
     int dpi = 96;
@@ -67,6 +67,9 @@ struct App {
     bool liveRec = false;         // recording live from the frozen game (busy is set too)
     int liveRecRow = 0;           // movie row the live recording started at
     bool pendingStep = false;     // step once the resync job finishes
+    bool pendingRun = false;      // run to the cursor once the resync job finishes
+    bool stepping = false;        // a batch of frames is running (busy is set too)
+    int runFrom = 0, runTarget = 0;   // rows the batch started at / will stop before
     bool busy = false, jobRecord = false, jobNew = false, jobHold = false;
     uint32_t jobTarget = 0;
     volatile LONG stop = 0;
@@ -547,6 +550,9 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             HMENU pm = CreatePopupMenu();
             std::wstring lbl = (NoteAt(row).empty() ? L"Add note to frame " : L"Edit note of frame ") + std::to_wstring(row + 1) + L"...";
             bool hasNote = SelectionHasNote();
+            std::wstring run = L"Run game to frame " + std::to_wstring(row + 1);
+            AppendMenuW(pm, MF_STRING | (A.busy ? MF_GRAYED : 0), IDM_RUNTO, run.c_str());
+            AppendMenuW(pm, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(pm, MF_STRING | (A.busy ? MF_GRAYED : 0), IDM_NOTE_EDIT, lbl.c_str());
             AppendMenuW(pm, MF_STRING | (A.busy || !hasNote ? MF_GRAYED : 0), IDM_NOTE_DEL, L"Remove note(s) in selection");
             AppendMenuW(pm, MF_SEPARATOR, 0, nullptr);
@@ -962,6 +968,7 @@ void OnJobProgress(Phase ph, uint32_t f) {
 }
 
 void FrameAdvance();
+void RunToCursor();
 void StopRecordHere();
 
 void OnJobDone(RunResult* r) {
@@ -1014,6 +1021,10 @@ void OnJobDone(RunResult* r) {
         A.pendingStep = false;
         if (A.sess.Active()) FrameAdvance();
     }
+    if (A.pendingRun) {
+        A.pendingRun = false;
+        if (A.sess.Active()) RunToCursor();
+    }
 }
 
 // ---- frame advance ----------------------------------------------------------
@@ -1048,6 +1059,74 @@ void FrameAdvance() {
     A.reached = row + 1;
     SetCursorRow(row, false);
     SetMsg(L"Frame " + std::to_wstring(row + 1) + L" advanced.");
+}
+
+// Advances the frozen game until it has run through the cursor row (the same stop point as
+// Rewind to cursor), feeding it the grid's inputs. Past the end of the movie it appends blank
+// frames. The batch runs at the fast-forward speed and does not block the editor.
+void RunToCursor() {
+    if (A.busy) return;
+    if (!A.sess.Active() || !A.sess.Alive()) {
+        A.sess.Close();
+        SetMsg(L"No frozen game. Use Rewind to cursor (F6) first, then run to a later row.");
+        return;
+    }
+    int row = (int)A.sess.Row();
+    if (row < 0) { SetMsg(L"The game is not frozen."); return; }
+    if (row > A.reached) {      // an edit before the game's position invalidated it: replay first
+        A.pendingRun = true;
+        StartJob(false, (uint32_t)A.reached, false, false, true);
+        if (!A.busy) A.pendingRun = false;
+        return;
+    }
+    int target = A.cursor + 1;
+    if (row >= target) {
+        SetMsg(L"The game is already at frame " + std::to_wstring(row) + L", at or past the cursor. Rewind to cursor (F6) goes back.");
+        return;
+    }
+    Step st; st.cur_before = A.cursor;
+    EnsureRows(st, target);
+    Commit(st);
+    Frames keys(A.movie.frames.begin() + row, A.movie.frames.begin() + target);
+    if (!A.sess.BeginSteps(keys.data(), (uint32_t)keys.size(), SPEEDS[A.speed])) {
+        A.sess.Close();
+        SetMsg(L"Could not start running the game.");
+        return;
+    }
+    A.runFrom = row; A.runTarget = target;
+    A.stepping = true;
+    A.busy = true;
+    EnableUi();
+    SetTimer(A.wnd, 2, 20, nullptr);
+    UpdateScroll(); UpdateStatus();
+}
+
+void FinishRun(int result, bool aborted) {
+    KillTimer(A.wnd, 2);
+    A.stepping = false;
+    A.busy = false;
+    EnableUi();
+    if (result < 0) {
+        A.sess.Close();
+        SetMsg(L"The game stopped responding while running to the cursor.");
+    } else {
+        int row = (int)A.sess.Row();
+        if (row >= 0) A.reached = std::max(A.reached, row);
+        SetMsg((aborted ? L"Stopped. Game frozen after frame " : L"Game frozen after frame ") + std::to_wstring(row) + L".");
+    }
+    InvalidateRect(A.grid, nullptr, FALSE);
+    UpdateStatus();
+    SetFocus(A.grid);
+}
+
+void PollRun() {
+    int r = A.sess.PollSteps();
+    if (r == 0) {
+        SetMsg(L"Running to the cursor: frame " + std::to_wstring(A.runFrom + (int)A.sess.StepsDone()) + L" / " +
+               std::to_wstring(A.runTarget) + L". Stop (F9) to cancel.");
+        return;
+    }
+    FinishRun(r, false);
 }
 
 // Record from the frozen game without relaunching: the game runs live, the hook records
@@ -1110,12 +1189,12 @@ void ResumeLive() {
 }
 
 // ---- main window ----------------------------------------------------------
-const wchar_t* const BTN_TEXT[7] = {L"Record new", L"Play", L"Rewind to cursor", L"Record from cursor", L"Frame advance", L"Record here", L"Stop"};
-const int BTN_ID[7] = {IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STEP, IDM_RECHERE, IDM_STOP};
+const wchar_t* const BTN_TEXT[8] = {L"Record new", L"Play", L"Rewind to cursor", L"Record from cursor", L"Frame advance", L"Run to cursor", L"Record here", L"Stop"};
+const int BTN_ID[8] = {IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STEP, IDM_RUNTO, IDM_RECHERE, IDM_STOP};
 
 void EnableUi() {
-    for (int i = 0; i < 6; i++) EnableWindow(A.btn[i], !A.busy);
-    EnableWindow(A.btn[6], A.busy);
+    for (int i = 0; i < 7; i++) EnableWindow(A.btn[i], !A.busy);
+    EnableWindow(A.btn[7], A.busy);
     EnableWindow(A.cbBase, !A.busy);
     EnableWindow(A.cbPre, !A.busy);
 }
@@ -1154,6 +1233,7 @@ void BuildMenu(HWND w) {
     add(r, IDM_RECFROM, L"Record &from cursor\tF7");
     add(r, IDM_RECORD, L"Record &new movie\tF8");
     add(r, IDM_STEP, L"Frame &advance\t.");
+    add(r, IDM_RUNTO, L"Run to &cursor (advance the frozen game)\tF4");
     add(r, IDM_RECHERE, L"Record &here (live, from the frozen game)\tF12");
     add(r, IDM_RESUME, L"Resume &live (unfreeze)\tF11");
     add(r, IDM_STOP, L"&Stop\tF9");
@@ -1177,8 +1257,8 @@ void Layout() {
     RECT sr;
     GetWindowRect(A.status, &sr);
     int sh = sr.bottom - sr.top, tb = S(38), x = S(6), y = S(5), bh = S(28);
-    const int bw[7] = {S(96), S(60), S(124), S(142), S(110), S(100), S(60)};
-    for (int i = 0; i < 7; i++) { MoveWindow(A.btn[i], x, y, bw[i], bh, TRUE); x += bw[i] + S(4); }
+    const int bw[8] = {S(96), S(60), S(124), S(142), S(110), S(110), S(100), S(60)};
+    for (int i = 0; i < 8; i++) { MoveWindow(A.btn[i], x, y, bw[i], bh, TRUE); x += bw[i] + S(4); }
     x += S(10);
     MoveWindow(A.lblBase, x, y + S(5), S(52), S(20), TRUE); x += S(54);
     MoveWindow(A.cbBase, x, y, S(130), S(200), TRUE); x += S(138);
@@ -1204,7 +1284,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 
             BuildMenu(w);
             A.status = CreateWindowExW(0, STATUSCLASSNAMEW, L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, w, nullptr, nullptr, nullptr);
-            for (int i = 0; i < 7; i++) {
+            for (int i = 0; i < 8; i++) {
                 A.btn[i] = CreateWindowExW(0, L"BUTTON", BTN_TEXT[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                            0, 0, 0, 0, w, (HMENU)(INT_PTR)BTN_ID[i], nullptr, nullptr);
                 SendMessageW(A.btn[i], WM_SETFONT, (WPARAM)A.font, TRUE);
@@ -1232,14 +1312,14 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_SIZE: if (A.status) Layout(); return 0;
-        case WM_GETMINMAXINFO: ((MINMAXINFO*)lp)->ptMinTrackSize = {S(1110), S(300)}; return 0;
+        case WM_GETMINMAXINFO: ((MINMAXINFO*)lp)->ptMinTrackSize = {S(1240), S(300)}; return 0;
         case WM_SETFOCUS: SetFocus(A.grid); return 0;
         case WM_INITMENUPOPUP: {
             HMENU m = (HMENU)wp;
             auto en = [&](int id, bool on) { EnableMenuItem(m, id, MF_BYCOMMAND | (on ? MF_ENABLED : MF_GRAYED)); };
             for (int id : {IDM_NEW, IDM_OPEN, IDM_CUT, IDM_PASTE, IDM_PASTEINS, IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES,
                            IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_RECORD, IDM_BASESAVE, IDM_STEP, IDM_RESUME, IDM_RECHERE,
-                           IDM_NOTE_EDIT})
+                           IDM_NOTE_EDIT, IDM_RUNTO})
                 en(id, !A.busy);
             en(IDM_NOTE_DEL, !A.busy && SelectionHasNote());
             en(IDM_UNDO, !A.busy && !A.undo.empty());
@@ -1273,6 +1353,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_PLAY: StartJob(false, (uint32_t)Size(), false, true); break;
                 case IDM_REWIND: StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true); break;
                 case IDM_STEP: FrameAdvance(); break;
+                case IDM_RUNTO: RunToCursor(); break;
                 case IDM_RECHERE: RecordHere(); break;
                 case IDM_RESUME: ResumeLive(); break;
                 case IDM_RECFROM: StartJob(true, (uint32_t)std::min(A.cursor + 1, Size()), false); break;
@@ -1288,6 +1369,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 case IDM_STOP:
                     if (A.liveRec) StopRecordHere();
+                    else if (A.stepping) { A.sess.AbortSteps(); FinishRun(1, true); }
                     else if (A.busy) { A.stop = 1; SetMsg(L"Stopping..."); }
                     break;
                 case IDC_BASE: case IDC_PRE:
@@ -1302,6 +1384,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (HIWORD(wp) == BN_CLICKED && lp) SetFocus(A.grid);
             return 0;
         case WM_TIMER:
+            if (wp == 2 && A.stepping) { PollRun(); return 0; }
             if (wp == 1 && A.liveRec) {
                 if (!A.sess.Alive()) { StopRecordHere(); break; }
                 SetMsg(L"RECORDING from frame " + std::to_wstring(A.liveRecRow + 1) + L" - " +
@@ -1374,7 +1457,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
         {FCONTROL | FVIRTKEY, 'A', IDM_SELALL},   {FVIRTKEY, VK_F5, IDM_PLAY},
         {FVIRTKEY, VK_F6, IDM_REWIND},            {FVIRTKEY, VK_F7, IDM_RECFROM},
         {FVIRTKEY, VK_F8, IDM_RECORD},            {FVIRTKEY, VK_F9, IDM_STOP},
-        {FVIRTKEY, VK_OEM_PERIOD, IDM_STEP},      {FVIRTKEY, VK_F11, IDM_RESUME},       {FVIRTKEY, VK_F12, IDM_RECHERE},
+        {FVIRTKEY, VK_OEM_PERIOD, IDM_STEP},      {FVIRTKEY, VK_F4, IDM_RUNTO},       {FVIRTKEY, VK_F11, IDM_RESUME},       {FVIRTKEY, VK_F12, IDM_RECHERE},
     };
     ACCEL acc[sizeof keys / sizeof keys[0]];
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) acc[i] = ACCEL{keys[i].f, keys[i].k, keys[i].c};
