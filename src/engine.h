@@ -21,6 +21,7 @@ struct RunParams {
     uint32_t speed_mask = 31;       // SPEED_* clocks that run at that speed
     bool seeded = false;            // the game sees a frozen clock at Unix time `seed` (its RNG seed)
     uint32_t seed = 0;
+    bool hist = false;              // sample the player's values at every frame (the Memory window's history)
     bool rng_log = false;           // log the game's random draws (see the RNG log window)
 };
 

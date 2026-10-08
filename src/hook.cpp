@@ -392,6 +392,46 @@ static void JoinThreads() {
     for (int i = 0; i < n; i++) CloseHandle(list[i]);
 }
 
+// ---- value history ----------------------------------------------------------------------------------
+// While the host asks for it (Shm::hist_on) every frame marker takes one sample of the player's values
+// from game memory (the same pointer chains the editor's Memory window uses, read here without leaving
+// the process), so a graph can show every frame, also during fast-forward.
+static bool SelfRead(uint32_t addr, void* out, size_t n) {
+    SIZE_T g = 0;
+    return addr && ReadProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)addr, out, n, &g) && g == n;
+}
+static void HistSample(uint32_t marker) {
+    HistEntry e;
+    e.frame = marker;
+    for (int i = 0; i < HIST_FIELDS; i++) e.v[i] = i < 3 ? 0xFFFFFFFFu : 0x7FC00000u;
+    uint32_t base = (uint32_t)(uintptr_t)GetModuleHandleW(NULL), p = 0;
+    // player: *(exe+0x48365C), then +0x08, +0x6C, +0x20, +0x20, +0x08, +0x84 (each dereferenced) gives the struct
+    if (SelfRead(base + 0x48365C, &p, 4) && p) {
+        static const uint32_t steps[] = {0x08, 0x6C, 0x20, 0x20, 0x08, 0x84};
+        bool ok = true;
+        for (uint32_t off : steps) if (!SelfRead(p + off, &p, 4) || !p) { ok = false; break; }
+        uint8_t blk[0x544];
+        if (ok && SelfRead(p, blk, sizeof blk)) {
+            e.v[0] = blk[0x3DC];
+            memcpy(&e.v[3], blk + 0x1A0, 4);      // X speed
+            memcpy(&e.v[4], blk + 0x1A4, 4);      // Y speed
+            memcpy(&e.v[5], blk + 0x1AC, 4);      // X
+            memcpy(&e.v[6], blk + 0x1B0, 4);      // Y
+            memcpy(&e.v[7], blk + 0x53C, 4);      // invisibility
+        }
+    }
+    uint32_t q = 0;                                // weapon points and score: *(exe+0x483660) -> +0x08 -> +0x1E / +0x24
+    if (SelfRead(base + 0x483660, &q, 4) && q && SelfRead(q + 0x08, &q, 4) && q) {
+        uint8_t ammo;
+        uint32_t score;
+        if (SelfRead(q + 0x1E, &ammo, 1)) e.v[1] = ammo;
+        if (SelfRead(q + 0x24, &score, 4)) e.v[2] = score;
+    }
+    uint32_t i = S->hist_n;
+    S->hist_buf[i & (HIST_MAX - 1)] = e;
+    MemoryBarrier();
+    S->hist_n = i + 1;
+}
 // ---- frame advance: block the game thread at a frame marker ----------------------
 // The game is stopped before frame f reads its input, so the host can still edit
 // keys[f - 1]. The virtual clock is frozen meanwhile; otherwise the limiter would
@@ -421,6 +461,7 @@ static void Marker(Shm* s) {
     uint32_t f = s->frame + 1;
     s->frame = f;
     RngCheck();
+    if (s->hist_on) HistSample(f);
     if (s->mode == M_RECORD) {
         if (s->armed && s->rec_count < MAX_FRAMES) s->keys[s->rec_count++] = (uint16_t)Cur;
         s->armed = 1;
