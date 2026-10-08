@@ -21,6 +21,7 @@ enum {
     IDM_NEW = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEPRE, IDM_SETGAME, IDM_BASESAVE, IDM_EXIT,
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
     IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO, IDM_MEMORY, IDM_RNGSEED,
+    IDM_REPEAT, IDM_PATTERN,
     IDC_MEM_HIST, IDC_MEM_GRAPH, IDC_MEM_CSV, IDC_MEM_CLR,
     IDM_HELP_START, IDM_HELP_KEYS, IDM_HELP_TROUBLE, IDM_HELP_ABOUT, IDM_HELP_GUIDE, IDC_HELP_TOPICS,
     IDM_RNGLOG, IDM_VERIFY, IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
@@ -422,6 +423,86 @@ void EditNote() {
     SetFocus(A.grid);
 }
 
+// Repeat the selected rows N more times right after the selection (inserted frames).
+void EditRepeat() {
+    if (A.busy || !Size()) return;
+    int lo = SelLo(), hi = std::min(SelHi(), Size() - 1);
+    if (hi < lo) return;
+    std::wstring t = L"1";
+    if (!AskText(L"Repeat selection", L"Copy the " + std::to_wstring(hi - lo + 1) + L" selected frame(s) this many more times (1 - 1000):", t)) return;
+    wchar_t* end = nullptr;
+    long n = wcstol(t.c_str(), &end, 10);
+    if (t.empty() || *end || n < 1 || n > 1000 || (size_t)(hi - lo + 1) * (size_t)n + (size_t)Size() >= (size_t)MAX_FRAMES - 4) {
+        MessageBoxW(A.wnd, L"Enter a whole number from 1 to 1000 (the movie must stay under the frame limit).", L"Repeat selection", MB_ICONERROR);
+        return;
+    }
+    Frames block(A.movie.frames.begin() + lo, A.movie.frames.begin() + hi + 1), nv;
+    for (long i = 0; i < n; i++) nv.insert(nv.end(), block.begin(), block.end());
+    Step st; st.cur_before = A.cursor;
+    DoSplice(st, hi + 1, 0, nv);
+    A.anchor = lo;
+    A.cursor = hi + (int)nv.size();
+    Commit(st);
+    UpdateScroll(); UpdateStatus();
+    SetMsg(L"Repeated the selection " + std::to_wstring(n) + L" more time(s).");
+}
+
+// Fill the selection with a repeating press of one key: "KEY period on [offset]", e.g. "Jmp 12 2" presses
+// the jump key for 2 frames out of every 12; the key is released on all the other selected frames.
+static int KeyByName(const std::wstring& w) {
+    std::string a = U8(w);
+    for (char& c : a) c = (char)tolower((unsigned char)c);
+    for (int i = 0; i < NUM_KEYS; i++) {
+        std::string n = KEYS[i].name, l = KEYS[i].label;
+        for (char& c : n) c = (char)tolower((unsigned char)c);
+        for (char& c : l) c = (char)tolower((unsigned char)c);
+        if (a == n || a == l) return i;
+    }
+    return -1;
+}
+
+void EditPattern() {
+    if (A.busy) return;
+    int lo = SelLo(), hi = SelHi();
+    if (hi - lo + 1 < 2) { SetMsg(L"Select the frames to fill first (click a frame number, Shift+click another)."); return; }
+    std::wstring t = L"Jmp 12 2";
+    std::wstring keys;
+    for (int i = 0; i < NUM_KEYS; i++) { if (i) keys += L" "; keys += W(KEYS[i].label); }
+    if (!AskText(L"Fill pattern", L"KEY period on [offset] for the " + std::to_wstring(hi - lo + 1) + L" selected frames. Keys: " + keys, t)) return;
+    std::vector<std::wstring> tok;
+    {
+        size_t i = 0;
+        while (i < t.size()) {
+            while (i < t.size() && t[i] == L' ') i++;
+            size_t j = i;
+            while (j < t.size() && t[j] != L' ') j++;
+            if (j > i) tok.push_back(t.substr(i, j - i));
+            i = j;
+        }
+    }
+    int key = tok.size() >= 3 ? KeyByName(tok[0]) : -1;
+    wchar_t* e1 = nullptr; wchar_t* e2 = nullptr; wchar_t* e3 = nullptr;
+    long period = tok.size() >= 3 ? wcstol(tok[1].c_str(), &e1, 10) : 0;
+    long on = tok.size() >= 3 ? wcstol(tok[2].c_str(), &e2, 10) : -1;
+    long offset = tok.size() >= 4 ? wcstol(tok[3].c_str(), &e3, 10) : 0;
+    if (key < 0 || tok.size() > 4 || period < 1 || on < 0 || on > period || offset < 0 || *e1 || *e2 || (e3 && *e3)) {
+        MessageBoxW(A.wnd, L"Format: KEY period on [offset]\nfor example  Jmp 12 2  (jump pressed for 2 frames out of every 12),\nor  R 1 1  (hold right on every frame).\n\nperiod is at least 1, on is 0 to period, offset is how many frames to skip first.",
+                    L"Fill pattern", MB_ICONERROR);
+        return;
+    }
+    Step st; st.cur_before = A.cursor;
+    EnsureRows(st, (size_t)hi + 1);
+    Frames nv(A.movie.frames.begin() + lo, A.movie.frames.begin() + hi + 1);
+    for (int k = 0; k <= hi - lo; k++) {
+        bool down = k >= offset && ((k - offset) % period) < on;
+        if (down) nv[k] |= (uint16_t)(1u << key); else nv[k] &= (uint16_t)~(1u << key);
+    }
+    DoSplice(st, lo, hi - lo + 1, nv);
+    Commit(st);
+    InvalidateRect(A.grid, nullptr, FALSE);
+    UpdateScroll(); UpdateStatus();
+    SetMsg(L"Filled " + std::to_wstring(hi - lo + 1) + L" frames with the pattern.");
+}
 // Bookmarks: named frames to jump to (see JumpTo). Stored as flagged notes.
 void EditBookmark() {
     if (A.busy || !Size()) return;
@@ -1415,7 +1496,7 @@ const HelpTopic HELP_TOPICS[] = {
      L"If it reports a difference, tell the developer which frame and value; some speed-up changes the game there."},
     {L"Keyboard shortcuts",
      L"File: Ctrl+N new, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as\r\n"
-     L"Edit: Ctrl+Z undo, Ctrl+Y redo, Ctrl+X cut, Ctrl+C copy, Ctrl+V paste, Ctrl+Shift+V paste insert, Ctrl+A select all, Delete clear, Insert insert frames, Ctrl+Delete delete frames\r\n"
+     L"Edit: Ctrl+Z undo, Ctrl+Y redo, Ctrl+X cut, Ctrl+C copy, Ctrl+V paste, Ctrl+Shift+V paste insert, Ctrl+A select all, Delete clear, Insert insert frames, Ctrl+Delete delete frames, Ctrl+R repeat selection, Ctrl+Shift+R fill pattern\r\n"
      L"Bookmarks: Ctrl+B add / rename, Ctrl+Shift+B remove, F2 next, Shift+F2 previous, Ctrl+G jump to frame\r\n"
      L"Run: F5 play, F6 rewind to cursor, F7 record from cursor, F8 record new, F9 stop, F4 run to cursor, period frame advance, F11 resume live, F12 record here\r\n"
      L"Help: F1 this guide"},
@@ -2215,6 +2296,8 @@ void BuildMenu(HWND w) {
     add(e, IDM_CLEAR, L"C&lear inputs\tDel");
     add(e, IDM_INSERT, L"&Insert frames\tIns");
     add(e, IDM_DELFRAMES, L"&Delete frames\tCtrl+Del");
+    add(e, IDM_REPEAT, L"Repeat selection...\tCtrl+R");
+    add(e, IDM_PATTERN, L"Fill selection with a &pattern...\tCtrl+Shift+R");
     AppendMenuW(e, MF_SEPARATOR, 0, nullptr);
     add(e, IDM_NOTE_EDIT, L"Add / edit frame &note...");
     add(e, IDM_NOTE_DEL, L"Remove notes in selection");
@@ -2329,7 +2412,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             auto en = [&](int id, bool on) { EnableMenuItem(m, id, MF_BYCOMMAND | (on ? MF_ENABLED : MF_GRAYED)); };
             for (int id : {IDM_NEW, IDM_OPEN, IDM_CUT, IDM_PASTE, IDM_PASTEINS, IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES,
                            IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_RECORD, IDM_BASESAVE, IDM_STEP, IDM_RESUME, IDM_RECHERE,
-                           IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED, IDM_VERIFY, IDM_BM_EDIT, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV})
+                           IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED, IDM_VERIFY, IDM_BM_EDIT, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_REPEAT, IDM_PATTERN})
                 en(id, !A.busy);
             en(IDM_NOTE_DEL, !A.busy && SelectionHasNote());
             en(IDM_BM_DEL, !A.busy && RowIsBm(A.cursor));
@@ -2358,6 +2441,8 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_CLEAR: EditClear(); break;
                 case IDM_INSERT: EditInsert(); break;
                 case IDM_DELFRAMES: EditDelete(); break;
+                case IDM_REPEAT: EditRepeat(); break;
+                case IDM_PATTERN: EditPattern(); break;
                 case IDM_NOTE_EDIT: EditNote(); break;
                 case IDM_NOTE_DEL: RemoveNotesInSelection(); break;
                 case IDM_NOTE_LIST: ShowNotesList(false); break;
@@ -2498,7 +2583,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
         {FVIRTKEY, VK_F6, IDM_REWIND},            {FVIRTKEY, VK_F7, IDM_RECFROM},
         {FVIRTKEY, VK_F8, IDM_RECORD},            {FVIRTKEY, VK_F9, IDM_STOP},
         {FVIRTKEY, VK_OEM_PERIOD, IDM_STEP},      {FVIRTKEY, VK_F4, IDM_RUNTO},       {FVIRTKEY, VK_F1, IDM_HELP_GUIDE}, {FVIRTKEY, VK_F11, IDM_RESUME},       {FVIRTKEY, VK_F12, IDM_RECHERE},
-        {FCONTROL | FVIRTKEY, 'B', IDM_BM_EDIT}, {FCONTROL | FSHIFT | FVIRTKEY, 'B', IDM_BM_DEL}, {FCONTROL | FVIRTKEY, 'G', IDM_GOTO},
+        {FCONTROL | FVIRTKEY, 'B', IDM_BM_EDIT}, {FCONTROL | FSHIFT | FVIRTKEY, 'B', IDM_BM_DEL}, {FCONTROL | FVIRTKEY, 'G', IDM_GOTO}, {FCONTROL | FVIRTKEY, 'R', IDM_REPEAT}, {FCONTROL | FSHIFT | FVIRTKEY, 'R', IDM_PATTERN},
         {FVIRTKEY, VK_F2, IDM_BM_NEXT}, {FSHIFT | FVIRTKEY, VK_F2, IDM_BM_PREV},
     };
     ACCEL acc[sizeof keys / sizeof keys[0]];

@@ -164,6 +164,12 @@ captured against a different start point.
   undo/redo, and are saved in the `.bscotm` file (an optional `notes` field, so older
   files still load). Painting or clearing inputs leaves notes alone; **Record new**
   starts a movie without notes.
+- **Input patterns.** `Ctrl+R` (*Edit > Repeat selection*) copies the selected frames N more
+  times right after the selection, as inserted frames. `Ctrl+Shift+R` (*Edit > Fill selection with
+  a pattern*) fills the selected frames with a repeating press of one key: type `KEY period on
+  [offset]`, e.g. `Jmp 12 2` presses jump for 2 frames out of every 12, `R 1 1` holds right on
+  every frame. The key is released on the other selected frames; `offset` frames are skipped first.
+  Both are one undo step.
 - **RNG seed.** *Run > RNG seed...* sets a number (0 - 4294967295) that is saved in the
   movie (`rng_seed`; empty = none). The game seeds its random generator from the Unix
   time in seconds at launch, which is why a replay could give different drops from run
