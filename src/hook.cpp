@@ -97,7 +97,24 @@ static DWORD Shorten(DWORD ms) {
     return n ? n : 1;
 }
 
-static void  WINAPI H_Sleep(DWORD ms) { R_Sleep(Shorten(ms)); }
+// Threads that poll in a Sleep loop (the game has one that does Sleep(8) for its whole life) are counted
+// here so JoinThreads does not wait for them to "finish": they never do, and waiting cost 3 s per launch.
+static const int MAXSLEEPERS = 64;
+static struct { volatile DWORD tid; volatile LONG n; } Sleepers[MAXSLEEPERS];
+static void NoteSleep() {
+    DWORD me = GetCurrentThreadId();
+    for (int i = 0; i < MAXSLEEPERS; i++) {
+        if (Sleepers[i].tid == me) { InterlockedIncrement(&Sleepers[i].n); return; }
+        if (!Sleepers[i].tid) {
+            if (InterlockedCompareExchange((volatile LONG*)&Sleepers[i].tid, (LONG)me, 0) == 0 || Sleepers[i].tid == me) { InterlockedIncrement(&Sleepers[i].n); return; }
+        }
+    }
+}
+static bool IsSleeper(DWORD tid) {
+    for (int i = 0; i < MAXSLEEPERS && Sleepers[i].tid; i++) if (Sleepers[i].tid == tid) return Sleepers[i].n >= 3;
+    return false;
+}
+static void  WINAPI H_Sleep(DWORD ms) { if (ms) NoteSleep(); R_Sleep(Shorten(ms)); }
 static DWORD WINAPI H_Wait(HANDLE h, DWORD ms) { return R_Wait(h, Shorten(ms)); }
 static DWORD WINAPI H_WaitEx(HANDLE h, DWORD ms, BOOL a) { return R_WaitEx(h, Shorten(ms), a); }
 
@@ -351,7 +368,7 @@ static HANDLE WINAPI H_Ct(LPSECURITY_ATTRIBUTES a, SIZE_T sz, LPTHREAD_START_ROU
     if (h && RngWatch && SuspendThread(h) != (DWORD)-1) { SetWatch(h, RngWatch); ResumeThread(h); }   // RNG log: watch new threads too
     HANDLE d;
     if (h && !(fl & CREATE_SUSPENDED) &&    // the game may close h at once, so keep our own copy
-        DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &d, SYNCHRONIZE, FALSE, 0)) {
+        DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &d, SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0)) {
         EnterCriticalSection(&ThCs);
         if (NPending < MAXIMUM_WAIT_OBJECTS) Pending[NPending++] = d; else CloseHandle(d);
         LeaveCriticalSection(&ThCs);
@@ -367,7 +384,11 @@ static void JoinThreads() {
     NPending = 0;
     LeaveCriticalSection(&ThCs);
     if (!n) return;
-    WaitForMultipleObjects(n, list, TRUE, 3000);    // bounded, in case a thread never ends
+    HANDLE wait[MAXIMUM_WAIT_OBJECTS];              // not the ones that sit in a Sleep loop: they are idle, not busy
+    int nw = 0;
+    for (int i = 0; i < n; i++)
+        if (WaitForSingleObject(list[i], 0) != WAIT_OBJECT_0 && !IsSleeper(GetThreadId(list[i]))) wait[nw++] = list[i];
+    if (nw) WaitForMultipleObjects(nw, wait, TRUE, 3000);    // bounded, in case a thread never ends
     for (int i = 0; i < n; i++) CloseHandle(list[i]);
 }
 
