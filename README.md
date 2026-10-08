@@ -210,6 +210,11 @@ captured against a different start point.
   at every frame (also during fast-forward). **Graph...** draws the selected values over the
   frames, each scaled to the full height (the legend shows its range; hover to read one frame);
   **Save CSV...** writes every recorded frame. A new game launch starts a new history.
+- **Boss HP.** While the stage 1 boss exists, the Memory window also shows **Boss HP** and
+  **Boss max HP** (120 for that boss; the TAS in `test3.bscotm` takes 7 per sub-weapon hit). The boss
+  is found by a background search of the game's memory (about a second after it spawns), because it has no
+  fixed pointer. Other bosses are not known yet; how it was found and how to add another is in
+  `docs/REVERSE_ENGINEERING.md`.
 - **Help.** The **Help** menu (or `F1`) opens an in-app guide: getting started, recording and
   playing, frame advance, editing, bookmarks and jumping, the RNG seed and log, the Memory
   window, Verify fast-forward, keyboard shortcuts and troubleshooting. It is part of the program,

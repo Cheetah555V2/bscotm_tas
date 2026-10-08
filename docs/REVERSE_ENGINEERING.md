@@ -623,3 +623,30 @@ and *Verify fast-forward* still matches at all 20 checkpoints.
 Note: with the old join, in a later session the same harness (baseline restored, the 40-frame stepping of
 `comp`, or a direct `RunJob` to frame N) often never got out of the menus (health 0 at frame 3000) while the
 new code reached the same states as before every time; the reason for the old flakiness was not found.
+
+## The stage 1 boss (Memory window: Boss HP)
+
+Goal: show the boss's health. The player values come from fixed pointer chains; the boss does not have one,
+so it was found by searching the game's memory during the boss fight of `test3.bscotm` (boss stage from
+frame 7601, the TAS drains the weapon points with six sub-weapon casts from frame 8556).
+
+Method (all with `ReadProcessMemory` and one hardware write breakpoint, no game code touched):
+1. *Decreasing-value scan.* Sample every aligned dword of the game's private read/write memory (about 150 MB)
+   every 5-15 frames from 8545 to 8780 and keep the ones that never increase. One candidate series went
+   `120 113 106 99 92 85 78`: six drops of 7 at the six casts; another, `19 16 13 10 7 4 1`, was the weapon
+   points. So the boss has 120 HP and a sub-weapon hit costs it 7.
+2. *Who writes it.* A write breakpoint on that address (the hook's debug-register code with four slots) fired
+   at `exe+0x7D7A9` with `ecx` = the boss object: a setter that stores the new HP. The field is at **+0x3DC of
+   the object, max HP at +0x3E0** (120), the same layout as the player (HP at +0x3DC of the player struct).
+   The boss object's vtable is `exe+0x39B99C`.
+3. The boss's position is not at +0x1AC/+0x1B0 (those floats are 0): the boss is made of several objects
+   and its position lives elsewhere. A static pointer chain was not found: the object is referenced from about
+   25 places in the heap (list/map nodes), none from the exe's data.
+
+So the editor finds it by search: a background thread scans the heap for a dword equal to a known boss vtable
+(`BOSS_VTABLES` in `main.cpp`) whose HP / max HP fields are sane, keeps the address while the object is valid
+and scans again when it is gone. A scan takes about 0.2 s. Other bosses have other vtables; to add one, run the
+same procedure (step 1 to find the HP series, step 2 to get the object and its vtable) and add the RVA.
+
+Not everything with HP at +0x3DC is an enemy: a generic scan for "vtable object with HP <= max HP at
++0x3DC/+0x3E0" finds hundreds of unrelated objects (UI and effect classes), so a known vtable is required.
