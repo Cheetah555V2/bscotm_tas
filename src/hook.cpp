@@ -8,6 +8,7 @@
 //    fast-forward. Calls made by other modules (D3D, XAudio, Steam) are untouched.
 #include <windows.h>
 #include <string.h>
+#include <utility>
 #include "common.h"
 
 static Shm*      S;
@@ -111,6 +112,55 @@ static HRESULT (WINAPI *R_CreateDevice)(void*, UINT, UINT, HWND, DWORD, DWORD*, 
 // normally so the frozen picture is correct.
 static bool SkipDraw() {
     return (S->speed_mask & SPEED_NODRAW) && S->draw_from && Speed() > 1000 && S->frame + 2 < S->draw_from;
+}
+
+// With SPEED_NORENDER the game's own render-command queue is not executed either. The game
+// queues drawing commands during a frame and runs them from a loop that calls handler
+// functions through a table in its data section (COTM.exe+0x380D88, 36 entries, called as
+// `push cmd; call [table + type*4]`, handlers return with `ret 4`). While frames are skipped
+// (see SkipDraw) every entry is pointed at a stub that only returns; the originals are put
+// back before the frames that will be seen. The table is data, not code, so this is a data write.
+static const uint32_t CMD_TABLE_RVA = 0x380D88, CMD_COUNT = 36;
+// Types skipped by default: those the game issues at least once a frame whose skipping changes neither
+// its state nor the final picture (checked on test3.bscotm). Types 6, 7, 14, 19, 20 and 27 load resources
+// or set persistent device state (skipping them leaves a black or wrong picture), 10 is needed to get past
+// the boot, and the rarely used (12, 21, 29) or never seen (0, 5, 8) ones are left alone to be safe.
+static const uint64_t CMD_SKIP_DEFAULT = 0x0000000FD7C7AA1EULL;
+static uint32_t* CmdTab;
+static uint32_t  CmdOrig[CMD_COUNT];
+static bool      CmdReady, CmdOff;
+// One stub per command type (stdcall with one argument pops the same 4 bytes the handlers do),
+// so the host can see which types were skipped.
+template <int I> static void __stdcall CmdStub(void*) { S->cmd_count[I]++; }
+template <int... I> static const void* const* StubTable(std::integer_sequence<int, I...>) {
+    static const void* const t[] = {(const void*)&CmdStub<I>...};
+    return t;
+}
+static void SetCmdSkip(bool on) {
+    if (on == CmdOff) return;
+    if (!CmdReady) {
+        BYTE* base = (BYTE*)GetModuleHandleW(NULL);
+        auto nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+        uint32_t lo = (uint32_t)(uintptr_t)base, hi = lo + nt->OptionalHeader.SizeOfImage;
+        uint32_t* t = (uint32_t*)(base + CMD_TABLE_RVA);
+        for (uint32_t i = 0; i < CMD_COUNT; i++)         // every entry must be a function inside the exe
+            if (t[i] < lo || t[i] >= hi) { CmdReady = CmdOff = false; S->status |= ST_NORENDER_BAD; return; }
+        memcpy(CmdOrig, t, sizeof CmdOrig);
+        CmdTab = t;
+        CmdReady = true;
+    }
+    DWORD old;
+    if (!VirtualProtect(CmdTab, sizeof CmdOrig, PAGE_READWRITE, &old)) return;
+    static const void* const* stubs = StubTable(std::make_integer_sequence<int, CMD_COUNT>());
+    uint64_t m = ((uint64_t)S->cmd_skip_hi << 32) | S->cmd_skip_lo;
+    if (!m) m = CMD_SKIP_DEFAULT;
+    for (uint32_t i = 0; i < CMD_COUNT; i++) CmdTab[i] = (on && (m >> i & 1)) ? (uint32_t)(uintptr_t)stubs[i] : CmdOrig[i];
+    VirtualProtect(CmdTab, sizeof CmdOrig, old, &old);
+    CmdOff = on;
+}
+static void UpdateCmdSkip() {
+    uint32_t tail = S->cmd_tail ? S->cmd_tail : 2;
+    SetCmdSkip((S->speed_mask & SPEED_NORENDER) && SkipDraw() && S->frame + tail < S->draw_from);
 }
 typedef HRESULT (__stdcall *PFN_Present)(void*, const void*, const void*, HWND, const void*);
 typedef HRESULT (__stdcall *PFN_Clear)(void*, DWORD, const void*, DWORD, DWORD, float, DWORD);
@@ -285,7 +335,8 @@ static void Marker(Shm* s) {
         s->speed_milli = 1000;          // stepping is always real time
         s->hold = 1;
     }
-    if (s->hold) Hold(s, f);
+    UpdateCmdSkip();                    // the game queues this frame's drawing right after the poll
+    if (s->hold) { SetCmdSkip(false); Hold(s, f); UpdateCmdSkip(); }
 }
 
 static __attribute__((noinline)) SHORT WINAPI H_Gaks(int vk) {
