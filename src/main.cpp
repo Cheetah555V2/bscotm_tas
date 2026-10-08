@@ -941,7 +941,7 @@ void ShowNotesList(bool bookmarks = false) {
 // Reads the running COTM.exe (any instance, frozen or live) with ReadProcessMemory every 100 ms.
 // Pointer chains are from the community cheat table: dereference *(exe+root), then for each offset
 // in reverse order dereference (p + off), and add the last one without dereferencing.
-enum MemKind { MK_U8, MK_U32, MK_F32, MK_HEX };
+enum MemKind { MK_U8, MK_U32, MK_F32, MK_HEX, MK_BOSSHP, MK_BOSSMAX };   // the last two come from the boss finder, not a pointer chain
 struct MemField { const wchar_t* name; uint32_t root; std::vector<uint32_t> xml; MemKind kind; };
 const std::vector<MemField>& MemFields() {
     static const std::vector<uint32_t> pl = {0x84, 0x08, 0x20, 0x20, 0x6C, 0x08};
@@ -968,6 +968,8 @@ const std::vector<MemField>& MemFields() {
         {L"RNG state y",     0x48365C, {0x2F8}, MK_HEX},
         {L"RNG state z",     0x48365C, {0x2FC}, MK_HEX},
         {L"RNG state w",     0x48365C, {0x300}, MK_HEX},
+        {L"Boss HP",         0, {0}, MK_BOSSHP},
+        {L"Boss max HP",     0, {0}, MK_BOSSMAX},
     };
     return f;
 }
@@ -1006,7 +1008,100 @@ bool ReadU32(const GameProc& gp, uintptr_t a, uint32_t& v) {
 }
 
 // Returns the text for one field, or "-" if the chain cannot be followed (menu, loading, no stage).
+// ---- boss finder ------------------------------------------------------------------------------------------
+// The boss is not reachable from a fixed pointer chain, so a background thread looks for it in the game's
+// heap: an object whose first dword is a known boss vtable (BOSS_VTABLES, RVAs in COTM.exe) and whose
+// health fields look right (HP at +0x3DC, max HP at +0x3E0; the same layout as the player). It keeps the
+// address while the object stays valid and scans again when it is gone (a new boss, a new launch).
+// Found with a memory search during the stage 1 boss of test3.bscotm: HP 120, minus 7 per sub-weapon hit.
+static const uint32_t BOSS_VTABLES[] = {0x39B99C};      // stage 1 boss
+static const uint32_t BOSS_HP_OFF = 0x3DC, BOSS_MAX_OFF = 0x3E0;
+static volatile uint32_t BossObj;                        // 0 = none found
+static volatile LONG BossStop;
+static HANDLE BossThread;
+static bool OpenGameProc(GameProc& g, int tries = 100);
+
+static bool BossValid(HANDLE h, uint32_t base, uint32_t obj) {
+    uint32_t vt = 0, hp = 0, mx = 0;
+    SIZE_T g;
+    if (!ReadProcessMemory(h, (void*)(uintptr_t)obj, &vt, 4, &g) || g != 4) return false;
+    bool known = false;
+    for (uint32_t rva : BOSS_VTABLES) if (vt == base + rva) known = true;
+    if (!known) return false;
+    if (!ReadProcessMemory(h, (void*)(uintptr_t)(obj + BOSS_HP_OFF), &hp, 4, &g) || g != 4) return false;
+    if (!ReadProcessMemory(h, (void*)(uintptr_t)(obj + BOSS_MAX_OFF), &mx, 4, &g) || g != 4) return false;
+    return mx >= 2 && mx <= 100000 && hp <= mx;
+}
+
+static uint32_t BossScan(HANDLE h, uint32_t base) {
+    std::vector<uint8_t> buf;
+    for (uintptr_t a = 0; a < 0x7FFE0000 && !BossStop;) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQueryEx(h, (void*)a, &mbi, sizeof mbi)) break;
+        uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) && !(mbi.Protect & PAGE_GUARD)) {
+            buf.resize(mbi.RegionSize);
+            SIZE_T g = 0;
+            if (ReadProcessMemory(h, mbi.BaseAddress, buf.data(), mbi.RegionSize, &g))
+                for (size_t o = 0; o + 4 <= g; o += 4) {
+                    uint32_t v;
+                    memcpy(&v, &buf[o], 4);
+                    for (uint32_t rva : BOSS_VTABLES)
+                        if (v == base + rva && BossValid(h, base, (uint32_t)((uintptr_t)mbi.BaseAddress + o))) return (uint32_t)((uintptr_t)mbi.BaseAddress + o);
+                }
+        }
+        a = next;
+    }
+    return 0;
+}
+
+static DWORD WINAPI BossProc(LPVOID) {
+    HANDLE h = nullptr;
+    uint32_t base = 0;
+    DWORD pid = 0;
+    while (!BossStop) {
+        if (h && WaitForSingleObject(h, 0) != WAIT_TIMEOUT) { CloseHandle(h); h = nullptr; BossObj = 0; }
+        if (!h) {
+            GameProc probe;
+            // find COTM.exe without keeping the memory window's handle: OpenGameProc opens its own
+            if (OpenGameProc(probe, 1)) {
+                pid = probe.pid;
+                base = (uint32_t)probe.base;
+                CloseHandle(probe.h);
+                h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE, FALSE, pid);
+            }
+        }
+        if (h) {
+            uint32_t obj = BossObj;
+            if (!obj || !BossValid(h, base, obj)) BossObj = obj = BossScan(h, base);
+            Sleep(obj ? 250 : 700);
+        } else {
+            Sleep(500);
+        }
+    }
+    if (h) CloseHandle(h);
+    return 0;
+}
+
+static void StartBossFinder() {
+    if (BossThread) return;
+    BossStop = 0;
+    BossThread = CreateThread(nullptr, 0, BossProc, nullptr, 0, nullptr);
+}
+static void StopBossFinder() {
+    if (!BossThread) return;
+    BossStop = 1;
+    WaitForSingleObject(BossThread, 3000);
+    CloseHandle(BossThread);
+    BossThread = nullptr;
+    BossObj = 0;
+}
 std::wstring ReadField(const GameProc& gp, const MemField& f) {
+    if (f.kind == MK_BOSSHP || f.kind == MK_BOSSMAX) {            // from the boss finder
+        uint32_t obj = BossObj, v = 0;
+        if (!obj || !ReadU32(gp, obj + (f.kind == MK_BOSSHP ? BOSS_HP_OFF : BOSS_MAX_OFF), v)) return L"-";
+        return std::to_wstring(v);
+    }
     uint32_t p = 0;
     if (!ReadU32(gp, gp.base + f.root, p) || !p) return L"-";
     for (size_t i = f.xml.size() - 1; i > 0; i--)
@@ -1270,6 +1365,7 @@ LRESULT CALLBACK MemProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CLOSE: DestroyWindow(h); return 0;
         case WM_DESTROY:
             KillTimer(h, 1);
+            StopBossFinder();
             A.histOn = false;
             if (OpenLogShm()) OpenLogShm()->hist_on = 0;
             A.memWnd = A.memList = nullptr;
@@ -1285,7 +1381,7 @@ void ShowMemory() {
     GetWindowRect(A.wnd, &pr);
     A.memWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmMem", L"Game memory",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
-                               pr.right - S(440), pr.top + S(90), S(420), S(640), A.wnd, nullptr, nullptr, nullptr);
+                               pr.right - S(440), pr.top + S(60), S(420), S(700), A.wnd, nullptr, nullptr, nullptr);
     if (!A.memWnd) return;
     HWND hchk = CreateWindowExW(0, L"BUTTON", L"Record history", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                 S(8), S(6), S(130), S(22), A.memWnd, (HMENU)(INT_PTR)IDC_MEM_HIST, nullptr, nullptr);
@@ -1322,6 +1418,7 @@ void ShowMemory() {
     GetClientRect(A.memWnd, &cr);
     SendMessageW(A.memWnd, WM_SIZE, 0, MAKELPARAM(cr.right, cr.bottom));
     RefreshMemory();
+    StartBossFinder();
     SetTimer(A.memWnd, 1, 100, nullptr);
 }
 
@@ -1930,8 +2027,8 @@ struct VerifyRun {
 
 static void VerifyNote(const std::wstring& t) { PostMessageW(A.wnd, WM_VERIFY_PROGRESS, 0, (LPARAM)new std::wstring(t)); }
 
-static bool OpenGameProc(GameProc& g) {            // like AttachGame, but for the worker thread's own handle
-    for (int i = 0; i < 100 && !g.h; i++) {
+static bool OpenGameProc(GameProc& g, int tries) {            // like AttachGame, but for the worker thread's own handle
+    for (int i = 0; i < tries && !g.h; i++) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         PROCESSENTRY32W pe{sizeof pe};
         DWORD pid = 0;
@@ -1985,7 +2082,7 @@ static bool VerifyPass(const VerifyArgs& va, uint32_t mask, const wchar_t* label
             pos = cp;
         }
         std::vector<std::wstring> row;
-        for (const MemField& f : fs) row.push_back(ReadField(g, f));
+        for (const MemField& f : fs) row.push_back(f.kind >= MK_BOSSHP ? std::wstring(L"-") : ReadField(g, f));
         out.vals.push_back(std::move(row));
         wchar_t b[96];
         swprintf(b, 96, L"%ls: frame %d / %d", label, cp, va.cps.back());
