@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <tlhelp32.h>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -19,7 +20,7 @@ namespace {
 enum {
     IDM_NEW = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEPRE, IDM_SETGAME, IDM_BASESAVE, IDM_EXIT,
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
-    IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO, IDM_RNGSEED,
+    IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO, IDM_MEMORY, IDM_RNGSEED,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
     IDC_BASE = 300, IDC_PRE,
@@ -44,6 +45,7 @@ struct App {
     HWND lblBase = nullptr, lblPre = nullptr, btn[8] = {};
     HFONT font = nullptr, fontB = nullptr;
     HWND notesWnd = nullptr, notesList = nullptr;   // the Notes list window (when open)
+    HWND memWnd = nullptr, memList = nullptr;       // the Game memory window (when open)
     int dpi = 96;
 
     Movie movie;
@@ -722,6 +724,168 @@ void ShowNotesList() {
     RefreshNotesList();
 }
 
+// ---- game memory window -------------------------------------------------------
+// Reads the running COTM.exe (any instance, frozen or live) with ReadProcessMemory every 100 ms.
+// Pointer chains are from the community cheat table: dereference *(exe+root), then for each offset
+// in reverse order dereference (p + off), and add the last one without dereferencing.
+enum MemKind { MK_U8, MK_U32, MK_F32, MK_HEX };
+struct MemField { const wchar_t* name; uint32_t root; std::vector<uint32_t> xml; MemKind kind; };
+const std::vector<MemField>& MemFields() {
+    static const std::vector<uint32_t> pl = {0x84, 0x08, 0x20, 0x20, 0x6C, 0x08};
+    auto P = [&](uint32_t field) { std::vector<uint32_t> v{field}; v.insert(v.end(), pl.begin(), pl.end()); return v; };
+    static const std::vector<MemField> f = {
+        {L"Health",          0x48365C, P(0x3DC), MK_U8},
+        {L"Weapon points",   0x483660, {0x1E, 0x08}, MK_U8},
+        {L"Max weapon points", 0x483660, {0x1D, 0x08}, MK_U8},
+        {L"Score",           0x483660, {0x24, 0x08}, MK_U32},
+        {L"X speed",         0x48365C, P(0x1A0), MK_F32},
+        {L"Y speed",         0x48365C, P(0x1A4), MK_F32},
+        {L"X position",      0x48365C, P(0x1AC), MK_F32},
+        {L"Y position",      0x48365C, P(0x1B0), MK_F32},
+        {L"X position (render)", 0x48365C, P(0x5B8), MK_F32},
+        {L"Y position (render)", 0x48365C, P(0x5BC), MK_F32},
+        {L"Invisibility",    0x48365C, P(0x53C), MK_F32},
+        {L"Difficulty",      0x483660, {0x08, 0x08}, MK_U8},
+        {L"Style",           0x483660, {0x0C, 0x08}, MK_U8},
+        {L"Character 1",     0x483660, {0x11, 0x08}, MK_U8},
+        {L"Character 2",     0x483660, {0x14, 0x08}, MK_U8},
+        {L"Character 3",     0x483660, {0x17, 0x08}, MK_U8},
+        {L"Character 4",     0x483660, {0x1A, 0x08}, MK_U8},
+        {L"RNG state x",     0x48365C, {0x2F4}, MK_HEX},
+        {L"RNG state y",     0x48365C, {0x2F8}, MK_HEX},
+        {L"RNG state z",     0x48365C, {0x2FC}, MK_HEX},
+        {L"RNG state w",     0x48365C, {0x300}, MK_HEX},
+    };
+    return f;
+}
+
+struct GameProc { DWORD pid = 0; HANDLE h = nullptr; uintptr_t base = 0; } gp;
+
+bool AttachGame() {
+    if (gp.h && WaitForSingleObject(gp.h, 0) == WAIT_TIMEOUT) return true;
+    if (gp.h) { CloseHandle(gp.h); gp = GameProc(); }
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe{sizeof pe};
+    DWORD pid = 0;
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+        if (!_wcsicmp(pe.szExeFile, L"COTM.exe")) { pid = pe.th32ProcessID; break; }
+    CloseHandle(snap);
+    if (!pid) return false;
+    HANDLE h = OpenProcess(PROCESS_VM_READ | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    uintptr_t base = 0;
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap != INVALID_HANDLE_VALUE) {
+        MODULEENTRY32W me{sizeof me};
+        for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me))
+            if (!_wcsicmp(me.szModule, L"COTM.exe")) { base = (uintptr_t)me.modBaseAddr; break; }
+        CloseHandle(snap);
+    }
+    if (!base) { CloseHandle(h); return false; }
+    gp.pid = pid; gp.h = h; gp.base = base;
+    return true;
+}
+
+bool ReadU32(uintptr_t a, uint32_t& v) {
+    SIZE_T g = 0;
+    return a && ReadProcessMemory(gp.h, (void*)a, &v, 4, &g) && g == 4;
+}
+
+// Returns the text for one field, or "-" if the chain cannot be followed (menu, loading, no stage).
+std::wstring ReadField(const MemField& f) {
+    uint32_t p = 0;
+    if (!ReadU32(gp.base + f.root, p) || !p) return L"-";
+    for (size_t i = f.xml.size() - 1; i > 0; i--)
+        if (!ReadU32(p + f.xml[i], p) || !p) return L"-";
+    uintptr_t a = p + f.xml[0];
+    wchar_t b[48];
+    SIZE_T g = 0;
+    if (f.kind == MK_U8) {
+        uint8_t v;
+        if (!ReadProcessMemory(gp.h, (void*)a, &v, 1, &g) || g != 1) return L"-";
+        swprintf(b, 48, L"%u", (unsigned)v);
+    } else {
+        uint32_t v;
+        if (!ReadU32(a, v)) return L"-";
+        if (f.kind == MK_U32) swprintf(b, 48, L"%u", (unsigned)v);
+        else if (f.kind == MK_HEX) swprintf(b, 48, L"%08X", (unsigned)v);
+        else {
+            float fl;
+            memcpy(&fl, &v, 4);
+            if (fl != fl) return L"NaN";
+            swprintf(b, 48, L"%.4f", (double)fl);
+        }
+    }
+    return b;
+}
+
+void RefreshMemory() {
+    if (!A.memList) return;
+    bool on = AttachGame();
+    const auto& fs = MemFields();
+    wchar_t cur[128];
+    for (size_t i = 0; i < fs.size(); i++) {
+        std::wstring v = on ? ReadField(fs[i]) : L"-";
+        ListView_GetItemText(A.memList, (int)i, 1, cur, 128);
+        if (v != cur) ListView_SetItemText(A.memList, (int)i, 1, (LPWSTR)v.c_str());
+    }
+    SetWindowTextW(A.memWnd, on ? L"Game memory" : L"Game memory (game not running)");
+}
+
+LRESULT CALLBACK MemProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE:
+            if (A.memList) MoveWindow(A.memList, 0, 0, LOWORD(lp), HIWORD(lp), TRUE);
+            return 0;
+        case WM_TIMER: RefreshMemory(); return 0;
+        case WM_CLOSE: DestroyWindow(h); return 0;
+        case WM_DESTROY:
+            KillTimer(h, 1);
+            A.memWnd = A.memList = nullptr;
+            if (gp.h) { CloseHandle(gp.h); gp = GameProc(); }
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowMemory() {
+    if (A.memWnd) { SetForegroundWindow(A.memWnd); return; }
+    RECT pr;
+    GetWindowRect(A.wnd, &pr);
+    A.memWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmMem", L"Game memory",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
+                               pr.right - S(340), pr.top + S(90), S(320), S(600), A.wnd, nullptr, nullptr, nullptr);
+    if (!A.memWnd) return;
+    A.memList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER,
+                                0, 0, 0, 0, A.memWnd, nullptr, nullptr, nullptr);
+    SendMessageW(A.memList, WM_SETFONT, (WPARAM)A.font, TRUE);
+    ListView_SetExtendedListViewStyle(A.memList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    LVCOLUMNW c{};
+    c.mask = LVCF_TEXT | LVCF_WIDTH;
+    c.pszText = (LPWSTR)L"Name";
+    c.cx = S(150);
+    SendMessageW(A.memList, LVM_INSERTCOLUMNW, 0, (LPARAM)&c);
+    c.pszText = (LPWSTR)L"Value";
+    c.cx = S(120);
+    SendMessageW(A.memList, LVM_INSERTCOLUMNW, 1, (LPARAM)&c);
+    const auto& fs = MemFields();
+    for (size_t i = 0; i < fs.size(); i++) {
+        LVITEMW it{};
+        it.mask = LVIF_TEXT;
+        it.iItem = (int)i;
+        it.pszText = (LPWSTR)fs[i].name;
+        SendMessageW(A.memList, LVM_INSERTITEMW, 0, (LPARAM)&it);
+        ListView_SetItemText(A.memList, (int)i, 1, (LPWSTR)L"-");
+    }
+    RECT cr;
+    GetClientRect(A.memWnd, &cr);
+    MoveWindow(A.memList, 0, 0, cr.right, cr.bottom, TRUE);
+    RefreshMemory();
+    SetTimer(A.memWnd, 1, 100, nullptr);
+}
+
 // ---- files, paths, config ---------------------------------------------------
 bool PickFile(bool save, const wchar_t* filter, const wchar_t* ext, std::wstring& io, const std::wstring& dir) {
     wchar_t buf[MAX_PATH * 2] = {};
@@ -1282,6 +1446,7 @@ void BuildMenu(HWND w) {
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)f, L"&File");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)e, L"&Edit");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)r, L"&Run");
+    AppendMenuW(bar, MF_STRING, IDM_MEMORY, L"&Memory");     // a plain menu-bar button: opens the window
     SetMenu(w, bar);
 }
 
@@ -1386,6 +1551,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_NOTE_DEL: RemoveNotesInSelection(); break;
                 case IDM_NOTE_LIST: ShowNotesList(); break;
                 case IDM_RNGSEED: EditSeed(); break;
+                case IDM_MEMORY: ShowMemory(); break;
                 case IDM_PLAY: StartJob(false, (uint32_t)Size(), false, true); break;
                 case IDM_REWIND: StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true); break;
                 case IDM_STEP: FrameAdvance(); break;
@@ -1464,6 +1630,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
     RegisterClassExW(&nd);
     nd.lpfnWndProc = NotesProc;
     nd.lpszClassName = L"BscotmNotes";
+    RegisterClassExW(&nd);
+    nd.lpfnWndProc = MemProc;
+    nd.lpszClassName = L"BscotmMem";
     RegisterClassExW(&nd);
 
     WNDCLASSEXW c{sizeof c};

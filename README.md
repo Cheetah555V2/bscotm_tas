@@ -137,6 +137,12 @@ captured against a different start point.
   to run. With a seed set, the game sees a frozen clock at that time, so every launch
   gets the same random numbers. The status bar shows the seed. Changing it restarts the
   game on the next Rewind / frame advance. Details: `docs/REVERSE_ENGINEERING.md`.
+- **Game memory window.** The **Memory** button in the menu bar opens a window that shows
+  the running game's health, weapon points (and max), score, X/Y speed, X/Y position
+  (physics and render copies), invisibility, difficulty, style, the four characters and
+  the four RNG state words. It updates 10 times a second for any COTM.exe that is running
+  (frozen or live) and shows `-` where the game has no value yet (menus, loading).
+  Read-only; the pointer chains come from the community cheat table.
 - Green frame numbers are the "greenzone": frames the live game has been advanced
   through. Editing a frame invalidates the greenzone after it.
 
