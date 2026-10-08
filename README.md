@@ -171,6 +171,10 @@ captured against a different start point.
   every frame. The key is released on the other selected frames; `offset` frames are skipped first.
   Both are one undo step.
 - **RNG seed.** *Run > RNG seed...* sets a number (0 - 4294967295) that is saved in the
+- **Find.** `Ctrl+F` (*Edit > Find*) moves the cursor to the next frame where a key is pressed:
+  type the key (`Jmp`), add `released` for the next release (`Atk released`), or `*` for any change
+  in any key. `F3` / `Shift+F3` find the next / previous match. `Alt+Down` / `Alt+Up` jump to the
+  next / previous frame that has a note or bookmark.
   movie (`rng_seed`; empty = none). The game seeds its random generator from the Unix
   time in seconds at launch, which is why a replay could give different drops from run
   to run. With a seed set, the game sees a frozen clock at that time, so every launch

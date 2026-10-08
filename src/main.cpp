@@ -21,7 +21,7 @@ enum {
     IDM_NEW = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEPRE, IDM_SETGAME, IDM_BASESAVE, IDM_EXIT,
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
     IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO, IDM_MEMORY, IDM_RNGSEED,
-    IDM_REPEAT, IDM_PATTERN,
+    IDM_REPEAT, IDM_PATTERN, IDM_FIND, IDM_FINDNEXT, IDM_FINDPREV, IDM_NOTENEXT, IDM_NOTEPREV,
     IDC_MEM_HIST, IDC_MEM_GRAPH, IDC_MEM_CSV, IDC_MEM_CLR,
     IDM_HELP_START, IDM_HELP_KEYS, IDM_HELP_TROUBLE, IDM_HELP_ABOUT, IDM_HELP_GUIDE, IDC_HELP_TOPICS,
     IDM_RNGLOG, IDM_VERIFY, IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
@@ -502,6 +502,73 @@ void EditPattern() {
     InvalidateRect(A.grid, nullptr, FALSE);
     UpdateScroll(); UpdateStatus();
     SetMsg(L"Filled " + std::to_wstring(hi - lo + 1) + L" frames with the pattern.");
+}
+// ---- find in the grid -----------------------------------------------------------------------------------
+// Find: move the cursor to the next / previous frame where a key is pressed (goes from up to down), released
+// (down to up) or any key changes. Notes: jump to the next / previous frame that has a note or bookmark.
+static int FindKey = -1;           // -1 = any key
+static int FindMode = 0;           // 0 = pressed, 1 = released, 2 = any change
+
+static bool FindMatch(int row) {
+    uint16_t cur = A.movie.frames[row], prev = row > 0 ? A.movie.frames[row - 1] : 0;
+    if (FindMode == 2 || FindKey < 0) return FindKey < 0 ? cur != prev : ((cur ^ prev) >> FindKey & 1) != 0;
+    bool now = cur >> FindKey & 1, was = prev >> FindKey & 1;
+    return FindMode == 0 ? (now && !was) : (!now && was);
+}
+
+static std::wstring FindDescription() {
+    std::wstring k = FindKey < 0 ? L"any key" : W(KEYS[FindKey].label);
+    return FindMode == 0 ? k + L" pressed" : FindMode == 1 ? k + L" released" : k + L" changes";
+}
+
+void FindStep(bool forward) {
+    if (A.busy || !Size()) return;
+    int n = Size();
+    for (int r = A.cursor + (forward ? 1 : -1); r >= 0 && r < n; r += forward ? 1 : -1)
+        if (FindMatch(r)) { SetCursorRow(r, false); SetMsg(L"Found: " + FindDescription() + L" at frame " + std::to_wstring(r + 1) + L". F3 / Shift+F3 for the next / previous."); return; }
+    SetMsg(L"No more frames where " + FindDescription() + (forward ? L" after the cursor." : L" before the cursor."));
+}
+
+void FindDialog() {
+    if (A.busy || !Size()) return;
+    std::wstring t = FindKey < 0 ? L"*" : W(KEYS[FindKey].label);
+    if (FindKey >= 0 && FindMode == 1) t += L" released";
+    std::wstring keys;
+    for (int i = 0; i < NUM_KEYS; i++) { if (i) keys += L" "; keys += W(KEYS[i].label); }
+    if (!AskText(L"Find", L"KEY [pressed|released], or * for any change. Keys: " + keys, t)) return;
+    std::vector<std::wstring> tok;
+    size_t i = 0;
+    while (i < t.size()) {
+        while (i < t.size() && t[i] == L' ') i++;
+        size_t j = i;
+        while (j < t.size() && t[j] != L' ') j++;
+        if (j > i) tok.push_back(t.substr(i, j - i));
+        i = j;
+    }
+    int key = -2, mode = 0;
+    if (!tok.empty() && tok.size() <= 2) {
+        key = tok[0] == L"*" ? -1 : KeyByName(tok[0]);
+        if (tok.size() == 2) {
+            std::string m = U8(tok[1]);
+            for (char& c : m) c = (char)tolower((unsigned char)c);
+            if (m == "pressed" || m == "press" || m == "down") mode = 0;
+            else if (m == "released" || m == "release" || m == "up") mode = 1;
+            else key = -2;
+        }
+    }
+    if (key == -2) {
+        MessageBoxW(A.wnd, L"Format: KEY [pressed|released]\nfor example  Jmp  or  Atk released  or  *  (any key changes).", L"Find", MB_ICONERROR);
+        return;
+    }
+    FindKey = key; FindMode = key < 0 ? 2 : mode;
+    FindStep(true);
+}
+
+void NoteStep(bool forward) {
+    if (A.busy || !Size()) return;
+    for (int r = A.cursor + (forward ? 1 : -1); r >= 0 && r < Size(); r += forward ? 1 : -1)
+        if (!NoteAt(r).empty()) { SetCursorRow(r, false); SetMsg(L"Note at frame " + std::to_wstring(r + 1) + L"."); return; }
+    SetMsg(forward ? L"No note after the cursor." : L"No note before the cursor.");
 }
 // Bookmarks: named frames to jump to (see JumpTo). Stored as flagged notes.
 void EditBookmark() {
@@ -1467,7 +1534,7 @@ const HelpTopic HELP_TOPICS[] = {
      L"Ctrl+Z / Ctrl+Y undo and redo. Ctrl+A selects all.\r\n\r\n"
      L"Notes\r\n"
      L"Right-click a row (or use the Edit menu) to add a note to that frame. Notes show in the Note column and as an orange flag. Edit > Notes list opens every note; double-click jumps to it. Notes move with their frames on insert, delete, cut and paste and are saved in the movie file.\r\n\r\n"
-     L"Keys\r\n"
+     L"Finding\r\n"
      L"The grid has one column per key the tool tracks: arrows, A D W S, jump (space), attack (left mouse), sub-weapon (right mouse), Q, E, P, Enter and Esc."},
     {L"Bookmarks and jumping",
      L"A bookmark is a named frame you can jump back to. Ctrl+B (or right-click > Add bookmark here) names the cursor frame; it shows with a purple flag and a star. Ctrl+Shift+B removes it.\r\n\r\n"
@@ -1496,7 +1563,7 @@ const HelpTopic HELP_TOPICS[] = {
      L"If it reports a difference, tell the developer which frame and value; some speed-up changes the game there."},
     {L"Keyboard shortcuts",
      L"File: Ctrl+N new, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as\r\n"
-     L"Edit: Ctrl+Z undo, Ctrl+Y redo, Ctrl+X cut, Ctrl+C copy, Ctrl+V paste, Ctrl+Shift+V paste insert, Ctrl+A select all, Delete clear, Insert insert frames, Ctrl+Delete delete frames, Ctrl+R repeat selection, Ctrl+Shift+R fill pattern\r\n"
+     L"Edit: Ctrl+Z undo, Ctrl+Y redo, Ctrl+X cut, Ctrl+C copy, Ctrl+V paste, Ctrl+Shift+V paste insert, Ctrl+A select all, Delete clear, Insert insert frames, Ctrl+Delete delete frames, Ctrl+R repeat selection, Ctrl+Shift+R fill pattern, Ctrl+F find, F3 / Shift+F3 find next / previous, Alt+Down / Alt+Up next / previous note\r\n"
      L"Bookmarks: Ctrl+B add / rename, Ctrl+Shift+B remove, F2 next, Shift+F2 previous, Ctrl+G jump to frame\r\n"
      L"Run: F5 play, F6 rewind to cursor, F7 record from cursor, F8 record new, F9 stop, F4 run to cursor, period frame advance, F11 resume live, F12 record here\r\n"
      L"Help: F1 this guide"},
@@ -2302,6 +2369,12 @@ void BuildMenu(HWND w) {
     add(e, IDM_NOTE_EDIT, L"Add / edit frame &note...");
     add(e, IDM_NOTE_DEL, L"Remove notes in selection");
     add(e, IDM_NOTE_LIST, L"Notes &list...");
+    add(e, IDM_NOTENEXT, L"Next note\tAlt+Down");
+    add(e, IDM_NOTEPREV, L"Previous note\tAlt+Up");
+    AppendMenuW(e, MF_SEPARATOR, 0, nullptr);
+    add(e, IDM_FIND, L"&Find...\tCtrl+F");
+    add(e, IDM_FINDNEXT, L"Find &next\tF3");
+    add(e, IDM_FINDPREV, L"Find pre&vious\tShift+F3");
     AppendMenuW(e, MF_SEPARATOR, 0, nullptr);
     add(e, IDM_BM_EDIT, L"Add / rename &bookmark...\tCtrl+B");
     add(e, IDM_BM_DEL, L"Remove bookmark\tCtrl+Shift+B");
@@ -2412,7 +2485,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             auto en = [&](int id, bool on) { EnableMenuItem(m, id, MF_BYCOMMAND | (on ? MF_ENABLED : MF_GRAYED)); };
             for (int id : {IDM_NEW, IDM_OPEN, IDM_CUT, IDM_PASTE, IDM_PASTEINS, IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES,
                            IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_RECORD, IDM_BASESAVE, IDM_STEP, IDM_RESUME, IDM_RECHERE,
-                           IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED, IDM_VERIFY, IDM_BM_EDIT, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_REPEAT, IDM_PATTERN})
+                           IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED, IDM_VERIFY, IDM_BM_EDIT, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_REPEAT, IDM_PATTERN, IDM_FIND, IDM_FINDNEXT, IDM_FINDPREV, IDM_NOTENEXT, IDM_NOTEPREV})
                 en(id, !A.busy);
             en(IDM_NOTE_DEL, !A.busy && SelectionHasNote());
             en(IDM_BM_DEL, !A.busy && RowIsBm(A.cursor));
@@ -2442,6 +2515,11 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_INSERT: EditInsert(); break;
                 case IDM_DELFRAMES: EditDelete(); break;
                 case IDM_REPEAT: EditRepeat(); break;
+                case IDM_FIND: FindDialog(); break;
+                case IDM_FINDNEXT: FindStep(true); break;
+                case IDM_FINDPREV: FindStep(false); break;
+                case IDM_NOTENEXT: NoteStep(true); break;
+                case IDM_NOTEPREV: NoteStep(false); break;
                 case IDM_PATTERN: EditPattern(); break;
                 case IDM_NOTE_EDIT: EditNote(); break;
                 case IDM_NOTE_DEL: RemoveNotesInSelection(); break;
@@ -2583,7 +2661,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
         {FVIRTKEY, VK_F6, IDM_REWIND},            {FVIRTKEY, VK_F7, IDM_RECFROM},
         {FVIRTKEY, VK_F8, IDM_RECORD},            {FVIRTKEY, VK_F9, IDM_STOP},
         {FVIRTKEY, VK_OEM_PERIOD, IDM_STEP},      {FVIRTKEY, VK_F4, IDM_RUNTO},       {FVIRTKEY, VK_F1, IDM_HELP_GUIDE}, {FVIRTKEY, VK_F11, IDM_RESUME},       {FVIRTKEY, VK_F12, IDM_RECHERE},
-        {FCONTROL | FVIRTKEY, 'B', IDM_BM_EDIT}, {FCONTROL | FSHIFT | FVIRTKEY, 'B', IDM_BM_DEL}, {FCONTROL | FVIRTKEY, 'G', IDM_GOTO}, {FCONTROL | FVIRTKEY, 'R', IDM_REPEAT}, {FCONTROL | FSHIFT | FVIRTKEY, 'R', IDM_PATTERN},
+        {FCONTROL | FVIRTKEY, 'B', IDM_BM_EDIT}, {FCONTROL | FSHIFT | FVIRTKEY, 'B', IDM_BM_DEL}, {FCONTROL | FVIRTKEY, 'G', IDM_GOTO}, {FCONTROL | FVIRTKEY, 'R', IDM_REPEAT}, {FCONTROL | FVIRTKEY, 'F', IDM_FIND}, {FVIRTKEY, VK_F3, IDM_FINDNEXT}, {FSHIFT | FVIRTKEY, VK_F3, IDM_FINDPREV}, {FALT | FVIRTKEY, VK_DOWN, IDM_NOTENEXT}, {FALT | FVIRTKEY, VK_UP, IDM_NOTEPREV}, {FCONTROL | FSHIFT | FVIRTKEY, 'R', IDM_PATTERN},
         {FVIRTKEY, VK_F2, IDM_BM_NEXT}, {FSHIFT | FVIRTKEY, VK_F2, IDM_BM_PREV},
     };
     ACCEL acc[sizeof keys / sizeof keys[0]];
