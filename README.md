@@ -176,6 +176,10 @@ captured against a different start point.
   to run. With a seed set, the game sees a frozen clock at that time, so every launch
   gets the same random numbers. The status bar shows the seed. Changing it restarts the
   game on the next Rewind / frame advance. Details: `docs/REVERSE_ENGINEERING.md`.
+- **Find.** `Ctrl+F` (*Edit > Find*) moves the cursor to the next frame where a key is pressed:
+  type the key (`Jmp`), add `released` for the next release (`Atk released`), or `*` for any change
+  in any key. `F3` / `Shift+F3` find the next / previous match. `Alt+Down` / `Alt+Up` jump to the
+  next / previous frame that has a note or bookmark.
 - **Bookmarks and jumping.** `Ctrl+B` (or right-click a row > *Add bookmark here...*) names the
   cursor frame as a bookmark (shown with a purple flag and a star). `F2` / `Shift+F2` jump to the
   next / previous bookmark, `Ctrl+G` jumps to any frame number, and *Edit > Bookmarks list...*
