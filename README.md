@@ -195,6 +195,10 @@ captured against a different start point.
   it. A frame with no rows made no draws. Use it to see which frame decides a drop and which input
   change would move it; *Save CSV...* exports the list. It uses a hardware write breakpoint on the
   RNG state (no game code is changed), so logging slows the frames it covers a little.
+- **Help.** The **Help** menu (or `F1`) opens an in-app guide: getting started, recording and
+  playing, frame advance, editing, bookmarks and jumping, the RNG seed and log, the Memory
+  window, Verify fast-forward, keyboard shortcuts and troubleshooting. It is part of the program,
+  so it always matches the version you run.
 - **Game memory window.** The **Memory** button in the menu bar opens a window that shows
   the running game's health, weapon points (and max), score, X/Y speed, X/Y position
   (physics and render copies), invisibility, difficulty, style, the four characters and
