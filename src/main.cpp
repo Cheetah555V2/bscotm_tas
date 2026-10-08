@@ -21,10 +21,10 @@ enum {
     IDM_NEW = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEPRE, IDM_SETGAME, IDM_BASESAVE, IDM_EXIT,
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
     IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO, IDM_MEMORY, IDM_RNGSEED,
-    IDM_VERIFY, IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
+    IDM_RNGLOG, IDM_VERIFY, IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
-    IDC_BASE = 300, IDC_PRE,
+    IDC_BASE = 300, IDC_PRE, IDC_RNG_CHK, IDC_RNG_CLR, IDC_RNG_CSV,
 };
 const UINT WM_JOB_PROGRESS = WM_APP + 1;   // wParam = Phase, lParam = movie frame
 const UINT WM_JOB_DONE     = WM_APP + 2;   // lParam = RunResult*
@@ -48,6 +48,9 @@ struct App {
     HWND notesWnd = nullptr, notesList = nullptr;   // the Notes / Bookmarks list window (when open)
     bool listBm = false;                            // that window shows only the bookmarks
     HWND memWnd = nullptr, memList = nullptr;       // the Game memory window (when open)
+    HWND rngWnd = nullptr, rngList = nullptr;       // the RNG log window (when open)
+    bool rngLogOn = false;                          // log the game's random draws (set by the window's checkbox)
+    int logPre = 0;                                 // prelude length of the last launch (marker number = movie frame + this)
     int dpi = 96;
 
     Movie movie;
@@ -944,6 +947,167 @@ void ShowMemory() {
     SetTimer(A.memWnd, 1, 100, nullptr);
 }
 
+// ---- RNG log window ----------------------------------------------------------------------------------
+// Every write to the game's RNG state (= every random draw) while the game runs the frames near the
+// stopping point, as recorded by the hook (see RngLogEntry). The editor reads the hook's log straight from
+// the shared memory, so it also shows draws made during frame advance and Run to cursor.
+bool PickFile(bool save, const wchar_t* filter, const wchar_t* ext, std::wstring& io, const std::wstring& dir);
+struct RngRow { uint32_t frame, eip, ret, range, w, kind; };
+static std::vector<RngRow> RngRows;
+static HANDLE LogMap;
+static Shm* LogShm;
+static uint32_t LogLast;
+
+static Shm* OpenLogShm() {
+    if (LogShm) return LogShm;
+    LogMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, SHM_NAME);
+    if (!LogMap) return nullptr;
+    LogShm = (Shm*)MapViewOfFile(LogMap, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    if (!LogShm || LogShm->magic != SHM_MAGIC) {
+        if (LogShm) UnmapViewOfFile(LogShm);
+        CloseHandle(LogMap);
+        LogShm = nullptr; LogMap = nullptr;
+    }
+    return LogShm;
+}
+
+static std::wstring RngFrameText(const RngRow& r) {
+    int fr = (int)r.frame - A.logPre;
+    return fr >= 1 ? std::to_wstring(fr) : L"boot";
+}
+static void RngRowText(const RngRow& r, std::wstring t[6]) {
+    wchar_t b[64];
+    t[0] = RngFrameText(r);
+    t[1] = r.kind == 1 ? L"draw" : r.kind == 2 ? L"draw (float)" : L"draw / write (inlined)";
+    if (r.kind == 0) swprintf(b, 64, L"exe+%X  (called from exe+%X)", r.eip, r.ret);
+    else swprintf(b, 64, L"exe+%X", r.ret);
+    t[2] = b;
+    if (r.kind == 1) {
+        t[3] = std::to_wstring(r.range);
+        t[4] = std::to_wstring(r.range ? r.w % r.range : r.w);
+    } else { t[3] = L"-"; t[4] = L"-"; }
+    swprintf(b, 64, L"%08X", r.w);
+    t[5] = b;
+}
+
+static void RngAddRow(const RngRow& r) {
+    std::wstring t[6];
+    RngRowText(r, t);
+    LVITEMW it{};
+    it.mask = LVIF_TEXT;
+    it.iItem = ListView_GetItemCount(A.rngList);
+    it.pszText = (LPWSTR)t[0].c_str();
+    int i = (int)SendMessageW(A.rngList, LVM_INSERTITEMW, 0, (LPARAM)&it);
+    for (int c = 1; c < 6; c++) ListView_SetItemText(A.rngList, i, c, (LPWSTR)t[c].c_str());
+}
+
+static void RngClear() {
+    RngRows.clear();
+    if (A.rngList) ListView_DeleteAllItems(A.rngList);
+}
+
+void RefreshRngLog() {
+    if (!A.rngList) return;
+    Shm* s = OpenLogShm();
+    if (!s) return;
+    s->rng_log = A.rngLogOn ? 1 : 0;
+    uint32_t n = s->rng_log_n;
+    if (n < LogLast) { RngClear(); LogLast = 0; }            // the game was relaunched: new log
+    if (n - LogLast > RNG_LOG_MAX) LogLast = n - RNG_LOG_MAX; // fell behind (old entries are overwritten)
+    if (n == LogLast) return;
+    SendMessageW(A.rngList, WM_SETREDRAW, FALSE, 0);
+    for (uint32_t i = LogLast; i < n; i++) {
+        const RngLogEntry& e = s->rng_log_buf[i & (RNG_LOG_MAX - 1)];
+        RngRow r{e.frame, e.eip, e.ret, e.range, e.w, e.kind};
+        RngRows.push_back(r);
+        RngAddRow(r);
+    }
+    LogLast = n;
+    while (RngRows.size() > 20000) { RngRows.erase(RngRows.begin()); ListView_DeleteItem(A.rngList, 0); }
+    SendMessageW(A.rngList, WM_SETREDRAW, TRUE, 0);
+    ListView_EnsureVisible(A.rngList, ListView_GetItemCount(A.rngList) - 1, FALSE);
+    InvalidateRect(A.rngList, nullptr, TRUE);
+}
+
+static void RngSaveCsv() {
+    std::wstring p;
+    if (!PickFile(true, L"CSV (*.csv)\0*.csv\0", L"csv", p, A.root)) return;
+    FILE* f = _wfopen(p.c_str(), L"wb");
+    if (!f) { MessageBoxW(A.wnd, L"Cannot write the file.", L"RNG log", MB_ICONERROR); return; }
+    fputs("frame,type,where,range,result,state_w\r\n", f);
+    for (const RngRow& r : RngRows) {
+        std::wstring t[6];
+        RngRowText(r, t);
+        std::string line;
+        for (int c = 0; c < 6; c++) { std::string u = U8(t[c]); if (u.find(',') != std::string::npos) u = "\"" + u + "\""; line += (c ? "," : "") + u; }
+        fputs((line + "\r\n").c_str(), f);
+    }
+    fclose(f);
+    SetMsg(L"Saved " + std::to_wstring(RngRows.size()) + L" random draws to " + p);
+}
+
+LRESULT CALLBACK RngProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE: {
+            int top = S(34);
+            if (A.rngList) MoveWindow(A.rngList, 0, top, LOWORD(lp), std::max(0, (int)HIWORD(lp) - top), TRUE);
+            return 0;
+        }
+        case WM_COMMAND:
+            switch (LOWORD(wp)) {
+                case IDC_RNG_CHK: A.rngLogOn = SendMessageW((HWND)lp, BM_GETCHECK, 0, 0) == BST_CHECKED; RefreshRngLog(); break;
+                case IDC_RNG_CLR: RngClear(); break;
+                case IDC_RNG_CSV: RngSaveCsv(); break;
+            }
+            return 0;
+        case WM_TIMER: RefreshRngLog(); return 0;
+        case WM_CLOSE: DestroyWindow(h); return 0;
+        case WM_DESTROY:
+            KillTimer(h, 1);
+            A.rngLogOn = false;
+            if (LogShm) LogShm->rng_log = 0;
+            A.rngWnd = A.rngList = nullptr;
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowRngLog() {
+    if (A.rngWnd) { SetForegroundWindow(A.rngWnd); return; }
+    RECT pr;
+    GetWindowRect(A.wnd, &pr);
+    A.rngWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmRng", L"RNG log",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
+                               pr.left + S(60), pr.top + S(120), S(760), S(480), A.wnd, nullptr, nullptr, nullptr);
+    if (!A.rngWnd) return;
+    HWND chk = CreateWindowExW(0, L"BUTTON", L"Log the game's random draws", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                               S(8), S(6), S(210), S(22), A.rngWnd, (HMENU)(INT_PTR)IDC_RNG_CHK, nullptr, nullptr);
+    HWND clr = CreateWindowExW(0, L"BUTTON", L"Clear", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                               S(230), S(4), S(70), S(26), A.rngWnd, (HMENU)(INT_PTR)IDC_RNG_CLR, nullptr, nullptr);
+    HWND csv = CreateWindowExW(0, L"BUTTON", L"Save CSV...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                               S(306), S(4), S(100), S(26), A.rngWnd, (HMENU)(INT_PTR)IDC_RNG_CSV, nullptr, nullptr);
+    for (HWND c : {chk, clr, csv}) SendMessageW(c, WM_SETFONT, (WPARAM)A.font, TRUE);
+    A.rngList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                                0, 0, 0, 0, A.rngWnd, nullptr, nullptr, nullptr);
+    SendMessageW(A.rngList, WM_SETFONT, (WPARAM)A.font, TRUE);
+    ListView_SetExtendedListViewStyle(A.rngList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    const wchar_t* names[6] = {L"Frame", L"Type", L"Where", L"Range", L"Result", L"State w"};
+    int widths[6] = {60, 150, 190, 60, 90, 90};
+    for (int c = 0; c < 6; c++) {
+        LVCOLUMNW col{};
+        col.mask = LVCF_TEXT | LVCF_WIDTH;
+        col.pszText = (LPWSTR)names[c];
+        col.cx = S(widths[c]);
+        SendMessageW(A.rngList, LVM_INSERTCOLUMNW, c, (LPARAM)&col);
+    }
+    RECT cr;
+    GetClientRect(A.rngWnd, &cr);
+    SendMessageW(A.rngWnd, WM_SIZE, 0, MAKELPARAM(cr.right, cr.bottom));
+    RngClear();
+    LogLast = LogShm ? LogShm->rng_log_n : 0;     // only draws from now on
+    SetTimer(A.rngWnd, 1, 150, nullptr);
+}
 // ---- files, paths, config ---------------------------------------------------
 bool PickFile(bool save, const wchar_t* filter, const wchar_t* ext, std::wstring& io, const std::wstring& dir) {
     wchar_t buf[MAX_PATH * 2] = {};
@@ -1193,6 +1357,8 @@ void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, b
     JobArgs* j = new JobArgs;
     RunParams& p = j->p;
     if (!FillParams(p)) { delete j; return; }
+    p.rng_log = A.rngWnd && A.rngLogOn;
+    A.logPre = (int)p.prelude.size();
     if (!fresh) p.movie = A.movie.frames;
     p.target = target;
     p.record = record;
@@ -1691,7 +1857,8 @@ void BuildMenu(HWND w) {
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)f, L"&File");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)e, L"&Edit");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)r, L"&Run");
-    AppendMenuW(bar, MF_STRING, IDM_MEMORY, L"&Memory");     // a plain menu-bar button: opens the window
+    AppendMenuW(bar, MF_STRING, IDM_MEMORY, L"&Memory");
+    AppendMenuW(bar, MF_STRING, IDM_RNGLOG, L"RNG &log");     // a plain menu-bar button: opens the window
     SetMenu(w, bar);
 }
 
@@ -1806,6 +1973,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_RNGSEED: EditSeed(); break;
                 case IDM_VERIFY: VerifyFastForward(); break;
                 case IDM_MEMORY: ShowMemory(); break;
+                case IDM_RNGLOG: ShowRngLog(); break;
                 case IDM_PLAY: StartJob(false, (uint32_t)Size(), false, true); break;
                 case IDM_REWIND: StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true); break;
                 case IDM_STEP: FrameAdvance(); break;
@@ -1889,6 +2057,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
     RegisterClassExW(&nd);
     nd.lpfnWndProc = MemProc;
     nd.lpszClassName = L"BscotmMem";
+    RegisterClassExW(&nd);
+    nd.lpfnWndProc = RngProc;
+    nd.lpszClassName = L"BscotmRng";
     RegisterClassExW(&nd);
 
     WNDCLASSEXW c{sizeof c};

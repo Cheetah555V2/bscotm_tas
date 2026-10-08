@@ -585,3 +585,19 @@ per-frame allocations of about 1.6 MB (a 1 MB block every frame, ~6 blocks of 62
   still (about 2000 fps) but the final picture is wrong.
 - Limits of the check: only `test3.bscotm` has gameplay (stage 1); other stages may use
   command types this movie never produced.
+
+## RNG draw log
+
+Every draw writes all four state words, so a hardware **write** breakpoint (DR0, 4 bytes, on
+`*(COTM.exe+0x48365C)+0x300`, set on every thread of the game from a helper thread, re-set when the
+manager object moves and on new threads) traps each draw, including the ~100 inlined copies that a
+breakpoint on the draw function would miss. The vectored handler logs frame marker, `eip` (the
+instruction after the write), the return address and the new `w` into `Shm::rng_log_buf`; for the draw
+function the range is read from `[ebp+8]` and the caller from `[ebp+4]` (write site `exe+0x802CF`), for
+the float version from `[esp+4]` (`exe+0x80328`), for inlined copies the first call-preceded address on
+the stack is used. It is armed only while the host wants it and within 300 frames of `draw_from`.
+
+Seen on `test3.bscotm` (no baseline, no seed change): draws are rare, a few dozen on a handful of
+frames in the first 3700; the item-drop roll is `range 100` called from `exe+0x26CC79`; the draws
+around it come from `exe+0xEC...` (spawn/behaviour code, ranges 2-4) and inlined copies at
+`exe+0xEC585/0xEC757/0xEC925/0xEC3C9`.

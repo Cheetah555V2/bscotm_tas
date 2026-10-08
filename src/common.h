@@ -40,6 +40,12 @@ enum SpeedMask : uint32_t {
 #define SHM_NAME "Local\\bscotm_tas_shm"
 #define SHM_MAGIC 0x54534342u
 
+// One write to the game's RNG state (a random draw, or the seeding). kind: 1 = the draw function
+// COTM.exe+0x80280 (range, result = w % range), 2 = the float version +0x802E0, 0 = any other code
+// that writes the state (inlined copies, seeding): `eip` is then the instruction after the write.
+enum { RNG_LOG_MAX = 16384 };
+struct RngLogEntry { uint32_t frame, eip, ret, range, w, kind; };   // frame = marker number; eip/ret = exe RVAs
+
 // Host <-> hook control block. keys[] is the play schedule (host writes) and
 // the record buffer (hook writes); index = 0-based frame.
 struct Shm {
@@ -65,5 +71,8 @@ struct Shm {
     volatile uint32_t cmd_count[36]; // SPEED_NORENDER: how many commands of each type were skipped (statistics)
     volatile uint32_t rng_on;       // 1 = the game sees a frozen clock at Unix time rng_time (that is its RNG seed)
     volatile uint32_t rng_time;     // Unix time in seconds; the game seeds its xorshift128 generator from it at launch
+    volatile uint32_t rng_log;      // 1 = log every write to the game's RNG state (see hook.cpp, RngLogEntry)
+    volatile uint32_t rng_log_n;    // entries written so far; entry i lives at rng_log_buf[i % RNG_LOG_MAX]
+    RngLogEntry rng_log_buf[RNG_LOG_MAX];
     uint16_t keys[MAX_FRAMES];
 };
