@@ -21,6 +21,7 @@ enum {
     IDM_NEW = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEPRE, IDM_SETGAME, IDM_BASESAVE, IDM_EXIT,
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
     IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO, IDM_MEMORY, IDM_RNGSEED,
+    IDC_MEM_HIST, IDC_MEM_GRAPH, IDC_MEM_CSV, IDC_MEM_CLR,
     IDM_HELP_START, IDM_HELP_KEYS, IDM_HELP_TROUBLE, IDM_HELP_ABOUT, IDM_HELP_GUIDE, IDC_HELP_TOPICS,
     IDM_RNGLOG, IDM_VERIFY, IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
@@ -50,6 +51,8 @@ struct App {
     bool listBm = false;                            // that window shows only the bookmarks
     HWND memWnd = nullptr, memList = nullptr;       // the Game memory window (when open)
     HWND rngWnd = nullptr, rngList = nullptr;       // the RNG log window (when open)
+    HWND graphWnd = nullptr, graphList = nullptr;   // the value graph window (when open)
+    bool histOn = false;                            // record the player's values every frame (Memory window's checkbox)
     bool rngLogOn = false;                          // log the game's random draws (set by the window's checkbox)
     int logPre = 0;                                 // prelude length of the last launch (marker number = movie frame + this)
     int dpi = 96;
@@ -882,6 +885,210 @@ std::wstring ReadField(const GameProc& gp, const MemField& f) {
     return b;
 }
 
+// ---- value history (graph and CSV) -------------------------------------------------------------------
+// The hook samples the player's values at every frame marker while the box is ticked; the editor copies the
+// samples from the shared memory. Frames are movie frames: the state after that frame.
+static Shm* OpenLogShm();
+bool PickFile(bool save, const wchar_t* filter, const wchar_t* ext, std::wstring& io, const std::wstring& dir);
+struct HistRow { int frame; uint32_t v[HIST_FIELDS]; };
+static std::vector<HistRow> Hist;
+static uint32_t HistLast;
+static const wchar_t* const HIST_NAMES[HIST_FIELDS] = {L"Health", L"Weapon points", L"Score", L"X speed", L"Y speed", L"X position", L"Y position", L"Invisibility"};
+static const bool HIST_FLOAT[HIST_FIELDS] = {false, false, false, true, true, true, true, true};
+
+static bool HistValue(const HistRow& r, int f, double& out) {
+    if (HIST_FLOAT[f]) {
+        float x;
+        memcpy(&x, &r.v[f], 4);
+        if (x != x) return false;
+        out = x;
+        return true;
+    }
+    if (r.v[f] == 0xFFFFFFFFu) return false;
+    out = r.v[f];
+    return true;
+}
+
+void RefreshGraph();
+
+void RefreshHistory() {
+    Shm* s = OpenLogShm();
+    if (!s) return;
+    s->hist_on = A.histOn ? 1 : 0;
+    uint32_t n = s->hist_n;
+    if (n < HistLast) { Hist.clear(); HistLast = 0; }              // the game was relaunched: new history
+    if (n - HistLast > HIST_MAX) HistLast = n - HIST_MAX;           // fell behind (old samples were overwritten)
+    if (n == HistLast) return;
+    for (uint32_t i = HistLast; i < n; i++) {
+        const HistEntry& e = s->hist_buf[i & (HIST_MAX - 1)];
+        int fr = (int)e.frame - 1 - A.logPre;                       // state after this movie frame
+        if (fr < 1) continue;
+        HistRow r;
+        r.frame = fr;
+        memcpy(r.v, e.v, sizeof r.v);
+        Hist.push_back(r);
+    }
+    HistLast = n;
+    if (Hist.size() > 400000) Hist.erase(Hist.begin(), Hist.begin() + 100000);
+    RefreshGraph();
+}
+
+static void HistSaveCsv() {
+    std::wstring p;
+    if (!PickFile(true, L"CSV (*.csv)\0*.csv\0", L"csv", p, A.root)) return;
+    FILE* f = _wfopen(p.c_str(), L"wb");
+    if (!f) { MessageBoxW(A.wnd, L"Cannot write the file.", L"Value history", MB_ICONERROR); return; }
+    fputs("frame", f);
+    for (int i = 0; i < HIST_FIELDS; i++) { std::string n = U8(HIST_NAMES[i]); for (char& c : n) if (c == ' ') c = '_'; fprintf(f, ",%s", n.c_str()); }
+    fputs("\r\n", f);
+    for (const HistRow& r : Hist) {
+        fprintf(f, "%d", r.frame);
+        for (int i = 0; i < HIST_FIELDS; i++) {
+            double v;
+            if (!HistValue(r, i, v)) fputs(",", f);
+            else if (HIST_FLOAT[i]) fprintf(f, ",%.4f", v);
+            else fprintf(f, ",%.0f", v);
+        }
+        fputs("\r\n", f);
+    }
+    fclose(f);
+    SetMsg(L"Saved " + std::to_wstring(Hist.size()) + L" frames of values to " + p);
+}
+
+// The graph: every selected value as a line over the frames, each scaled to the full height (the legend
+// shows its range); move the mouse over the plot to read the values of one frame.
+static int GraphMouseX = -1;
+static const COLORREF GRAPH_COLORS[HIST_FIELDS] = {RGB(200, 40, 40), RGB(40, 120, 200), RGB(120, 120, 120), RGB(30, 150, 60),
+                                                    RGB(220, 130, 20), RGB(130, 60, 190), RGB(20, 160, 170), RGB(170, 90, 90)};
+
+static RECT GraphPlotRect(HWND h) {
+    RECT rc;
+    GetClientRect(h, &rc);
+    rc.left = S(190) + S(8); rc.top = S(60); rc.right -= S(10); rc.bottom -= S(26);
+    return rc;
+}
+
+void RefreshGraph() { if (A.graphWnd) InvalidateRect(A.graphWnd, nullptr, FALSE); }
+
+static void PaintGraph(HWND h) {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    RECT cr;
+    GetClientRect(h, &cr);
+    HDC m = CreateCompatibleDC(dc);
+    HBITMAP bm = CreateCompatibleBitmap(dc, cr.right, cr.bottom);
+    HGDIOBJ old = SelectObject(m, bm);
+    Fill(m, 0, 0, cr.right, cr.bottom, cBg);
+    SelectObject(m, A.font);
+    SetBkMode(m, TRANSPARENT);
+    RECT pr = GraphPlotRect(h);
+    int pw = pr.right - pr.left, ph = pr.bottom - pr.top;
+    std::vector<int> sel;
+    for (int i = 0; i < HIST_FIELDS; i++) if (SendMessageW(A.graphList, LB_GETSEL, i, 0) > 0) sel.push_back(i);
+    HPEN frame = CreatePen(PS_SOLID, 1, cLine60);
+    HGDIOBJ op = SelectObject(m, frame);
+    MoveToEx(m, pr.left, pr.top, nullptr); LineTo(m, pr.left, pr.bottom); LineTo(m, pr.right, pr.bottom);
+    SelectObject(m, op);
+    DeleteObject(frame);
+    if (Hist.empty() || sel.empty() || pw < 10 || ph < 10) {
+        std::wstring msg = Hist.empty() ? L"No values yet. Tick \"Record history\" in the Memory window, then step or jump." : L"Select one or more values on the left.";
+        Text(m, msg.c_str(), RECT{pr.left + S(10), pr.top + S(10), pr.right, pr.top + S(40)}, DT_LEFT, RGB(90, 90, 90));
+    } else {
+        int f0 = Hist.front().frame, f1 = Hist.back().frame;
+        if (f1 <= f0) f1 = f0 + 1;
+        wchar_t b[96];
+        swprintf(b, 96, L"%d", f0);
+        Text(m, b, RECT{pr.left, pr.bottom + S(4), pr.left + S(100), pr.bottom + S(22)}, DT_LEFT, RGB(60, 60, 60));
+        swprintf(b, 96, L"frame %d", f1);
+        Text(m, b, RECT{pr.right - S(120), pr.bottom + S(4), pr.right, pr.bottom + S(22)}, DT_RIGHT, RGB(60, 60, 60));
+        int hover = -1;
+        if (GraphMouseX >= pr.left && GraphMouseX <= pr.right) {
+            int fr = f0 + (int)((double)(GraphMouseX - pr.left) / pw * (f1 - f0) + 0.5);
+            size_t lo = 0, hi = Hist.size() - 1;
+            while (lo < hi) { size_t mid = (lo + hi) / 2; if (Hist[mid].frame < fr) lo = mid + 1; else hi = mid; }
+            hover = (int)lo;
+        }
+        int lx = pr.left + S(4);
+        for (int f : sel) {
+            double mn = 1e300, mx = -1e300;
+            for (const HistRow& r : Hist) { double v; if (HistValue(r, f, v)) { mn = std::min(mn, v); mx = std::max(mx, v); } }
+            if (mn > mx) continue;
+            if (mx - mn < 1e-9) { mn -= 1; mx += 1; }
+            HPEN pen = CreatePen(PS_SOLID, 2, GRAPH_COLORS[f]);
+            HGDIOBJ op2 = SelectObject(m, pen);
+            bool started = false;
+            size_t step = std::max<size_t>(1, Hist.size() / (size_t)(pw * 2));
+            for (size_t i = 0; i < Hist.size(); i += step) {
+                double v;
+                if (!HistValue(Hist[i], f, v)) { started = false; continue; }
+                int x = pr.left + (int)((double)(Hist[i].frame - f0) / (f1 - f0) * pw);
+                int y = pr.bottom - (int)((v - mn) / (mx - mn) * ph);
+                if (!started) { MoveToEx(m, x, y, nullptr); started = true; } else LineTo(m, x, y);
+            }
+            SelectObject(m, op2);
+            DeleteObject(pen);
+            std::wstring name = HIST_NAMES[f];
+            swprintf(b, 96, L"%ls  [%g .. %g]", name.c_str(), mn, mx);
+            Fill(m, lx, S(8), lx + S(10), S(18), GRAPH_COLORS[f]);
+            Text(m, b, RECT{lx + S(14), S(4), lx + S(260), S(22)}, DT_LEFT, RGB(30, 30, 30));
+            lx += S(250);
+            if (lx > cr.right - S(260)) lx = pr.left + S(4);
+        }
+        if (hover >= 0) {
+            const HistRow& r = Hist[hover];
+            int x = pr.left + (int)((double)(r.frame - f0) / (f1 - f0) * pw);
+            HPEN hp = CreatePen(PS_SOLID, 1, RGB(120, 120, 120));
+            HGDIOBJ o3 = SelectObject(m, hp);
+            MoveToEx(m, x, pr.top, nullptr); LineTo(m, x, pr.bottom);
+            SelectObject(m, o3);
+            DeleteObject(hp);
+            std::wstring line = L"frame " + std::to_wstring(r.frame);
+            for (int f : sel) { double v; wchar_t t[64]; if (HistValue(r, f, v)) swprintf(t, 64, L"   %ls %g", HIST_NAMES[f], v); else swprintf(t, 64, L"   %ls -", HIST_NAMES[f]); line += t; }
+            Text(m, line.c_str(), RECT{pr.left + S(4), S(28), cr.right - S(8), S(48)}, DT_LEFT, RGB(30, 30, 30));
+        }
+    }
+    BitBlt(dc, 0, 0, cr.right, cr.bottom, m, 0, 0, SRCCOPY);
+    SelectObject(m, old);
+    DeleteObject(bm);
+    DeleteDC(m);
+    EndPaint(h, &ps);
+}
+
+LRESULT CALLBACK GraphProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE:
+            if (A.graphList) MoveWindow(A.graphList, 0, 0, S(190), HIWORD(lp), TRUE);
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        case WM_COMMAND:
+            if (HIWORD(wp) == LBN_SELCHANGE) InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        case WM_MOUSEMOVE: GraphMouseX = (short)LOWORD(lp); InvalidateRect(h, nullptr, FALSE); return 0;
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: PaintGraph(h); return 0;
+        case WM_CLOSE: DestroyWindow(h); return 0;
+        case WM_DESTROY: A.graphWnd = A.graphList = nullptr; return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowGraph() {
+    if (A.graphWnd) { SetForegroundWindow(A.graphWnd); return; }
+    RECT pr;
+    GetWindowRect(A.wnd, &pr);
+    A.graphWnd = CreateWindowExW(0, L"BscotmGraph", L"Value graph", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                 pr.left + S(80), pr.top + S(100), S(900), S(500), A.wnd, nullptr, nullptr, nullptr);
+    if (!A.graphWnd) return;
+    A.graphList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_MULTIPLESEL,
+                                  0, 0, 0, 0, A.graphWnd, nullptr, nullptr, nullptr);
+    SendMessageW(A.graphList, WM_SETFONT, (WPARAM)A.font, TRUE);
+    for (int i = 0; i < HIST_FIELDS; i++) SendMessageW(A.graphList, LB_ADDSTRING, 0, (LPARAM)HIST_NAMES[i]);
+    SendMessageW(A.graphList, LB_SETSEL, TRUE, 3);       // X speed and Y speed to start with
+    SendMessageW(A.graphList, LB_SETSEL, TRUE, 4);
+    RECT cr;
+    GetClientRect(A.graphWnd, &cr);
+    SendMessageW(A.graphWnd, WM_SIZE, 0, MAKELPARAM(cr.right, cr.bottom));
+}
 void RefreshMemory() {
     if (!A.memList) return;
     bool on = AttachGame();
@@ -893,17 +1100,30 @@ void RefreshMemory() {
         if (v != cur) ListView_SetItemText(A.memList, (int)i, 1, (LPWSTR)v.c_str());
     }
     SetWindowTextW(A.memWnd, on ? L"Game memory" : L"Game memory (game not running)");
+    RefreshHistory();
 }
 
 LRESULT CALLBACK MemProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-        case WM_SIZE:
-            if (A.memList) MoveWindow(A.memList, 0, 0, LOWORD(lp), HIWORD(lp), TRUE);
+        case WM_SIZE: {
+            int top = S(34);
+            if (A.memList) MoveWindow(A.memList, 0, top, LOWORD(lp), std::max(0, (int)HIWORD(lp) - top), TRUE);
+            return 0;
+        }
+        case WM_COMMAND:
+            switch (LOWORD(wp)) {
+                case IDC_MEM_HIST: A.histOn = SendMessageW((HWND)lp, BM_GETCHECK, 0, 0) == BST_CHECKED; RefreshHistory(); break;
+                case IDC_MEM_GRAPH: ShowGraph(); break;
+                case IDC_MEM_CSV: HistSaveCsv(); break;
+                case IDC_MEM_CLR: Hist.clear(); RefreshGraph(); break;
+            }
             return 0;
         case WM_TIMER: RefreshMemory(); return 0;
         case WM_CLOSE: DestroyWindow(h); return 0;
         case WM_DESTROY:
             KillTimer(h, 1);
+            A.histOn = false;
+            if (OpenLogShm()) OpenLogShm()->hist_on = 0;
             A.memWnd = A.memList = nullptr;
             if (gp.h) { CloseHandle(gp.h); gp = GameProc(); }
             return 0;
@@ -917,8 +1137,17 @@ void ShowMemory() {
     GetWindowRect(A.wnd, &pr);
     A.memWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmMem", L"Game memory",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
-                               pr.right - S(340), pr.top + S(90), S(320), S(600), A.wnd, nullptr, nullptr, nullptr);
+                               pr.right - S(440), pr.top + S(90), S(420), S(640), A.wnd, nullptr, nullptr, nullptr);
     if (!A.memWnd) return;
+    HWND hchk = CreateWindowExW(0, L"BUTTON", L"Record history", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                S(8), S(6), S(130), S(22), A.memWnd, (HMENU)(INT_PTR)IDC_MEM_HIST, nullptr, nullptr);
+    HWND hgr = CreateWindowExW(0, L"BUTTON", L"Graph...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                               S(144), S(4), S(80), S(26), A.memWnd, (HMENU)(INT_PTR)IDC_MEM_GRAPH, nullptr, nullptr);
+    HWND hcs = CreateWindowExW(0, L"BUTTON", L"Save CSV...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                               S(228), S(4), S(96), S(26), A.memWnd, (HMENU)(INT_PTR)IDC_MEM_CSV, nullptr, nullptr);
+    HWND hcl = CreateWindowExW(0, L"BUTTON", L"Clear", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                               S(328), S(4), S(70), S(26), A.memWnd, (HMENU)(INT_PTR)IDC_MEM_CLR, nullptr, nullptr);
+    for (HWND c : {hchk, hgr, hcs, hcl}) SendMessageW(c, WM_SETFONT, (WPARAM)A.font, TRUE);
     A.memList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                 WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER,
                                 0, 0, 0, 0, A.memWnd, nullptr, nullptr, nullptr);
@@ -943,7 +1172,7 @@ void ShowMemory() {
     }
     RECT cr;
     GetClientRect(A.memWnd, &cr);
-    MoveWindow(A.memList, 0, 0, cr.right, cr.bottom, TRUE);
+    SendMessageW(A.memWnd, WM_SIZE, 0, MAKELPARAM(cr.right, cr.bottom));
     RefreshMemory();
     SetTimer(A.memWnd, 1, 100, nullptr);
 }
@@ -1177,7 +1406,9 @@ const HelpTopic HELP_TOPICS[] = {
      L"A seed fixes the random numbers at launch only. If you change your inputs, the game may draw a different number of values before an event, and that event's result changes too."},
     {L"Memory window",
      L"The Memory button in the menu bar opens a read-only window with the running game's values, 10 times a second: health, weapon points and maximum, score, X and Y speed, X and Y position (physics and the render copy), invisibility, difficulty, style, the four characters and the four RNG state words.\r\n\r\n"
-     L"A dash means the game has no value yet (menus, loading). The window follows any COTM.exe that is running, frozen or live."},
+     L"A dash means the game has no value yet (menus, loading). The window follows any COTM.exe that is running, frozen or live.\r\n\r\n"
+     L"Value history\r\n"
+     L"Tick Record history, then step, run or jump as usual: the game samples health, weapon points, score, X and Y speed, X and Y position and invisibility at every frame, also while fast-forwarding. Graph... draws the selected values over the frames (each value is scaled to the full height, its range is in the legend; move the mouse over the plot to read the values of one frame). Save CSV... writes every recorded frame; Clear empties the history. A new launch of the game (a rewind) starts a new history. Each row is the state after that movie frame."},
     {L"Verify fast-forward",
      L"Run > Verify fast-forward replays your whole movie twice at the fastest speed: once with every speed-up (no drawing, skipped render commands) and once with only the clock speed-up and normal drawing. It compares the game's values (the Memory window's list) at about 20 evenly spaced frames and tells you the first frame and value that differ, or that all matched.\r\n\r\n"
      L"Use it on your own movie, especially one that goes through other stages, before you trust a long fast-forward. Checkpoints during loading are skipped (loading runs on real time). The picture is not compared. A 10,000-frame movie takes about 40 seconds.\r\n\r\n"
@@ -1516,6 +1747,7 @@ void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, b
     RunParams& p = j->p;
     if (!FillParams(p)) { delete j; return; }
     p.rng_log = A.rngWnd && A.rngLogOn;
+    p.hist = A.memWnd && A.histOn;
     A.logPre = (int)p.prelude.size();
     if (!fresh) p.movie = A.movie.frames;
     p.target = target;
@@ -2230,6 +2462,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
     RegisterClassExW(&nd);
     nd.lpfnWndProc = RngProc;
     nd.lpszClassName = L"BscotmRng";
+    RegisterClassExW(&nd);
+    nd.lpfnWndProc = GraphProc;
+    nd.lpszClassName = L"BscotmGraph";
     RegisterClassExW(&nd);
     nd.lpfnWndProc = HelpProc;
     nd.lpszClassName = L"BscotmHelp";

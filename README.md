@@ -195,6 +195,11 @@ captured against a different start point.
   it. A frame with no rows made no draws. Use it to see which frame decides a drop and which input
   change would move it; *Save CSV...* exports the list. It uses a hardware write breakpoint on the
   RNG state (no game code is changed), so logging slows the frames it covers a little.
+- **Value history.** In the Memory window, tick **Record history**, then step, run or jump as
+  usual: the hook samples health, weapon points, score, X/Y speed, X/Y position and invisibility
+  at every frame (also during fast-forward). **Graph...** draws the selected values over the
+  frames, each scaled to the full height (the legend shows its range; hover to read one frame);
+  **Save CSV...** writes every recorded frame. A new game launch starts a new history.
 - **Help.** The **Help** menu (or `F1`) opens an in-app guide: getting started, recording and
   playing, frame advance, editing, bookmarks and jumping, the RNG seed and log, the Memory
   window, Verify fast-forward, keyboard shortcuts and troubleshooting. It is part of the program,

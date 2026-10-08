@@ -46,6 +46,13 @@ enum SpeedMask : uint32_t {
 enum { RNG_LOG_MAX = 16384 };
 struct RngLogEntry { uint32_t frame, eip, ret, range, w, kind; };   // frame = marker number; eip/ret = exe RVAs
 
+// One sample of the player's values, taken by the hook at every frame marker while Shm::hist_on is set.
+// frame = marker number; the values are the state before that frame is run, i.e. after frame (marker - 1).
+// v: health, weapon points, score (unsigned ints), X speed, Y speed, X, Y, invisibility (float bits);
+// 0xFFFFFFFF / NaN means the game has no such value yet (menus, loading).
+enum { HIST_MAX = 32768, HIST_FIELDS = 8 };
+struct HistEntry { uint32_t frame; uint32_t v[HIST_FIELDS]; };
+
 // Host <-> hook control block. keys[] is the play schedule (host writes) and
 // the record buffer (hook writes); index = 0-based frame.
 struct Shm {
@@ -74,5 +81,8 @@ struct Shm {
     volatile uint32_t rng_log;      // 1 = log every write to the game's RNG state (see hook.cpp, RngLogEntry)
     volatile uint32_t rng_log_n;    // entries written so far; entry i lives at rng_log_buf[i % RNG_LOG_MAX]
     RngLogEntry rng_log_buf[RNG_LOG_MAX];
+    volatile uint32_t hist_on;      // 1 = sample the player's values at every frame marker (see HistEntry)
+    volatile uint32_t hist_n;       // samples taken so far; sample i lives at hist_buf[i % HIST_MAX]
+    HistEntry hist_buf[HIST_MAX];
     uint16_t keys[MAX_FRAMES];
 };
