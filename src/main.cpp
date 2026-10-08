@@ -21,10 +21,10 @@ enum {
     IDM_NEW = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEPRE, IDM_SETGAME, IDM_BASESAVE, IDM_EXIT,
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
     IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO, IDM_MEMORY, IDM_RNGSEED,
-    IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
+    IDM_RNGLOG, IDM_VERIFY, IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
-    IDC_BASE = 300, IDC_PRE,
+    IDC_BASE = 300, IDC_PRE, IDC_RNG_CHK, IDC_RNG_CLR, IDC_RNG_CSV,
 };
 const UINT WM_JOB_PROGRESS = WM_APP + 1;   // wParam = Phase, lParam = movie frame
 const UINT WM_JOB_DONE     = WM_APP + 2;   // lParam = RunResult*
@@ -48,6 +48,9 @@ struct App {
     HWND notesWnd = nullptr, notesList = nullptr;   // the Notes / Bookmarks list window (when open)
     bool listBm = false;                            // that window shows only the bookmarks
     HWND memWnd = nullptr, memList = nullptr;       // the Game memory window (when open)
+    HWND rngWnd = nullptr, rngList = nullptr;       // the RNG log window (when open)
+    bool rngLogOn = false;                          // log the game's random draws (set by the window's checkbox)
+    int logPre = 0;                                 // prelude length of the last launch (marker number = movie frame + this)
     int dpi = 96;
 
     Movie movie;
@@ -845,17 +848,17 @@ bool AttachGame() {
     return true;
 }
 
-bool ReadU32(uintptr_t a, uint32_t& v) {
+bool ReadU32(const GameProc& gp, uintptr_t a, uint32_t& v) {
     SIZE_T g = 0;
     return a && ReadProcessMemory(gp.h, (void*)a, &v, 4, &g) && g == 4;
 }
 
 // Returns the text for one field, or "-" if the chain cannot be followed (menu, loading, no stage).
-std::wstring ReadField(const MemField& f) {
+std::wstring ReadField(const GameProc& gp, const MemField& f) {
     uint32_t p = 0;
-    if (!ReadU32(gp.base + f.root, p) || !p) return L"-";
+    if (!ReadU32(gp, gp.base + f.root, p) || !p) return L"-";
     for (size_t i = f.xml.size() - 1; i > 0; i--)
-        if (!ReadU32(p + f.xml[i], p) || !p) return L"-";
+        if (!ReadU32(gp, p + f.xml[i], p) || !p) return L"-";
     uintptr_t a = p + f.xml[0];
     wchar_t b[48];
     SIZE_T g = 0;
@@ -865,7 +868,7 @@ std::wstring ReadField(const MemField& f) {
         swprintf(b, 48, L"%u", (unsigned)v);
     } else {
         uint32_t v;
-        if (!ReadU32(a, v)) return L"-";
+        if (!ReadU32(gp, a, v)) return L"-";
         if (f.kind == MK_U32) swprintf(b, 48, L"%u", (unsigned)v);
         else if (f.kind == MK_HEX) swprintf(b, 48, L"%08X", (unsigned)v);
         else {
@@ -884,7 +887,7 @@ void RefreshMemory() {
     const auto& fs = MemFields();
     wchar_t cur[128];
     for (size_t i = 0; i < fs.size(); i++) {
-        std::wstring v = on ? ReadField(fs[i]) : L"-";
+        std::wstring v = on ? ReadField(gp, fs[i]) : L"-";
         ListView_GetItemText(A.memList, (int)i, 1, cur, 128);
         if (v != cur) ListView_SetItemText(A.memList, (int)i, 1, (LPWSTR)v.c_str());
     }
@@ -944,6 +947,167 @@ void ShowMemory() {
     SetTimer(A.memWnd, 1, 100, nullptr);
 }
 
+// ---- RNG log window ----------------------------------------------------------------------------------
+// Every write to the game's RNG state (= every random draw) while the game runs the frames near the
+// stopping point, as recorded by the hook (see RngLogEntry). The editor reads the hook's log straight from
+// the shared memory, so it also shows draws made during frame advance and Run to cursor.
+bool PickFile(bool save, const wchar_t* filter, const wchar_t* ext, std::wstring& io, const std::wstring& dir);
+struct RngRow { uint32_t frame, eip, ret, range, w, kind; };
+static std::vector<RngRow> RngRows;
+static HANDLE LogMap;
+static Shm* LogShm;
+static uint32_t LogLast;
+
+static Shm* OpenLogShm() {
+    if (LogShm) return LogShm;
+    LogMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, SHM_NAME);
+    if (!LogMap) return nullptr;
+    LogShm = (Shm*)MapViewOfFile(LogMap, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    if (!LogShm || LogShm->magic != SHM_MAGIC) {
+        if (LogShm) UnmapViewOfFile(LogShm);
+        CloseHandle(LogMap);
+        LogShm = nullptr; LogMap = nullptr;
+    }
+    return LogShm;
+}
+
+static std::wstring RngFrameText(const RngRow& r) {
+    int fr = (int)r.frame - A.logPre;
+    return fr >= 1 ? std::to_wstring(fr) : L"boot";
+}
+static void RngRowText(const RngRow& r, std::wstring t[6]) {
+    wchar_t b[64];
+    t[0] = RngFrameText(r);
+    t[1] = r.kind == 1 ? L"draw" : r.kind == 2 ? L"draw (float)" : L"draw / write (inlined)";
+    if (r.kind == 0) swprintf(b, 64, L"exe+%X  (called from exe+%X)", r.eip, r.ret);
+    else swprintf(b, 64, L"exe+%X", r.ret);
+    t[2] = b;
+    if (r.kind == 1) {
+        t[3] = std::to_wstring(r.range);
+        t[4] = std::to_wstring(r.range ? r.w % r.range : r.w);
+    } else { t[3] = L"-"; t[4] = L"-"; }
+    swprintf(b, 64, L"%08X", r.w);
+    t[5] = b;
+}
+
+static void RngAddRow(const RngRow& r) {
+    std::wstring t[6];
+    RngRowText(r, t);
+    LVITEMW it{};
+    it.mask = LVIF_TEXT;
+    it.iItem = ListView_GetItemCount(A.rngList);
+    it.pszText = (LPWSTR)t[0].c_str();
+    int i = (int)SendMessageW(A.rngList, LVM_INSERTITEMW, 0, (LPARAM)&it);
+    for (int c = 1; c < 6; c++) ListView_SetItemText(A.rngList, i, c, (LPWSTR)t[c].c_str());
+}
+
+static void RngClear() {
+    RngRows.clear();
+    if (A.rngList) ListView_DeleteAllItems(A.rngList);
+}
+
+void RefreshRngLog() {
+    if (!A.rngList) return;
+    Shm* s = OpenLogShm();
+    if (!s) return;
+    s->rng_log = A.rngLogOn ? 1 : 0;
+    uint32_t n = s->rng_log_n;
+    if (n < LogLast) { RngClear(); LogLast = 0; }            // the game was relaunched: new log
+    if (n - LogLast > RNG_LOG_MAX) LogLast = n - RNG_LOG_MAX; // fell behind (old entries are overwritten)
+    if (n == LogLast) return;
+    SendMessageW(A.rngList, WM_SETREDRAW, FALSE, 0);
+    for (uint32_t i = LogLast; i < n; i++) {
+        const RngLogEntry& e = s->rng_log_buf[i & (RNG_LOG_MAX - 1)];
+        RngRow r{e.frame, e.eip, e.ret, e.range, e.w, e.kind};
+        RngRows.push_back(r);
+        RngAddRow(r);
+    }
+    LogLast = n;
+    while (RngRows.size() > 20000) { RngRows.erase(RngRows.begin()); ListView_DeleteItem(A.rngList, 0); }
+    SendMessageW(A.rngList, WM_SETREDRAW, TRUE, 0);
+    ListView_EnsureVisible(A.rngList, ListView_GetItemCount(A.rngList) - 1, FALSE);
+    InvalidateRect(A.rngList, nullptr, TRUE);
+}
+
+static void RngSaveCsv() {
+    std::wstring p;
+    if (!PickFile(true, L"CSV (*.csv)\0*.csv\0", L"csv", p, A.root)) return;
+    FILE* f = _wfopen(p.c_str(), L"wb");
+    if (!f) { MessageBoxW(A.wnd, L"Cannot write the file.", L"RNG log", MB_ICONERROR); return; }
+    fputs("frame,type,where,range,result,state_w\r\n", f);
+    for (const RngRow& r : RngRows) {
+        std::wstring t[6];
+        RngRowText(r, t);
+        std::string line;
+        for (int c = 0; c < 6; c++) { std::string u = U8(t[c]); if (u.find(',') != std::string::npos) u = "\"" + u + "\""; line += (c ? "," : "") + u; }
+        fputs((line + "\r\n").c_str(), f);
+    }
+    fclose(f);
+    SetMsg(L"Saved " + std::to_wstring(RngRows.size()) + L" random draws to " + p);
+}
+
+LRESULT CALLBACK RngProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE: {
+            int top = S(34);
+            if (A.rngList) MoveWindow(A.rngList, 0, top, LOWORD(lp), std::max(0, (int)HIWORD(lp) - top), TRUE);
+            return 0;
+        }
+        case WM_COMMAND:
+            switch (LOWORD(wp)) {
+                case IDC_RNG_CHK: A.rngLogOn = SendMessageW((HWND)lp, BM_GETCHECK, 0, 0) == BST_CHECKED; RefreshRngLog(); break;
+                case IDC_RNG_CLR: RngClear(); break;
+                case IDC_RNG_CSV: RngSaveCsv(); break;
+            }
+            return 0;
+        case WM_TIMER: RefreshRngLog(); return 0;
+        case WM_CLOSE: DestroyWindow(h); return 0;
+        case WM_DESTROY:
+            KillTimer(h, 1);
+            A.rngLogOn = false;
+            if (LogShm) LogShm->rng_log = 0;
+            A.rngWnd = A.rngList = nullptr;
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowRngLog() {
+    if (A.rngWnd) { SetForegroundWindow(A.rngWnd); return; }
+    RECT pr;
+    GetWindowRect(A.wnd, &pr);
+    A.rngWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmRng", L"RNG log",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
+                               pr.left + S(60), pr.top + S(120), S(760), S(480), A.wnd, nullptr, nullptr, nullptr);
+    if (!A.rngWnd) return;
+    HWND chk = CreateWindowExW(0, L"BUTTON", L"Log the game's random draws", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                               S(8), S(6), S(210), S(22), A.rngWnd, (HMENU)(INT_PTR)IDC_RNG_CHK, nullptr, nullptr);
+    HWND clr = CreateWindowExW(0, L"BUTTON", L"Clear", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                               S(230), S(4), S(70), S(26), A.rngWnd, (HMENU)(INT_PTR)IDC_RNG_CLR, nullptr, nullptr);
+    HWND csv = CreateWindowExW(0, L"BUTTON", L"Save CSV...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                               S(306), S(4), S(100), S(26), A.rngWnd, (HMENU)(INT_PTR)IDC_RNG_CSV, nullptr, nullptr);
+    for (HWND c : {chk, clr, csv}) SendMessageW(c, WM_SETFONT, (WPARAM)A.font, TRUE);
+    A.rngList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                                0, 0, 0, 0, A.rngWnd, nullptr, nullptr, nullptr);
+    SendMessageW(A.rngList, WM_SETFONT, (WPARAM)A.font, TRUE);
+    ListView_SetExtendedListViewStyle(A.rngList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    const wchar_t* names[6] = {L"Frame", L"Type", L"Where", L"Range", L"Result", L"State w"};
+    int widths[6] = {60, 150, 190, 60, 90, 90};
+    for (int c = 0; c < 6; c++) {
+        LVCOLUMNW col{};
+        col.mask = LVCF_TEXT | LVCF_WIDTH;
+        col.pszText = (LPWSTR)names[c];
+        col.cx = S(widths[c]);
+        SendMessageW(A.rngList, LVM_INSERTCOLUMNW, c, (LPARAM)&col);
+    }
+    RECT cr;
+    GetClientRect(A.rngWnd, &cr);
+    SendMessageW(A.rngWnd, WM_SIZE, 0, MAKELPARAM(cr.right, cr.bottom));
+    RngClear();
+    LogLast = LogShm ? LogShm->rng_log_n : 0;     // only draws from now on
+    SetTimer(A.rngWnd, 1, 150, nullptr);
+}
 // ---- files, paths, config ---------------------------------------------------
 bool PickFile(bool save, const wchar_t* filter, const wchar_t* ext, std::wstring& io, const std::wstring& dir) {
     wchar_t buf[MAX_PATH * 2] = {};
@@ -1158,18 +1322,8 @@ DWORD WINAPI JobThread(LPVOID a) {
 
 const uint32_t SPEEDS[4] = {1000, 4000, 16000, 50000};
 
-// realtime: ignore the fast-forward setting (watching a movie, not seeking).
-// hold: leave the game frozen after `target` frames so it can be stepped.
-void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, bool hold = false) {
-    if (A.busy || !EnsureGamePath()) return;
-    if (!record && !Size()) { MessageBoxW(A.wnd, L"The movie is empty.", L"bscotm-tas", MB_ICONINFORMATION); return; }
-    if (!A.exe.empty() && !Exists(A.toolDir + L"\\bscotm_hook.dll")) {
-        MessageBoxW(A.wnd, L"bscotm_hook.dll must be next to bscotm_tas.exe.", L"bscotm-tas", MB_ICONERROR);
-        return;
-    }
-    A.sess.Close();         // the job kills the game; drop our handles first
-    JobArgs* j = new JobArgs;
-    RunParams& p = j->p;
+// The parts of a run that do not depend on what it is for: game, hook, saves, prelude and RNG seed.
+bool FillParams(RunParams& p) {
     p.exe = A.exe;
     p.dll = A.toolDir + L"\\bscotm_hook.dll";
     std::wstring base = ComboSel(A.cbBase), pre = ComboSel(A.cbPre);
@@ -1182,11 +1336,29 @@ void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, b
         std::string err;
         if (!pm.Load(A.root + L"\\preludes\\" + pre + L".bscotm", err)) {
             MessageBoxW(A.wnd, W("Prelude: " + err).c_str(), L"bscotm-tas", MB_ICONERROR);
-            delete j;
-            return;
+            return false;
         }
         p.prelude = pm.frames;
     }
+    p.seeded = A.movie.has_seed;
+    p.seed = A.movie.seed;
+    return true;
+}
+// realtime: ignore the fast-forward setting (watching a movie, not seeking).
+// hold: leave the game frozen after `target` frames so it can be stepped.
+void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, bool hold = false) {
+    if (A.busy || !EnsureGamePath()) return;
+    if (!record && !Size()) { MessageBoxW(A.wnd, L"The movie is empty.", L"bscotm-tas", MB_ICONINFORMATION); return; }
+    if (!A.exe.empty() && !Exists(A.toolDir + L"\\bscotm_hook.dll")) {
+        MessageBoxW(A.wnd, L"bscotm_hook.dll must be next to bscotm_tas.exe.", L"bscotm-tas", MB_ICONERROR);
+        return;
+    }
+    A.sess.Close();         // the job kills the game; drop our handles first
+    JobArgs* j = new JobArgs;
+    RunParams& p = j->p;
+    if (!FillParams(p)) { delete j; return; }
+    p.rng_log = A.rngWnd && A.rngLogOn;
+    A.logPre = (int)p.prelude.size();
     if (!fresh) p.movie = A.movie.frames;
     p.target = target;
     p.record = record;
@@ -1195,8 +1367,6 @@ void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, b
     // can be thawed without a burst of catch-up frames.
     p.speed_mask = p.speed_milli > 1000 ? SPEED_ALL : (SPEED_ALL & ~SPEED_NOVSYNC);
     p.hold = hold;
-    p.seeded = A.movie.has_seed;
-    p.seed = A.movie.seed;
 
     A.jobRecord = record; A.jobNew = fresh; A.jobTarget = target; A.jobHold = hold;
     A.busy = true;
@@ -1206,6 +1376,167 @@ void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, b
     A.thread = CreateThread(nullptr, 0, JobThread, j, 0, nullptr);
 }
 
+// ---- verify fast-forward ------------------------------------------------------------------------
+// Replays the movie twice at the fastest speed, once with all speed-ups (no drawing, render-command
+// skip) and once with only the clock speed-up and normal drawing, and compares the game's values
+// (the Memory window's list) at evenly spaced frames. A difference means a speed-up changes the game.
+const UINT WM_VERIFY_DONE = WM_APP + 3;       // lParam = std::wstring* (the report)
+const UINT WM_VERIFY_PROGRESS = WM_APP + 4;   // lParam = std::wstring* (a status line)
+
+struct VerifyArgs { RunParams p; std::vector<int> cps; };
+
+struct VerifyRun {
+    std::vector<std::vector<std::wstring>> vals;      // [checkpoint][field]
+    std::string error;
+};
+
+static void VerifyNote(const std::wstring& t) { PostMessageW(A.wnd, WM_VERIFY_PROGRESS, 0, (LPARAM)new std::wstring(t)); }
+
+static bool OpenGameProc(GameProc& g) {            // like AttachGame, but for the worker thread's own handle
+    for (int i = 0; i < 100 && !g.h; i++) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        PROCESSENTRY32W pe{sizeof pe};
+        DWORD pid = 0;
+        for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+            if (!_wcsicmp(pe.szExeFile, L"COTM.exe")) { pid = pe.th32ProcessID; break; }
+        CloseHandle(snap);
+        if (pid) {
+            HANDLE h = OpenProcess(PROCESS_VM_READ | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            uintptr_t base = 0;
+            snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+            if (h && snap != INVALID_HANDLE_VALUE) {
+                MODULEENTRY32W me{sizeof me};
+                for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me))
+                    if (!_wcsicmp(me.szModule, L"COTM.exe")) { base = (uintptr_t)me.modBaseAddr; break; }
+                CloseHandle(snap);
+            }
+            if (h && base) { g.pid = pid; g.h = h; g.base = base; return true; }
+            if (h) CloseHandle(h);
+        }
+        Sleep(100);
+    }
+    return false;
+}
+
+static bool VerifyPass(const VerifyArgs& va, uint32_t mask, const wchar_t* label, VerifyRun& out) {
+    RunParams p = va.p;
+    p.speed_milli = 50000;
+    p.speed_mask = mask;
+    p.hold = true;
+    p.record = false;
+    p.target = 1;
+    RunCallbacks cb;
+    cb.stop = &A.stop;
+    Session ss;
+    VerifyNote(std::wstring(label) + L": launching the game...");
+    RunResult rr = RunJob(p, cb, &ss);
+    if (!rr.ok || !ss.Active()) { out.error = rr.error.empty() ? "the game did not start" : rr.error; return false; }
+    GameProc g;
+    if (!OpenGameProc(g)) { out.error = "could not read the game's memory"; ss.Close(); KillGame(); return false; }
+    const auto& fs = MemFields();
+    int pos = 1;
+    for (int cp : va.cps) {
+        if (cp > pos) {
+            if (!ss.BeginSteps(p.movie.data() + pos, (uint32_t)(cp - pos), 50000)) { out.error = "could not run the game"; break; }
+            int r;
+            while (!(r = ss.PollSteps())) {
+                if (A.stop) ss.AbortSteps();
+                Sleep(5);
+            }
+            if (r < 0 || A.stop) { out.error = A.stop ? "Stopped." : "the game stopped responding"; break; }
+            pos = cp;
+        }
+        std::vector<std::wstring> row;
+        for (const MemField& f : fs) row.push_back(ReadField(g, f));
+        out.vals.push_back(std::move(row));
+        wchar_t b[96];
+        swprintf(b, 96, L"%ls: frame %d / %d", label, cp, va.cps.back());
+        VerifyNote(b);
+    }
+    CloseHandle(g.h);
+    ss.Close();
+    KillGame();
+    return out.error.empty();
+}
+
+DWORD WINAPI VerifyThread(LPVOID a) {
+    VerifyArgs* va = (VerifyArgs*)a;
+    VerifyRun slow, fast;
+    std::wstring report;
+    bool ok = VerifyPass(*va, SPEED_ALL & ~(SPEED_NODRAW | SPEED_NORENDER), L"Reference run (drawing on)", slow);
+    if (ok) ok = VerifyPass(*va, SPEED_ALL, L"Fast run (all speed-ups)", fast);
+    if (!ok) {
+        const std::string& e = !slow.error.empty() ? slow.error : fast.error;
+        report = e == "Stopped." ? L"Verification stopped." : L"Verification failed: " + W(e);
+    } else {
+        const auto& fs = MemFields();
+        // While the game is still starting or loading (no player yet) its background loading runs on real
+        // time, so those checkpoints differ between any two runs: they are skipped.
+        int bad = -1, badField = -1, compared = 0, skipped = 0, first = 0, last = 0;
+        for (size_t c = 0; c < va->cps.size() && bad < 0; c++) {
+            if (slow.vals[c][0] == L"-" || fast.vals[c][0] == L"-") { skipped++; continue; }
+            if (!compared) first = va->cps[c];
+            compared++;
+            last = va->cps[c];
+            for (size_t i = 0; i < fs.size(); i++)
+                if (slow.vals[c][i] != fast.vals[c][i]) { bad = (int)c; badField = (int)i; break; }
+        }
+        wchar_t b[384];
+        if (bad < 0 && !compared) {
+            report = L"No checkpoint could be compared: the game had no player at any of them (still loading or in the menus).";
+        } else if (bad < 0) {
+            swprintf(b, 384, L"The fast run matches the reference run at all %d compared checkpoints (frames %d to %d): %zu game values each (health, weapon points, speeds, positions, RNG state, ...).%ls\n\nThe picture is not compared.",
+                     compared, first, last, fs.size(),
+                     skipped ? (std::wstring(L"\n") + std::to_wstring(skipped) + L" earlier checkpoint(s) were skipped because the game was still loading.").c_str() : L"");
+            report = b;
+        } else {
+            swprintf(b, 256, L"DIFFERENT at frame %d: %ls\n  reference run: %ls\n  fast run:      %ls\n\nSome speed-up changes the game here. First look at the frames just before this checkpoint.",
+                     va->cps[bad], fs[badField].name, slow.vals[bad][badField].c_str(), fast.vals[bad][badField].c_str());
+            report = b;
+        }
+    }
+    delete va;
+    PostMessageW(A.wnd, WM_VERIFY_DONE, 0, (LPARAM)new std::wstring(report));
+    return 0;
+}
+
+void VerifyFastForward() {
+    if (A.busy || !EnsureGamePath()) return;
+    if (Size() < 2) { MessageBoxW(A.wnd, L"The movie is too short to verify.", L"Verify fast-forward", MB_ICONINFORMATION); return; }
+    if (!A.exe.empty() && !Exists(A.toolDir + L"\\bscotm_hook.dll")) {
+        MessageBoxW(A.wnd, L"bscotm_hook.dll must be next to bscotm_tas.exe.", L"bscotm-tas", MB_ICONERROR);
+        return;
+    }
+    int n = Size();
+    int gap = std::max(200, n / 20);
+    wchar_t msg[512];
+    swprintf(msg, 512, L"This replays the whole movie (%d frames) twice at the fastest speed, once with every speed-up and once with only the clock speed-up and normal drawing, and compares the game's values at about %d checkpoints.\n\nIt takes roughly %d minutes and the game window will be in front. Continue?",
+             n, (n + gap - 1) / gap, std::max(1, (int)(n / 340.0 / 60.0 + n / 1100.0 / 60.0 + 1.5)));
+    if (MessageBoxW(A.wnd, msg, L"Verify fast-forward", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return;
+    A.sess.Close();
+    VerifyArgs* va = new VerifyArgs;
+    if (!FillParams(va->p)) { delete va; return; }
+    va->p.movie = A.movie.frames;
+    for (int c = gap; c < n; c += gap) va->cps.push_back(c);
+    va->cps.push_back(n);
+    A.reached = 0;
+    A.busy = true;
+    A.stop = 0;
+    EnableUi();
+    SetMsg(L"Verifying...");
+    A.thread = CreateThread(nullptr, 0, VerifyThread, va, 0, nullptr);
+}
+
+void OnVerifyDone(std::wstring* report) {
+    if (A.thread) { WaitForSingleObject(A.thread, 2000); CloseHandle(A.thread); A.thread = nullptr; }
+    A.busy = false;
+    EnableUi();
+    UpdateScroll(); UpdateStatus();
+    SetMsg(report->compare(0, 4, L"DIFF") == 0 ? L"Verify fast-forward: DIFFERENT (see the message)." : L"Verify fast-forward finished.");
+    MessageBoxW(A.wnd, report->c_str(), L"Verify fast-forward", MB_OK | (report->compare(0, 4, L"DIFF") == 0 ? MB_ICONWARNING : MB_ICONINFORMATION));
+    delete report;
+    SetFocus(A.grid);
+}
 void OnJobProgress(Phase ph, uint32_t f) {
     wchar_t b[96];
     switch (ph) {
@@ -1516,6 +1847,7 @@ void BuildMenu(HWND w) {
     add(r, IDM_STOP, L"&Stop\tF9");
     AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
     add(r, IDM_RNGSEED, L"RNG see&d...");
+    add(r, IDM_VERIFY, L"&Verify fast-forward...");
     A.speedMenu = CreatePopupMenu();
     add(A.speedMenu, IDM_SPEED0, L"Real time (1x)");
     add(A.speedMenu, IDM_SPEED1, L"4x");
@@ -1525,7 +1857,8 @@ void BuildMenu(HWND w) {
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)f, L"&File");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)e, L"&Edit");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)r, L"&Run");
-    AppendMenuW(bar, MF_STRING, IDM_MEMORY, L"&Memory");     // a plain menu-bar button: opens the window
+    AppendMenuW(bar, MF_STRING, IDM_MEMORY, L"&Memory");
+    AppendMenuW(bar, MF_STRING, IDM_RNGLOG, L"RNG &log");     // a plain menu-bar button: opens the window
     SetMenu(w, bar);
 }
 
@@ -1598,7 +1931,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             auto en = [&](int id, bool on) { EnableMenuItem(m, id, MF_BYCOMMAND | (on ? MF_ENABLED : MF_GRAYED)); };
             for (int id : {IDM_NEW, IDM_OPEN, IDM_CUT, IDM_PASTE, IDM_PASTEINS, IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES,
                            IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_RECORD, IDM_BASESAVE, IDM_STEP, IDM_RESUME, IDM_RECHERE,
-                           IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED, IDM_BM_EDIT, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV})
+                           IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED, IDM_VERIFY, IDM_BM_EDIT, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV})
                 en(id, !A.busy);
             en(IDM_NOTE_DEL, !A.busy && SelectionHasNote());
             en(IDM_BM_DEL, !A.busy && RowIsBm(A.cursor));
@@ -1638,7 +1971,9 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_GOTO: GoToFrame(); break;
                 case IDM_JUMPCUR: JumpTo(A.cursor); break;
                 case IDM_RNGSEED: EditSeed(); break;
+                case IDM_VERIFY: VerifyFastForward(); break;
                 case IDM_MEMORY: ShowMemory(); break;
+                case IDM_RNGLOG: ShowRngLog(); break;
                 case IDM_PLAY: StartJob(false, (uint32_t)Size(), false, true); break;
                 case IDM_REWIND: StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true); break;
                 case IDM_STEP: FrameAdvance(); break;
@@ -1682,6 +2017,8 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_JOB_PROGRESS: OnJobProgress((Phase)wp, (uint32_t)lp); return 0;
         case WM_JOB_DONE: OnJobDone((RunResult*)lp); return 0;
+        case WM_VERIFY_PROGRESS: { std::wstring* t = (std::wstring*)lp; if (A.busy) SetMsg(*t); delete t; return 0; }
+        case WM_VERIFY_DONE: OnVerifyDone((std::wstring*)lp); return 0;
         case WM_CLOSE:
             if (A.busy) {
                 A.stop = 1;
@@ -1720,6 +2057,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
     RegisterClassExW(&nd);
     nd.lpfnWndProc = MemProc;
     nd.lpszClassName = L"BscotmMem";
+    RegisterClassExW(&nd);
+    nd.lpfnWndProc = RngProc;
+    nd.lpszClassName = L"BscotmRng";
     RegisterClassExW(&nd);
 
     WNDCLASSEXW c{sizeof c};

@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <string.h>
 #include <utility>
+#include <tlhelp32.h>
 #include "common.h"
 
 static Shm*      S;
@@ -96,7 +97,24 @@ static DWORD Shorten(DWORD ms) {
     return n ? n : 1;
 }
 
-static void  WINAPI H_Sleep(DWORD ms) { R_Sleep(Shorten(ms)); }
+// Threads that poll in a Sleep loop (the game has one that does Sleep(8) for its whole life) are counted
+// here so JoinThreads does not wait for them to "finish": they never do, and waiting cost 3 s per launch.
+static const int MAXSLEEPERS = 64;
+static struct { volatile DWORD tid; volatile LONG n; } Sleepers[MAXSLEEPERS];
+static void NoteSleep() {
+    DWORD me = GetCurrentThreadId();
+    for (int i = 0; i < MAXSLEEPERS; i++) {
+        if (Sleepers[i].tid == me) { InterlockedIncrement(&Sleepers[i].n); return; }
+        if (!Sleepers[i].tid) {
+            if (InterlockedCompareExchange((volatile LONG*)&Sleepers[i].tid, (LONG)me, 0) == 0 || Sleepers[i].tid == me) { InterlockedIncrement(&Sleepers[i].n); return; }
+        }
+    }
+}
+static bool IsSleeper(DWORD tid) {
+    for (int i = 0; i < MAXSLEEPERS && Sleepers[i].tid; i++) if (Sleepers[i].tid == tid) return Sleepers[i].n >= 3;
+    return false;
+}
+static void  WINAPI H_Sleep(DWORD ms) { if (ms) NoteSleep(); R_Sleep(Shorten(ms)); }
 static DWORD WINAPI H_Wait(HANDLE h, DWORD ms) { return R_Wait(h, Shorten(ms)); }
 static DWORD WINAPI H_WaitEx(HANDLE h, DWORD ms, BOOL a) { return R_WaitEx(h, Shorten(ms), a); }
 
@@ -250,6 +268,90 @@ static HWND WINAPI H_Cwe(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, 
     return wnd;
 }
 
+// ---- RNG draw log ---------------------------------------------------------------------------------
+// The game's xorshift128 state (x,y,z,w) lives at *(COTM.exe+0x48365C) + 0x2F4..0x300 and every draw
+// writes all four words. A hardware write breakpoint (debug register 0, set on every thread of the
+// process; no game code is touched) on the last word traps each draw, whether it goes through the draw
+// function (+0x80280 / float +0x802E0) or one of the ~100 inlined copies. Each trap is recorded in
+// Shm::rng_log_buf. It is only armed while the host wants the log and the frames are near the stopping
+// point (every trap costs microseconds), see RngLogWanted.
+static uint32_t  RngWatch;                          // address currently watched, 0 = nothing
+static const uint32_t RNG_PTR_RVA = 0x48365C, RNG_W_OFF = 0x300, RNG_DRAW_INT = 0x802CF, RNG_DRAW_FLOAT = 0x80328;
+
+static void SetWatch(HANDLE th, uint32_t addr) {
+    CONTEXT c{};
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(th, &c)) return;
+    c.Dr0 = addr;
+    c.Dr6 = 0;
+    c.Dr7 = addr ? 0x000D0001 : 0;                  // enable DR0, break on write, 4 bytes
+    SetThreadContext(th, &c);
+}
+static DWORD WINAPI ArmThread(LPVOID arg) {         // runs on a helper thread so it can also stop the game's main thread
+    uint32_t addr = (uint32_t)(uintptr_t)arg;
+    DWORD ids[256]; int n = 0;
+    HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (sn == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te{sizeof te};
+    DWORD pid = GetCurrentProcessId(), me = GetCurrentThreadId();
+    for (BOOL ok = Thread32First(sn, &te); ok && n < 256; ok = Thread32Next(sn, &te))
+        if (te.th32OwnerProcessID == pid && te.th32ThreadID != me) ids[n++] = te.th32ThreadID;
+    CloseHandle(sn);
+    for (int i = 0; i < n; i++) {
+        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, ids[i]);
+        if (!th) continue;
+        if (SuspendThread(th) != (DWORD)-1) { SetWatch(th, addr); ResumeThread(th); }
+        CloseHandle(th);
+    }
+    return 0;
+}
+static void ArmAll(uint32_t addr) {
+    HANDLE h = CreateThread(nullptr, 0, ArmThread, (LPVOID)(uintptr_t)addr, 0, nullptr);
+    if (h) { WaitForSingleObject(h, 5000); CloseHandle(h); }
+    RngWatch = addr;
+}
+static bool RngLogWanted() {
+    return S->rng_log && (S->draw_from == 0 || S->frame + 300 >= S->draw_from);
+}
+static void RngCheck() {                            // at every frame marker
+    uint32_t addr = 0;
+    if (RngLogWanted()) {
+        uint32_t obj = *(volatile uint32_t*)((uint8_t*)GetModuleHandleW(NULL) + RNG_PTR_RVA);
+        if (obj) addr = obj + RNG_W_OFF;
+    }
+    if (addr != RngWatch) ArmAll(addr);
+}
+static LONG CALLBACK RngVeh(EXCEPTION_POINTERS* e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = e->ContextRecord;
+    if (!(c->Dr6 & 1) || !RngWatch) return EXCEPTION_CONTINUE_SEARCH;
+    uint32_t base = (uint32_t)(uintptr_t)GetModuleHandleW(NULL), rva = c->Eip - base;
+    RngLogEntry en{};
+    en.frame = S->frame;
+    en.eip = rva;
+    en.w = *(volatile uint32_t*)RngWatch;
+    if (rva == RNG_DRAW_INT) {                      // inside the draw function: ebp frame is set up
+        en.kind = 1;
+        en.range = *(uint32_t*)(c->Ebp + 8);
+        en.ret = *(uint32_t*)(c->Ebp + 4) - base;
+    } else if (rva == RNG_DRAW_FLOAT) {             // after `push esi`
+        en.kind = 2;
+        en.ret = *(uint32_t*)(c->Esp + 4) - base;
+    } else {                                        // inlined copy: first plausible return address on the stack
+        uint32_t* sp = (uint32_t*)c->Esp;
+        for (int i = 0; i < 64; i++) {
+            uint32_t v = sp[i];
+            if (v > base + 6 && v < base + 0x350000) {
+                uint8_t* p = (uint8_t*)v;
+                if (p[-5] == 0xE8 || p[-6] == 0xFF || p[-2] == 0xFF || p[-3] == 0xFF) { en.ret = v - base; break; }
+            }
+        }
+    }
+    uint32_t i = InterlockedIncrement((volatile LONG*)&S->rng_log_n) - 1;
+    S->rng_log_buf[i & (RNG_LOG_MAX - 1)] = en;
+    c->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
 // ---- worker threads ------------------------------------------------------------
 // The game starts short-lived threads for loading work and checks on them a frame
 // later. At 1x each finishes inside one 16 ms frame; at 50x a frame lasts ~0.3 ms, so
@@ -263,9 +365,10 @@ static int    NPending;
 
 static HANDLE WINAPI H_Ct(LPSECURITY_ATTRIBUTES a, SIZE_T sz, LPTHREAD_START_ROUTINE fn, LPVOID p, DWORD fl, LPDWORD id) {
     HANDLE h = R_Ct(a, sz, fn, p, fl, id);
+    if (h && RngWatch && SuspendThread(h) != (DWORD)-1) { SetWatch(h, RngWatch); ResumeThread(h); }   // RNG log: watch new threads too
     HANDLE d;
     if (h && !(fl & CREATE_SUSPENDED) &&    // the game may close h at once, so keep our own copy
-        DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &d, SYNCHRONIZE, FALSE, 0)) {
+        DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &d, SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0)) {
         EnterCriticalSection(&ThCs);
         if (NPending < MAXIMUM_WAIT_OBJECTS) Pending[NPending++] = d; else CloseHandle(d);
         LeaveCriticalSection(&ThCs);
@@ -281,7 +384,11 @@ static void JoinThreads() {
     NPending = 0;
     LeaveCriticalSection(&ThCs);
     if (!n) return;
-    WaitForMultipleObjects(n, list, TRUE, 3000);    // bounded, in case a thread never ends
+    HANDLE wait[MAXIMUM_WAIT_OBJECTS];              // not the ones that sit in a Sleep loop: they are idle, not busy
+    int nw = 0;
+    for (int i = 0; i < n; i++)
+        if (WaitForSingleObject(list[i], 0) != WAIT_OBJECT_0 && !IsSleeper(GetThreadId(list[i]))) wait[nw++] = list[i];
+    if (nw) WaitForMultipleObjects(nw, wait, TRUE, 3000);    // bounded, in case a thread never ends
     for (int i = 0; i < n; i++) CloseHandle(list[i]);
 }
 
@@ -313,6 +420,7 @@ static void Marker(Shm* s) {
     JoinThreads();
     uint32_t f = s->frame + 1;
     s->frame = f;
+    RngCheck();
     if (s->mode == M_RECORD) {
         if (s->armed && s->rec_count < MAX_FRAMES) s->keys[s->rec_count++] = (uint16_t)Cur;
         s->armed = 1;
@@ -419,6 +527,7 @@ static void Init() {
         PatchIat(exe, "kernel32.dll", "WaitForSingleObjectEx", (void*)H_WaitEx, &R_WaitEx);
     }
     PatchIat(exe, "kernel32.dll", "GetProcAddress", (void*)H_Gpa, &R_Gpa);
+    AddVectoredExceptionHandler(1, RngVeh);
     PatchIat(exe, "user32.dll", "CreateWindowExA", (void*)H_Cwe, &R_Cwe);
     PatchIat(exe, "d3d9.dll", "Direct3DCreate9", (void*)H_D3dCreate, &R_D3dCreate);
     S->status |= ok ? ST_HOOKED : ST_HOOK_FAIL;

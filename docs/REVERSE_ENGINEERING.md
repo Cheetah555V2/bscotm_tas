@@ -582,3 +582,41 @@ per-frame allocations of about 1.6 MB (a 1 MB block every frame, ~6 blocks of 62
   still (about 2000 fps) but the final picture is wrong.
 - Limits of the check: only `test3.bscotm` has gameplay (stage 1); other stages may use
   command types this movie never produced.
+
+## RNG draw log
+
+Every draw writes all four state words, so a hardware **write** breakpoint (DR0, 4 bytes, on
+`*(COTM.exe+0x48365C)+0x300`, set on every thread of the game from a helper thread, re-set when the
+manager object moves and on new threads) traps each draw, including the ~100 inlined copies that a
+breakpoint on the draw function would miss. The vectored handler logs frame marker, `eip` (the
+instruction after the write), the return address and the new `w` into `Shm::rng_log_buf`; for the draw
+function the range is read from `[ebp+8]` and the caller from `[ebp+4]` (write site `exe+0x802CF`), for
+the float version from `[esp+4]` (`exe+0x80328`), for inlined copies the first call-preceded address on
+the stack is used. It is armed only while the host wants it and within 300 frames of `draw_from`.
+
+Seen on `test3.bscotm` (no baseline, no seed change): draws are rare, a few dozen on a handful of
+frames in the first 3700; the item-drop roll is `range 100` called from `exe+0x26CC79`; the draws
+around it come from `exe+0xEC...` (spawn/behaviour code, ranges 2-4) and inlined copies at
+`exe+0xEC585/0xEC757/0xEC925/0xEC3C9`.
+
+## Launch time: the 3 second join
+
+A rewind restarts the game, so the time to the first frame is paid every time. Measured (`test3.bscotm`,
+speed 50x, with a baseline): hook loaded at 0.15-0.4 s, game window at 0.8-1.1 s, first input poll at
+1.3-1.6 s and the **first frame marker at 4.3-4.6 s**. The 3 s gap was ours: at every frame marker the hook
+joins the worker threads the game started since the previous one (so their loading finishes inside the
+frame, see "worker threads" above), with a 3000 ms bound. Before the first marker the game starts 9 threads
+(all through the CRT start stub `exe+0x31CC6E`, real entry `exe+0x293340`); 8 finish within about 0.4 s, the
+first one never does: it loops on `Sleep(8)` (called from `exe+0x2BDDA4`) for the life of the process, so
+the join always ran into its 3000 ms timeout.
+
+Fix: `H_Sleep` counts the sleeps of each thread; the join skips a thread that is still running and has
+called `Sleep` at least 3 times (a polling thread: idle, not busy). The thread handles are duplicated with
+`THREAD_QUERY_LIMITED_INFORMATION` so the thread id can be read. First frame marker now at 1.3-1.7 s; a
+rewind to frame 1000 through the editor went from 6-9 s to 3.5 s. The game state at frames 700, 1500, 3000,
+3715, 7000 and 9000 (RNG words, health, weapon points, position) is identical to the earlier measurements,
+and *Verify fast-forward* still matches at all 20 checkpoints.
+
+Note: with the old join, in a later session the same harness (baseline restored, the 40-frame stepping of
+`comp`, or a direct `RunJob` to frame N) often never got out of the menus (health 0 at frame 3000) while the
+new code reached the same states as before every time; the reason for the old flakiness was not found.

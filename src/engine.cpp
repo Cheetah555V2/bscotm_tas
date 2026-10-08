@@ -218,6 +218,7 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     s->magic = SHM_MAGIC;
     s->rng_on = p.seeded ? 1 : 0;       // set before the game starts: it reads the clock during start-up
     s->rng_time = p.seed;
+    s->rng_log = p.rng_log ? 1 : 0;
 
     STARTUPINFOW si{};
     si.cb = sizeof si;
