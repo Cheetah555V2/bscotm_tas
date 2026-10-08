@@ -520,9 +520,6 @@ from the host, no code modified) logged calls; the hook logged who reads each cl
   calls `exe+0x26CB80`, which builds cumulative weights and calls `exe+0x80280(total)`.
   The result picks the item kind. Pickup (`exe+0x1FDE40..`) adds weapon points through
   `exe+0x1FCCE0`. Weapon points ("Ammo") = byte at `*(*(exe+0x483660)+8)+0x1E` (max at +0x1D).
-- Measured: `test3.bscotm` to frame ~3715 gave 18 or 19 weapon points in different launches
-  (about 1 launch in 4), depending only on the launch second. Not the cause: wall clock via
-  `QueryPerformanceCounter`, process id, heap address, worker-thread overlap, game speed.
 
 ### Seeding it from the tool
 
