@@ -178,6 +178,14 @@ captured against a different start point.
   game and fast-forwards to the frame.** Bookmarks are frame notes with a flag: they move with
   their frames on insert / delete / paste, are covered by undo, and are saved in the `.bscotm`
   file (`"bookmark":true` on a note, so older files and the Python tool still load).
+- **Verify fast-forward.** *Run > Verify fast-forward...* replays the whole movie twice at the
+  fastest speed, once with all the speed-ups and once with only the clock speed-up and normal
+  drawing, and compares the game's values (the Memory window's list: health, weapon points,
+  speeds, positions, RNG state, ...) at about 20 evenly spaced frames. Use it on your own movie,
+  especially one that goes through other stages, before trusting a long fast-forward. It reports
+  the first checkpoint and value that differ, or that all matched. Checkpoints while the game is
+  still loading (no player yet) are skipped because loading runs on real time. The picture is
+  not compared. About 40 seconds for a 10,000-frame movie.
 - **Game memory window.** The **Memory** button in the menu bar opens a window that shows
   the running game's health, weapon points (and max), score, X/Y speed, X/Y position
   (physics and render copies), invisibility, difficulty, style, the four characters and
