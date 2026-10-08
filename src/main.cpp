@@ -21,6 +21,7 @@ enum {
     IDM_NEW = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEPRE, IDM_SETGAME, IDM_BASESAVE, IDM_EXIT,
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
     IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO, IDM_MEMORY, IDM_RNGSEED,
+    IDM_HELP_START, IDM_HELP_KEYS, IDM_HELP_TROUBLE, IDM_HELP_ABOUT, IDM_HELP_GUIDE, IDC_HELP_TOPICS,
     IDM_RNGLOG, IDM_VERIFY, IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
@@ -1108,6 +1109,163 @@ void ShowRngLog() {
     LogLast = LogShm ? LogShm->rng_log_n : 0;     // only draws from now on
     SetTimer(A.rngWnd, 1, 150, nullptr);
 }
+// ---- Help window ------------------------------------------------------------------------------------
+// A guide for people who have not used the tool: topics on the left, text on the right. The text is part
+// of the program so it is always there and always matches this version.
+const wchar_t* const APP_VERSION = L"0.8.0";
+
+struct HelpTopic { const wchar_t* title; const wchar_t* text; };
+const HelpTopic HELP_TOPICS[] = {
+    {L"Getting started",
+     L"What this is\r\n"
+     L"bscotm-tas is a TAStudio-style editor for Bloodstained: Curse of the Moon (Steam, version 1.1.2). A movie is a list of frames; each frame says which keys are held. The tool starts the game, feeds it the movie one frame at a time, and lets you step, rewind and re-record.\r\n\r\n"
+     L"First run\r\n"
+     L"1. Put bscotm_tas.exe and bscotm_hook.dll in the same folder (the DLL is injected into the game).\r\n"
+     L"2. Start bscotm_tas.exe. It looks for Bloodstained Curse of the Moon\\exe\\COTM.exe in the folders above it. If it cannot find it, use File > Set game path.\r\n"
+     L"3. Close the game if it is running. The tool starts its own copy and closes it when a new run starts.\r\n\r\n"
+     L"Baseline and prelude\r\n"
+     L"Baseline: a copy of the game's save files that is restored before every launch, so every run starts from the same state. Make one with File > Save current game saves as baseline (the game must be closed).\r\n"
+     L"Prelude: the input that takes the game from launch to the first controllable frame (menus). It is played before your movie. Record it once, then File > Save as prelude.\r\n"
+     L"Choose both in the two drop-downs at the top.\r\n\r\n"
+     L"Your first movie\r\n"
+     L"Press Record new (F8), click the game window and play. Press Stop (F9) when you are done, then File > Save (Ctrl+S).\r\n"
+     L"To edit it: press Rewind to cursor (F6) to get the game to the cursor row, then step with the period key or paint keys in the grid."},
+    {L"Recording and playing",
+     L"Record new (F8): relaunch the game and record your keyboard from its first frame.\r\n"
+     L"Play (F5): relaunch the game and play the whole movie in real time.\r\n"
+     L"Rewind to cursor (F6, or double-click a frame number): relaunch, fast-forward to the cursor row and freeze the game there.\r\n"
+     L"Record from cursor (F7): play to the cursor row, then record live from the next frame.\r\n"
+     L"Record here (F12): unfreeze the game and record your keyboard from the frozen frame. Stop (F9) freezes it again.\r\n"
+     L"Resume live (F11): unfreeze the game and take over with the keyboard (not recorded).\r\n"
+     L"Stop (F9): end the current run.\r\n\r\n"
+     L"Fast-forward\r\n"
+     L"Rewind and the jumps run the game faster than real time. The speed is in Run > Fast-forward speed (default: Max, 50x). The game window may look frozen or garbled while it fast-forwards; audio is garbled too. Only the last frames before the stopping point are drawn.\r\n\r\n"
+     L"The game window\r\n"
+     L"The game accepts the tool's input even when the editor has focus. To type into the game yourself (Record here, Resume live), click the game window first."},
+    {L"Frame advance and run",
+     L"Frame advance (the period key): run exactly one frame of the frozen game using the next grid row's inputs. Hold the key to repeat. The game is held at a frame boundary before that frame reads its input, so you can still edit the row.\r\n\r\n"
+     L"Run to cursor (F4, or right-click a row): advance the frozen game through many frames at once, up to the cursor row, using the grid's inputs. It runs at the fast-forward speed and gives the same result as stepping one by one. Stop (F9) cancels. Past the end of the movie it appends blank frames. If the game is already past the cursor, use Rewind.\r\n\r\n"
+     L"Greenzone\r\n"
+     L"Green frame numbers are frames the live game has been advanced through. Editing a frame before the game's position makes the later green frames invalid: the next advance first replays from the start to the edge of the green area, then steps.\r\n\r\n"
+     L"Going back\r\n"
+     L"The game cannot step backwards. To go back, move the cursor and Rewind (F6): it relaunches the game and fast-forwards to the cursor. A launch takes about 1.5 s; the replay runs at roughly 1800 frames per second."},
+    {L"Editing frames",
+     L"Painting: click or drag on a key cell to toggle it. Rows past the end extend the movie.\r\n"
+     L"Selecting rows: click a frame number; Shift+click or drag to extend.\r\n"
+     L"Delete clears inputs. Insert inserts blank frames. Ctrl+Delete removes frames.\r\n"
+     L"Ctrl+C / Ctrl+X copy and cut. Ctrl+V pastes over; Ctrl+Shift+V pastes as inserted frames.\r\n"
+     L"Ctrl+Z / Ctrl+Y undo and redo. Ctrl+A selects all.\r\n\r\n"
+     L"Notes\r\n"
+     L"Right-click a row (or use the Edit menu) to add a note to that frame. Notes show in the Note column and as an orange flag. Edit > Notes list opens every note; double-click jumps to it. Notes move with their frames on insert, delete, cut and paste and are saved in the movie file.\r\n\r\n"
+     L"Keys\r\n"
+     L"The grid has one column per key the tool tracks: arrows, A D W S, jump (space), attack (left mouse), sub-weapon (right mouse), Q, E, P, Enter and Esc."},
+    {L"Bookmarks and jumping",
+     L"A bookmark is a named frame you can jump back to. Ctrl+B (or right-click > Add bookmark here) names the cursor frame; it shows with a purple flag and a star. Ctrl+Shift+B removes it.\r\n\r\n"
+     L"F2 / Shift+F2: jump to the next / previous bookmark.\r\n"
+     L"Ctrl+G: jump to any frame number.\r\n"
+     L"Edit > Bookmarks list: every bookmark; double-click or Enter jumps there, Delete removes it.\r\n\r\n"
+     L"What a jump does\r\n"
+     L"Forward (the frozen game has not reached the frame yet): the game just runs ahead at the fast-forward speed, no restart. Backward, or no game running: the game restarts and fast-forwards to the frame.\r\n\r\n"
+     L"Bookmarks are frame notes with a flag, so they move with their frames, are covered by undo and are saved in the movie file."},
+    {L"RNG seed and RNG log",
+     L"How the game's randomness works\r\n"
+     L"The game uses one random number generator, seeded from the clock (Unix time in seconds) when it starts. Launch the same movie one second later and the random numbers differ, so drops and enemy behaviour can differ.\r\n\r\n"
+     L"RNG seed (Run > RNG seed)\r\n"
+     L"Set a number from 0 to 4294967295 (avoid 0: it makes the generator stick at zero). The game then sees a frozen clock at that time, so every launch gets the same random numbers. The seed is saved in the movie. The status bar shows it. Changing it restarts the game on the next Rewind or advance. Seeds one second apart behave almost the same, so try seeds far apart.\r\n\r\n"
+     L"RNG log (menu bar)\r\n"
+     L"Opens a window that lists every random draw the game makes in the frames near where you stop (the last 300 frames of a Rewind, Run to cursor or Jump, and every frame you advance by hand). Tick Log the game's random draws, then step or jump as usual. Each row shows the frame, the code that made the draw, the range asked for (100 for an item-drop roll), the result and the generator state. A frame with no rows made no draws. Save CSV exports the list.\r\n\r\n"
+     L"A seed fixes the random numbers at launch only. If you change your inputs, the game may draw a different number of values before an event, and that event's result changes too."},
+    {L"Memory window",
+     L"The Memory button in the menu bar opens a read-only window with the running game's values, 10 times a second: health, weapon points and maximum, score, X and Y speed, X and Y position (physics and the render copy), invisibility, difficulty, style, the four characters and the four RNG state words.\r\n\r\n"
+     L"A dash means the game has no value yet (menus, loading). The window follows any COTM.exe that is running, frozen or live."},
+    {L"Verify fast-forward",
+     L"Run > Verify fast-forward replays your whole movie twice at the fastest speed: once with every speed-up (no drawing, skipped render commands) and once with only the clock speed-up and normal drawing. It compares the game's values (the Memory window's list) at about 20 evenly spaced frames and tells you the first frame and value that differ, or that all matched.\r\n\r\n"
+     L"Use it on your own movie, especially one that goes through other stages, before you trust a long fast-forward. Checkpoints during loading are skipped (loading runs on real time). The picture is not compared. A 10,000-frame movie takes about 40 seconds.\r\n\r\n"
+     L"If it reports a difference, tell the developer which frame and value; some speed-up changes the game there."},
+    {L"Keyboard shortcuts",
+     L"File: Ctrl+N new, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as\r\n"
+     L"Edit: Ctrl+Z undo, Ctrl+Y redo, Ctrl+X cut, Ctrl+C copy, Ctrl+V paste, Ctrl+Shift+V paste insert, Ctrl+A select all, Delete clear, Insert insert frames, Ctrl+Delete delete frames\r\n"
+     L"Bookmarks: Ctrl+B add / rename, Ctrl+Shift+B remove, F2 next, Shift+F2 previous, Ctrl+G jump to frame\r\n"
+     L"Run: F5 play, F6 rewind to cursor, F7 record from cursor, F8 record new, F9 stop, F4 run to cursor, period frame advance, F11 resume live, F12 record here\r\n"
+     L"Help: F1 this guide"},
+    {L"Troubleshooting",
+     L"The tool says it cannot find the game\r\n"
+     L"Use File > Set game path and pick COTM.exe.\r\n\r\n"
+     L"bscotm_hook.dll must be next to bscotm_tas.exe\r\n"
+     L"Keep the two files together; unzip the release into one folder.\r\n\r\n"
+     L"The game exits right away or the tool cannot start it\r\n"
+     L"Close any running copy of the game first, and run the tool from a folder you can write to. Some antivirus programs block the injected DLL; add an exception for the folder.\r\n\r\n"
+     L"The movie plays differently from last time\r\n"
+     L"Set an RNG seed (random drops and enemies depend on the launch second), use the same baseline and prelude, and run Verify fast-forward to check the speed-ups.\r\n\r\n"
+     L"The game picture is black or wrong after a fast jump\r\n"
+     L"Step one frame or press Rewind (F6) again. The picture is only drawn for the last frames before a stop.\r\n\r\n"
+     L"Keys typed into the editor appear in the game, or the reverse\r\n"
+     L"Live keys only count while the game window is in front. If you use Record here or Resume live, click the game window first."},
+    {L"About",
+     nullptr},
+};
+const int NUM_HELP_TOPICS = (int)(sizeof HELP_TOPICS / sizeof HELP_TOPICS[0]);
+
+HWND helpWnd = nullptr, helpList = nullptr, helpText = nullptr;
+
+void ShowHelpTopic(int i) {
+    if (!helpText || i < 0 || i >= NUM_HELP_TOPICS) return;
+    std::wstring t;
+    if (HELP_TOPICS[i].text) t = HELP_TOPICS[i].text;
+    else t = std::wstring(L"bscotm-tas ") + APP_VERSION + L"\r\n\r\nA TAStudio-style frame editor for Bloodstained: Curse of the Moon (Steam, version 1.1.2).\r\n\r\n"
+             L"Project: https://github.com/Cheetah555V2/bscotm_tas\r\nReleases: https://github.com/Cheetah555V2/bscotm_tas/releases\r\n"
+             L"License: MIT.\r\n\r\nThe tool injects bscotm_hook.dll into the game. It patches only the game's import tables and data, never its code. How it works and every finding: docs\\REVERSE_ENGINEERING.md in the repository.";
+    SetWindowTextW(helpText, t.c_str());
+    SendMessageW(helpText, EM_SETSEL, 0, 0);
+    SendMessageW(helpText, EM_SCROLLCARET, 0, 0);
+    SendMessageW(helpList, LB_SETCURSEL, i, 0);
+}
+
+LRESULT CALLBACK HelpProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE: {
+            int lw = S(190), w = LOWORD(lp), ht = HIWORD(lp);
+            if (helpList) MoveWindow(helpList, 0, 0, lw, ht, TRUE);
+            if (helpText) MoveWindow(helpText, lw, 0, std::max(0, w - lw), ht, TRUE);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wp) == IDC_HELP_TOPICS && HIWORD(wp) == LBN_SELCHANGE)
+                ShowHelpTopic((int)SendMessageW(helpList, LB_GETCURSEL, 0, 0));
+            return 0;
+        case WM_CLOSE: DestroyWindow(h); return 0;
+        case WM_DESTROY: helpWnd = helpList = helpText = nullptr; return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowHelp(int topic) {
+    if (!helpWnd) {
+        RECT pr;
+        GetWindowRect(A.wnd, &pr);
+        helpWnd = CreateWindowExW(0, L"BscotmHelp", L"bscotm-tas Help",
+                                  WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                  pr.left + S(50), pr.top + S(60), S(860), S(560), A.wnd, nullptr, nullptr, nullptr);
+        if (!helpWnd) return;
+        helpList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | WS_VSCROLL,
+                                   0, 0, 0, 0, helpWnd, (HMENU)(INT_PTR)IDC_HELP_TOPICS, nullptr, nullptr);
+        helpText = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
+                                   0, 0, 0, 0, helpWnd, nullptr, nullptr, nullptr);
+        LOGFONTW lf{};
+        GetObjectW(A.font, sizeof lf, &lf);
+        lf.lfHeight = lf.lfHeight * 12 / 10;
+        static HFONT big = CreateFontIndirectW(&lf);
+        SendMessageW(helpList, WM_SETFONT, (WPARAM)big, TRUE);
+        SendMessageW(helpText, WM_SETFONT, (WPARAM)big, TRUE);
+        for (const HelpTopic& t : HELP_TOPICS) SendMessageW(helpList, LB_ADDSTRING, 0, (LPARAM)t.title);
+        RECT cr;
+        GetClientRect(helpWnd, &cr);
+        SendMessageW(helpWnd, WM_SIZE, 0, MAKELPARAM(cr.right, cr.bottom));
+    }
+    ShowHelpTopic(topic);
+    ShowWindow(helpWnd, SW_SHOWNORMAL);
+    SetForegroundWindow(helpWnd);
+}
 // ---- files, paths, config ---------------------------------------------------
 bool PickFile(bool save, const wchar_t* filter, const wchar_t* ext, std::wstring& io, const std::wstring& dir) {
     wchar_t buf[MAX_PATH * 2] = {};
@@ -1859,6 +2017,14 @@ void BuildMenu(HWND w) {
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)r, L"&Run");
     AppendMenuW(bar, MF_STRING, IDM_MEMORY, L"&Memory");
     AppendMenuW(bar, MF_STRING, IDM_RNGLOG, L"RNG &log");     // a plain menu-bar button: opens the window
+    HMENU hp = CreatePopupMenu();
+    add(hp, IDM_HELP_GUIDE, L"&Guide...\tF1");
+    add(hp, IDM_HELP_START, L"&Getting started");
+    add(hp, IDM_HELP_KEYS, L"&Keyboard shortcuts");
+    add(hp, IDM_HELP_TROUBLE, L"&Troubleshooting");
+    AppendMenuW(hp, MF_SEPARATOR, 0, nullptr);
+    add(hp, IDM_HELP_ABOUT, L"&About");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)hp, L"&Help");
     SetMenu(w, bar);
 }
 
@@ -1973,6 +2139,10 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_RNGSEED: EditSeed(); break;
                 case IDM_VERIFY: VerifyFastForward(); break;
                 case IDM_MEMORY: ShowMemory(); break;
+                case IDM_HELP_GUIDE: case IDM_HELP_START: ShowHelp(0); break;
+                case IDM_HELP_KEYS: ShowHelp(8); break;
+                case IDM_HELP_TROUBLE: ShowHelp(9); break;
+                case IDM_HELP_ABOUT: ShowHelp(NUM_HELP_TOPICS - 1); break;
                 case IDM_RNGLOG: ShowRngLog(); break;
                 case IDM_PLAY: StartJob(false, (uint32_t)Size(), false, true); break;
                 case IDM_REWIND: StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true); break;
@@ -2061,6 +2231,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
     nd.lpfnWndProc = RngProc;
     nd.lpszClassName = L"BscotmRng";
     RegisterClassExW(&nd);
+    nd.lpfnWndProc = HelpProc;
+    nd.lpszClassName = L"BscotmHelp";
+    RegisterClassExW(&nd);
 
     WNDCLASSEXW c{sizeof c};
     c.lpfnWndProc = MainProc;
@@ -2089,7 +2262,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
         {FCONTROL | FVIRTKEY, 'A', IDM_SELALL},   {FVIRTKEY, VK_F5, IDM_PLAY},
         {FVIRTKEY, VK_F6, IDM_REWIND},            {FVIRTKEY, VK_F7, IDM_RECFROM},
         {FVIRTKEY, VK_F8, IDM_RECORD},            {FVIRTKEY, VK_F9, IDM_STOP},
-        {FVIRTKEY, VK_OEM_PERIOD, IDM_STEP},      {FVIRTKEY, VK_F4, IDM_RUNTO},       {FVIRTKEY, VK_F11, IDM_RESUME},       {FVIRTKEY, VK_F12, IDM_RECHERE},
+        {FVIRTKEY, VK_OEM_PERIOD, IDM_STEP},      {FVIRTKEY, VK_F4, IDM_RUNTO},       {FVIRTKEY, VK_F1, IDM_HELP_GUIDE}, {FVIRTKEY, VK_F11, IDM_RESUME},       {FVIRTKEY, VK_F12, IDM_RECHERE},
         {FCONTROL | FVIRTKEY, 'B', IDM_BM_EDIT}, {FCONTROL | FSHIFT | FVIRTKEY, 'B', IDM_BM_DEL}, {FCONTROL | FVIRTKEY, 'G', IDM_GOTO},
         {FVIRTKEY, VK_F2, IDM_BM_NEXT}, {FSHIFT | FVIRTKEY, VK_F2, IDM_BM_PREV},
     };
