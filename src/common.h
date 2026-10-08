@@ -23,7 +23,7 @@ static const KeyDef KEYS[NUM_KEYS] = {
 static const uint32_t POLL_RET_RVA = 0x2A5960;
 
 enum Mode   : uint32_t { M_IDLE = 0, M_RECORD = 1, M_PLAY = 2 };
-enum Status : uint32_t { ST_HOOKED = 1, ST_PLAY_END = 2, ST_RESUMED = 4, ST_HOOK_FAIL = 8 };
+enum Status : uint32_t { ST_HOOKED = 1, ST_PLAY_END = 2, ST_RESUMED = 4, ST_HOOK_FAIL = 8, ST_NORENDER_BAD = 16 };
 
 // Clocks the hook can speed up (it patches COTM.exe's own imports of these).
 enum SpeedMask : uint32_t {
@@ -33,7 +33,8 @@ enum SpeedMask : uint32_t {
     SPEED_SLEEP = 8,    // Sleep / WaitForSingleObject(Ex) with a finite timeout
     SPEED_NOVSYNC = 16, // d3d9: force PresentationInterval IMMEDIATE when the device is created
     SPEED_NODRAW = 32,  // d3d9: skip Present/Clear/Draw* while fast-forwarding (see Shm::draw_from)
-    SPEED_ALL = 63,
+    SPEED_NORENDER = 64, // skip the game's own render-command queue while fast-forwarding (see SkipDraw)
+    SPEED_ALL = 127,
 };
 
 #define SHM_NAME "Local\\bscotm_tas_shm"
@@ -58,6 +59,10 @@ struct Shm {
     volatile uint32_t advance;      // frames the host releases while held
     volatile uint32_t paused;       // marker number the game is blocked at, 0 = running
     volatile uint32_t draw_from;    // SPEED_NODRAW: skip drawing until 2 frames before this marker (0 = never skip)
+    volatile uint32_t cmd_skip_lo;  // SPEED_NORENDER: bit i = skip render-command type i (0..31); see hook.cpp
+    volatile uint32_t cmd_skip_hi;  // types 32..35 in bits 0..3
+    volatile uint32_t cmd_tail;     // SPEED_NORENDER: stop skipping this many frames before draw_from
+    volatile uint32_t cmd_count[36]; // SPEED_NORENDER: how many commands of each type were skipped (statistics)
     volatile uint32_t rng_on;       // 1 = the game sees a frozen clock at Unix time rng_time (that is its RNG seed)
     volatile uint32_t rng_time;     // Unix time in seconds; the game seeds its xorshift128 generator from it at launch
     uint16_t keys[MAX_FRAMES];

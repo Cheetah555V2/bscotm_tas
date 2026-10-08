@@ -6,6 +6,10 @@
 
 typedef std::vector<uint16_t> Frames;   // one key bitmask per frame (see KEYS)
 
+// A note whose text starts with this character is a bookmark (the editor strips it for display; the file
+// stores it as a "bookmark":true field).
+static const char kBookmarkFlag = '\x01';
+
 struct Movie {
     std::string author, created, prelude_id, prelude_desc;
     Frames frames;

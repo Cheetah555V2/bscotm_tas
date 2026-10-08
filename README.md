@@ -30,7 +30,9 @@ back. The whole tool is two small native files (no Python, no Frida):
   the hook returns to real time exactly on the frame the replay ends. While
   fast-forwarding it also skips drawing (D3D `Present`/`Clear`/`Draw*` return at once,
   except for the last 2 frames so the frozen picture is real) and answers the game's
-  key polls without asking Windows: about 1000 frames per second instead of 340.
+  key polls without asking Windows: about 1000 frames per second instead of 340. It also
+  stops the game's own render-command queue from running the drawing commands that are
+  safe to skip (about 1.3x faster again; see the docs).
 - **Frame advance.** The hook blocks the game thread inside the input poll at a
   frame marker (before the frame's input is read) and releases it one frame per step.
   The virtual clock is frozen during the hold so the limiter does not see the pause
@@ -168,6 +170,14 @@ captured against a different start point.
   to run. With a seed set, the game sees a frozen clock at that time, so every launch
   gets the same random numbers. The status bar shows the seed. Changing it restarts the
   game on the next Rewind / frame advance. Details: `docs/REVERSE_ENGINEERING.md`.
+- **Bookmarks and jumping.** `Ctrl+B` (or right-click a row > *Add bookmark here...*) names the
+  cursor frame as a bookmark (shown with a purple flag and a star). `F2` / `Shift+F2` jump to the
+  next / previous bookmark, `Ctrl+G` jumps to any frame number, and *Edit > Bookmarks list...*
+  (or double-click an entry there) jumps to one. **A jump to a frame the frozen game has not reached
+  yet just runs the game forward at the fast-forward speed (no restart); a jump back restarts the
+  game and fast-forwards to the frame.** Bookmarks are frame notes with a flag: they move with
+  their frames on insert / delete / paste, are covered by undo, and are saved in the `.bscotm`
+  file (`"bookmark":true` on a note, so older files and the Python tool still load).
 - **Game memory window.** The **Memory** button in the menu bar opens a window that shows
   the running game's health, weapon points (and max), score, X/Y speed, X/Y position
   (physics and render copies), invisibility, difficulty, style, the four characters and
