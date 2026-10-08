@@ -204,7 +204,8 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
             const J* tx = e.get("text");
             if (!fn || !tx || fn->t != J::Num || tx->t != J::Str) continue;
             long idx = (long)fn->n - 1;
-            if (idx >= 0 && (size_t)idx < notes.size()) notes[idx] = tx->s;
+            const J* bm = e.get("bookmark");     // optional: this note is a bookmark (note text may be empty)
+            if (idx >= 0 && (size_t)idx < notes.size()) notes[idx] = (bm && Truthy(*bm) ? std::string(1, kBookmarkFlag) : std::string()) + tx->s;
         }
     prelude.clear();
     const J* pf = root.get("prelude_frames");
@@ -241,8 +242,10 @@ bool Movie::Save(const std::wstring& path, std::string& err) const {
     first = true;
     for (size_t i = 0; i < notes.size() && i < frames.size(); i++) {
         if (notes[i].empty()) continue;
+        bool bm = notes[i][0] == kBookmarkFlag;
         fprintf(f, "%s{\"frame\":%u,\"text\":", first ? "" : ",", (unsigned)i + 1);
-        Esc(f, notes[i]);
+        Esc(f, bm ? notes[i].substr(1) : notes[i]);
+        if (bm) fputs(",\"bookmark\":true", f);
         fputc('}', f);
         first = false;
     }

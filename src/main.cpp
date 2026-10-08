@@ -21,6 +21,7 @@ enum {
     IDM_NEW = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEPRE, IDM_SETGAME, IDM_BASESAVE, IDM_EXIT,
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
     IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO, IDM_MEMORY, IDM_RNGSEED,
+    IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
     IDC_BASE = 300, IDC_PRE,
@@ -32,7 +33,7 @@ const COLORREF cBg = RGB(255, 255, 255), cHdr = RGB(236, 236, 240), cLine = RGB(
                cLine60 = RGB(140, 140, 155), cGreen = RGB(212, 240, 212), cGreenHead = RGB(140, 205, 140),
                cSel = RGB(204, 224, 255), cCursor = RGB(40, 90, 180), cPressed = RGB(52, 120, 200),
                cPhantom = RGB(170, 170, 175), cNote = RGB(255, 249, 212), cNoteText = RGB(90, 60, 0),
-               cFlag = RGB(235, 170, 20);
+               cFlag = RGB(235, 170, 20), cBm = RGB(238, 226, 250), cBmFlag = RGB(140, 70, 200), cBmText = RGB(80, 30, 130);
 
 typedef std::vector<std::string> Notes;   // UTF-8, parallel to the frames
 
@@ -44,7 +45,8 @@ struct App {
     HWND wnd = nullptr, grid = nullptr, status = nullptr, cbBase = nullptr, cbPre = nullptr;
     HWND lblBase = nullptr, lblPre = nullptr, btn[8] = {};
     HFONT font = nullptr, fontB = nullptr;
-    HWND notesWnd = nullptr, notesList = nullptr;   // the Notes list window (when open)
+    HWND notesWnd = nullptr, notesList = nullptr;   // the Notes / Bookmarks list window (when open)
+    bool listBm = false;                            // that window shows only the bookmarks
     HWND memWnd = nullptr, memList = nullptr;       // the Game memory window (when open)
     int dpi = 96;
 
@@ -153,11 +155,20 @@ void Touch(size_t pos) {
 }
 
 void RefreshNotesList();
+void JumpTo(int row);
 
 const std::string& NoteAt(int row) {
     static const std::string none;
     return row >= 0 && (size_t)row < A.movie.notes.size() ? A.movie.notes[row] : none;
 }
+
+// A bookmark is a frame note with a flag: the note string starts with BM_FLAG (never typed by the
+// user), so bookmarks move with their frames and are covered by undo like notes are. A bookmark can
+// have an empty name, a plain note cannot be empty.
+const char BM_FLAG = kBookmarkFlag;
+bool IsBm(const std::string& s) { return !s.empty() && s[0] == BM_FLAG; }
+std::string NoteBody(const std::string& s) { return IsBm(s) ? s.substr(1) : s; }
+bool RowIsBm(int row) { return IsBm(NoteAt(row)); }
 
 void Replace(size_t pos, size_t oldlen, const Frames& nv, const Notes& nn) {
     Frames& f = A.movie.frames;
@@ -317,7 +328,7 @@ void SetNote(int row, const std::string& text) {
 
 bool SelectionHasNote() {
     for (int r = SelLo(); r <= std::min(SelHi(), Size() - 1); r++)
-        if (!NoteAt(r).empty()) return true;
+        if (!NoteBody(NoteAt(r)).empty()) return true;
     return false;
 }
 
@@ -326,6 +337,7 @@ void RemoveNotesInSelection() {
     int lo = SelLo(), hi = std::min(SelHi(), Size() - 1);
     Step st; st.cur_before = A.cursor;
     Notes none(hi - lo + 1);
+    for (int r = lo; r <= hi; r++) if (RowIsBm(r)) none[r - lo] = std::string(1, BM_FLAG);   // bookmarks stay
     DoSplice(st, lo, hi - lo + 1, Frames(A.movie.frames.begin() + lo, A.movie.frames.begin() + hi + 1), &none);
     Commit(st);
     InvalidateRect(A.grid, nullptr, FALSE);
@@ -395,11 +407,46 @@ bool AskText(const std::wstring& title, const std::wstring& prompt, std::wstring
 void EditNote() {
     if (A.busy) return;
     int row = A.cursor;
-    std::wstring t = W(NoteAt(row));
+    bool bm = RowIsBm(row);
+    std::wstring t = W(NoteBody(NoteAt(row)));
     if (!AskText(L"Frame note", L"Note for frame " + std::to_wstring(row + 1) + L" (leave empty to remove):", t)) return;
-    for (wchar_t& c : t) if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
-    SetNote(row, U8(t));
+    for (wchar_t& c : t) if (c == L'\r' || c == L'\n' || c == L'\t' || c == (wchar_t)BM_FLAG) c = L' ';
+    SetNote(row, (bm ? std::string(1, BM_FLAG) : std::string()) + U8(t));
     SetFocus(A.grid);
+}
+
+// Bookmarks: named frames to jump to (see JumpTo). Stored as flagged notes.
+void EditBookmark() {
+    if (A.busy || !Size()) return;
+    int row = A.cursor;
+    std::wstring t = W(NoteBody(NoteAt(row)));
+    if (!AskText(L"Bookmark", L"Name of the bookmark at frame " + std::to_wstring(row + 1) + L":", t)) return;
+    for (wchar_t& c : t) if (c == L'\r' || c == L'\n' || c == L'\t' || c == (wchar_t)BM_FLAG) c = L' ';
+    SetNote(row, std::string(1, BM_FLAG) + U8(t));
+    SetFocus(A.grid);
+}
+
+void RemoveBookmark(int row) {
+    if (A.busy || !RowIsBm(row)) return;
+    SetNote(row, NoteBody(NoteAt(row)));
+}
+
+void NextBookmark(bool forward) {
+    int best = -1;
+    if (forward) { for (int r = A.cursor + 1; r < Size(); r++) if (RowIsBm(r)) { best = r; break; } }
+    else         { for (int r = A.cursor - 1; r >= 0; r--)     if (RowIsBm(r)) { best = r; break; } }
+    if (best < 0) { SetMsg(forward ? L"No bookmark after the cursor." : L"No bookmark before the cursor."); return; }
+    JumpTo(best);
+}
+
+void GoToFrame() {
+    if (A.busy || !Size()) return;
+    std::wstring t = std::to_wstring(A.cursor + 1);
+    if (!AskText(L"Jump to frame", L"Frame number (1 - " + std::to_wstring(Size()) + L"):", t)) return;
+    wchar_t* end = nullptr;
+    long n = wcstol(t.c_str(), &end, 10);
+    if (t.empty() || *end || n < 1) { MessageBoxW(A.wnd, L"Enter a frame number.", L"Jump to frame", MB_ICONERROR); return; }
+    JumpTo((int)std::min<long>(n, Size()) - 1);
 }
 
 // The RNG seed is the Unix time (seconds) the game sees at launch; it seeds the game's generator.
@@ -491,11 +538,12 @@ void PaintGrid(HWND h) {
         Text(m, num, RECT{0, y, fw - S(6), y + rh}, DT_RIGHT, real ? RGB(0, 0, 0) : cPhantom);
         Fill(m, fw, y, gw, y + rh, sel ? cSel : cBg);
         const std::string& note = NoteAt(r);
-        Fill(m, gw, y, rc.right, y + rh, sel ? cSel : (note.empty() ? cBg : cNote));
+        bool bm = IsBm(note);
+        Fill(m, gw, y, rc.right, y + rh, sel ? cSel : (note.empty() ? cBg : bm ? cBm : cNote));
         if (!note.empty()) {
-            Fill(m, S(2), y + S(4), S(8), y + rh - S(4), cFlag);       // flag next to the frame number
-            std::wstring wn = W(note);
-            Text(m, wn.c_str(), RECT{gw + S(6), y, rc.right - S(4), y + rh}, DT_LEFT | DT_END_ELLIPSIS, cNoteText);
+            Fill(m, S(2), y + S(4), S(8), y + rh - S(4), bm ? cBmFlag : cFlag);   // flag next to the frame number
+            std::wstring wn = (bm ? L"\x2605 " : L"") + W(NoteBody(note));       // bookmarks show a star
+            Text(m, wn.c_str(), RECT{gw + S(6), y, rc.right - S(4), y + rh}, DT_LEFT | DT_END_ELLIPSIS, bm ? cBmText : cNoteText);
         }
 
         for (int k = 0; k < NUM_KEYS; k++) {
@@ -584,13 +632,16 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             HMENU pm = CreatePopupMenu();
             std::wstring lbl = (NoteAt(row).empty() ? L"Add note to frame " : L"Edit note of frame ") + std::to_wstring(row + 1) + L"...";
             bool hasNote = SelectionHasNote();
-            std::wstring run = L"Run game to frame " + std::to_wstring(row + 1);
-            AppendMenuW(pm, MF_STRING | (A.busy ? MF_GRAYED : 0), IDM_RUNTO, run.c_str());
+            std::wstring jump = L"Jump to frame " + std::to_wstring(row + 1) + L" (run forward, or rewind)";
+            AppendMenuW(pm, MF_STRING | (A.busy ? MF_GRAYED : 0), IDM_JUMPCUR, jump.c_str());
             AppendMenuW(pm, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(pm, MF_STRING | (A.busy ? MF_GRAYED : 0), IDM_BM_EDIT, RowIsBm(row) ? L"Rename bookmark..." : L"Add bookmark here...");
+            AppendMenuW(pm, MF_STRING | (A.busy || !RowIsBm(row) ? MF_GRAYED : 0), IDM_BM_DEL, L"Remove bookmark");
             AppendMenuW(pm, MF_STRING | (A.busy ? MF_GRAYED : 0), IDM_NOTE_EDIT, lbl.c_str());
             AppendMenuW(pm, MF_STRING | (A.busy || !hasNote ? MF_GRAYED : 0), IDM_NOTE_DEL, L"Remove note(s) in selection");
             AppendMenuW(pm, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(pm, MF_STRING, IDM_NOTE_LIST, L"Notes list...");
+            AppendMenuW(pm, MF_STRING, IDM_BM_LIST, L"Bookmarks list...");
             POINT pt{x, y};
             ClientToScreen(h, &pt);
             TrackPopupMenu(pm, TPM_RIGHTBUTTON, pt.x, pt.y, 0, A.wnd, nullptr);
@@ -649,7 +700,7 @@ void RefreshNotesList() {
     ListView_DeleteAllItems(lv);
     int n = 0;
     for (int r = 0; r < (int)A.movie.notes.size(); r++) {
-        if (A.movie.notes[r].empty()) continue;
+        if (A.movie.notes[r].empty() || (A.listBm && !IsBm(A.movie.notes[r]))) continue;
         wchar_t b[16];
         swprintf(b, 16, L"%d", r + 1);
         LVITEMW it{};
@@ -658,7 +709,7 @@ void RefreshNotesList() {
         it.pszText = b;
         it.lParam = r;
         int i = (int)SendMessageW(lv, LVM_INSERTITEMW, 0, (LPARAM)&it);
-        std::wstring w = W(A.movie.notes[r]);
+        std::wstring w = (IsBm(A.movie.notes[r]) ? L"\x2605 " : L"") + W(NoteBody(A.movie.notes[r]));
         ListView_SetItemText(lv, i, 1, (LPWSTR)w.c_str());
     }
     SendMessageW(lv, WM_SETREDRAW, TRUE, 0);
@@ -684,10 +735,10 @@ LRESULT CALLBACK NotesProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (nh->hwndFrom != A.notesList) break;
             if (nh->code == NM_DBLCLK || (nh->code == LVN_KEYDOWN && ((NMLVKEYDOWN*)lp)->wVKey == VK_RETURN)) {
                 int row = NotesSelectedRow();
-                if (row >= 0) SetCursorRow(row, false);
+                if (row >= 0) { if (A.listBm) JumpTo(row); else SetCursorRow(row, false); }
             } else if (nh->code == LVN_KEYDOWN && ((NMLVKEYDOWN*)lp)->wVKey == VK_DELETE) {
                 int row = NotesSelectedRow();
-                if (row >= 0) SetNote(row, "");
+                if (row >= 0) { if (A.listBm) RemoveBookmark(row); else SetNote(row, RowIsBm(row) ? std::string(1, BM_FLAG) : std::string()); }
             }
             return 0;
         }
@@ -697,11 +748,18 @@ LRESULT CALLBACK NotesProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-void ShowNotesList() {
-    if (A.notesWnd) { SetForegroundWindow(A.notesWnd); return; }
+void ShowNotesList(bool bookmarks = false) {
+    if (A.notesWnd) {
+        A.listBm = bookmarks;
+        SetWindowTextW(A.notesWnd, bookmarks ? L"Bookmarks" : L"Frame notes");
+        RefreshNotesList();
+        SetForegroundWindow(A.notesWnd);
+        return;
+    }
+    A.listBm = bookmarks;
     RECT pr;
     GetWindowRect(A.wnd, &pr);
-    A.notesWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmNotes", L"Frame notes",
+    A.notesWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmNotes", bookmarks ? L"Bookmarks" : L"Frame notes",
                                  WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
                                  pr.right - S(460), pr.top + S(90), S(440), S(360), A.wnd, nullptr, nullptr, nullptr);
     if (!A.notesWnd) return;
@@ -1317,6 +1375,20 @@ void FinishRun(int result, bool aborted) {
     SetFocus(A.grid);
 }
 
+// Go to a frame: if the frozen game has not reached it yet, just run it forward at the fast-forward
+// speed (no restart); if it is behind us (or there is no frozen game), rewind (restart + fast-forward).
+void JumpTo(int row) {
+    if (A.busy) { SetMsg(L"Wait for the running job to finish (Stop = F9) before jumping."); return; }
+    if (!Size()) return;
+    row = std::max(0, std::min(row, Size() - 1));
+    SetCursorRow(row, false);
+    bool frozen = A.sess.Active() && A.sess.Alive();
+    int next = frozen ? (int)A.sess.Row() : -1;         // the row the frozen game runs next
+    if (frozen && next >= 0 && next <= row) { RunToCursor(); return; }
+    if (frozen && next == row + 1) { SetMsg(L"The game is already at frame " + std::to_wstring(row + 1) + L"."); return; }
+    StartJob(false, (uint32_t)(row + 1), false, false, true);
+}
+
 void PollRun() {
     int r = A.sess.PollSteps();
     if (r == 0) {
@@ -1426,12 +1498,19 @@ void BuildMenu(HWND w) {
     add(e, IDM_NOTE_EDIT, L"Add / edit frame &note...");
     add(e, IDM_NOTE_DEL, L"Remove notes in selection");
     add(e, IDM_NOTE_LIST, L"Notes &list...");
+    AppendMenuW(e, MF_SEPARATOR, 0, nullptr);
+    add(e, IDM_BM_EDIT, L"Add / rename &bookmark...\tCtrl+B");
+    add(e, IDM_BM_DEL, L"Remove bookmark\tCtrl+Shift+B");
+    add(e, IDM_BM_LIST, L"Bookmarks lis&t...");
     add(r, IDM_PLAY, L"&Play from start\tF5");
     add(r, IDM_REWIND, L"&Rewind to cursor\tF6");
     add(r, IDM_RECFROM, L"Record &from cursor\tF7");
     add(r, IDM_RECORD, L"Record &new movie\tF8");
     add(r, IDM_STEP, L"Frame &advance\t.");
     add(r, IDM_RUNTO, L"Run to &cursor (advance the frozen game)\tF4");
+    add(r, IDM_GOTO, L"&Jump to frame...\tCtrl+G");
+    add(r, IDM_BM_NEXT, L"&Next bookmark (jump)\tF2");
+    add(r, IDM_BM_PREV, L"Pre&vious bookmark (jump)\tShift+F2");
     add(r, IDM_RECHERE, L"Record &here (live, from the frozen game)\tF12");
     add(r, IDM_RESUME, L"Resume &live (unfreeze)\tF11");
     add(r, IDM_STOP, L"&Stop\tF9");
@@ -1519,9 +1598,10 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             auto en = [&](int id, bool on) { EnableMenuItem(m, id, MF_BYCOMMAND | (on ? MF_ENABLED : MF_GRAYED)); };
             for (int id : {IDM_NEW, IDM_OPEN, IDM_CUT, IDM_PASTE, IDM_PASTEINS, IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES,
                            IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_RECORD, IDM_BASESAVE, IDM_STEP, IDM_RESUME, IDM_RECHERE,
-                           IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED})
+                           IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED, IDM_BM_EDIT, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV})
                 en(id, !A.busy);
             en(IDM_NOTE_DEL, !A.busy && SelectionHasNote());
+            en(IDM_BM_DEL, !A.busy && RowIsBm(A.cursor));
             en(IDM_UNDO, !A.busy && !A.undo.empty());
             en(IDM_REDO, !A.busy && !A.redo.empty());
             en(IDM_STOP, A.busy);
@@ -1549,7 +1629,14 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_DELFRAMES: EditDelete(); break;
                 case IDM_NOTE_EDIT: EditNote(); break;
                 case IDM_NOTE_DEL: RemoveNotesInSelection(); break;
-                case IDM_NOTE_LIST: ShowNotesList(); break;
+                case IDM_NOTE_LIST: ShowNotesList(false); break;
+                case IDM_BM_LIST: ShowNotesList(true); break;
+                case IDM_BM_EDIT: EditBookmark(); break;
+                case IDM_BM_DEL: RemoveBookmark(A.cursor); break;
+                case IDM_BM_NEXT: NextBookmark(true); break;
+                case IDM_BM_PREV: NextBookmark(false); break;
+                case IDM_GOTO: GoToFrame(); break;
+                case IDM_JUMPCUR: JumpTo(A.cursor); break;
                 case IDM_RNGSEED: EditSeed(); break;
                 case IDM_MEMORY: ShowMemory(); break;
                 case IDM_PLAY: StartJob(false, (uint32_t)Size(), false, true); break;
@@ -1663,6 +1750,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
         {FVIRTKEY, VK_F6, IDM_REWIND},            {FVIRTKEY, VK_F7, IDM_RECFROM},
         {FVIRTKEY, VK_F8, IDM_RECORD},            {FVIRTKEY, VK_F9, IDM_STOP},
         {FVIRTKEY, VK_OEM_PERIOD, IDM_STEP},      {FVIRTKEY, VK_F4, IDM_RUNTO},       {FVIRTKEY, VK_F11, IDM_RESUME},       {FVIRTKEY, VK_F12, IDM_RECHERE},
+        {FCONTROL | FVIRTKEY, 'B', IDM_BM_EDIT}, {FCONTROL | FSHIFT | FVIRTKEY, 'B', IDM_BM_DEL}, {FCONTROL | FVIRTKEY, 'G', IDM_GOTO},
+        {FVIRTKEY, VK_F2, IDM_BM_NEXT}, {FSHIFT | FVIRTKEY, VK_F2, IDM_BM_PREV},
     };
     ACCEL acc[sizeof keys / sizeof keys[0]];
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) acc[i] = ACCEL{keys[i].f, keys[i].k, keys[i].c};
