@@ -601,3 +601,25 @@ Seen on `test3.bscotm` (no baseline, no seed change): draws are rare, a few doze
 frames in the first 3700; the item-drop roll is `range 100` called from `exe+0x26CC79`; the draws
 around it come from `exe+0xEC...` (spawn/behaviour code, ranges 2-4) and inlined copies at
 `exe+0xEC585/0xEC757/0xEC925/0xEC3C9`.
+
+## Launch time: the 3 second join
+
+A rewind restarts the game, so the time to the first frame is paid every time. Measured (`test3.bscotm`,
+speed 50x, with a baseline): hook loaded at 0.15-0.4 s, game window at 0.8-1.1 s, first input poll at
+1.3-1.6 s and the **first frame marker at 4.3-4.6 s**. The 3 s gap was ours: at every frame marker the hook
+joins the worker threads the game started since the previous one (so their loading finishes inside the
+frame, see "worker threads" above), with a 3000 ms bound. Before the first marker the game starts 9 threads
+(all through the CRT start stub `exe+0x31CC6E`, real entry `exe+0x293340`); 8 finish within about 0.4 s, the
+first one never does: it loops on `Sleep(8)` (called from `exe+0x2BDDA4`) for the life of the process, so
+the join always ran into its 3000 ms timeout.
+
+Fix: `H_Sleep` counts the sleeps of each thread; the join skips a thread that is still running and has
+called `Sleep` at least 3 times (a polling thread: idle, not busy). The thread handles are duplicated with
+`THREAD_QUERY_LIMITED_INFORMATION` so the thread id can be read. First frame marker now at 1.3-1.7 s; a
+rewind to frame 1000 through the editor went from 6-9 s to 3.5 s. The game state at frames 700, 1500, 3000,
+3715, 7000 and 9000 (RNG words, health, weapon points, position) is identical to the earlier measurements,
+and *Verify fast-forward* still matches at all 20 checkpoints.
+
+Note: with the old join, in a later session the same harness (baseline restored, the 40-frame stepping of
+`comp`, or a direct `RunJob` to frame N) often never got out of the menus (health 0 at frame 3000) while the
+new code reached the same states as before every time; the reason for the old flakiness was not found.
