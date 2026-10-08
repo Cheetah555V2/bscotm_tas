@@ -30,7 +30,9 @@ back. The whole tool is two small native files (no Python, no Frida):
   the hook returns to real time exactly on the frame the replay ends. While
   fast-forwarding it also skips drawing (D3D `Present`/`Clear`/`Draw*` return at once,
   except for the last 2 frames so the frozen picture is real) and answers the game's
-  key polls without asking Windows: about 1000 frames per second instead of 340.
+  key polls without asking Windows: about 1000 frames per second instead of 340. It also
+  stops the game's own render-command queue from running the drawing commands that are
+  safe to skip (about 1.3x faster again; see the docs).
 - **Frame advance.** The hook blocks the game thread inside the input poll at a
   frame marker (before the frame's input is read) and releases it one frame per step.
   The virtual clock is frozen during the hold so the limiter does not see the pause

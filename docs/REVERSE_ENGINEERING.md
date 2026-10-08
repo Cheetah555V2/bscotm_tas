@@ -555,3 +555,33 @@ breakpoint on `exe+0x80280` to log every draw.
 - 19 call sites (`exe+0x2C79xx .. 0x2C8Bxx`, random ranges/colours in script handlers).
   **Zero calls** were observed in all of `test3.bscotm` (4838 frames) and 12000 frames of
   `test.bscotm`, so it does not decide stage 1; later stages were not checked.
+
+## Render-command queue (fast-forward speed-up)
+
+Profiling the fast-forward (sampling the busiest game thread) showed the main thread is
+CPU-bound (about 90% of one core, the other threads are idle) and that after the D3D calls were
+skipped, about half of its time was still the game preparing its drawing: big `memcpy`s and
+per-frame allocations of about 1.6 MB (a 1 MB block every frame, ~6 blocks of 62 KB, ...).
+
+- The game queues drawing commands during a frame and runs them from a loop at `exe+0x29DF10`
+  (called from `exe+0x293070`, which is called from the main loop at `exe+0x2A4946`). Each command
+  has a type at `cmd+4`; the loop does `push cmd; mov ecx, this; call [exe+0x380D88 + type*4]`
+  (36 entries, thiscall, handlers return with `ret 4`) and then calls the command's own cleanup.
+- The table is in the data section (pointers into the exe), so pointing its entries at a stub is a
+  data write, not a code patch. The hook does this while frames are being skipped
+  (`SPEED_NORENDER`, same condition as skipping the D3D draws) and puts the originals back
+  for the last 2 frames before the stopping point.
+- Not every type can go: type 10 is needed to get past the boot (the game never starts without it);
+  types 6, 7, 14, 19, 20, 27 are used rarely (8 - 150 times in 9000 frames) and load resources or
+  set persistent device state, skipping them leaves a black or wrong picture at the stopping
+  point (14 loads a named resource through the device and is the most expensive). The default skip
+  set is the 23 types used about once per frame or more that change neither the game state nor
+  the final picture: 1-4, 9, 11, 13, 15-18, 22-26, 28, 30-35 (`CMD_SKIP_DEFAULT` in `hook.cpp`;
+  the host can override it with `Shm::cmd_skip_lo/hi`). Types 0, 5, 8 were never used in the
+  test movie and 12, 21, 29 only a few dozen times, so they are left alone.
+- Result on `test3.bscotm` (9000 frames, max speed): about 1350 -> 1780 frames per second
+  (1.3x). The RNG state, health, weapon points and position were identical at 7 checkpoints
+  and the picture at the end was pixel-identical. Skipping every type except 10 is faster
+  still (about 2000 fps) but the final picture is wrong.
+- Limits of the check: only `test3.bscotm` has gameplay (stage 1); other stages may use
+  command types this movie never produced.
