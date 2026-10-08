@@ -42,6 +42,37 @@ back. The whole tool is two small native files (no Python, no Frida):
   game window really being in the foreground, so typing in the editor never leaks in.
 - Details and every finding: [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md).
 
+## How the game's RNG works
+
+Drops, enemy behaviour and the like come from one random number generator. Knowing how
+it is fed explains why a replay could differ from run to run, and what **RNG seed** does.
+
+1. **The generator.** It is a small xorshift128 generator: four 32-bit numbers (its
+   state) that are scrambled a little each time the game asks for a random number
+   (`w % range` for "pick one of N"). The same four numbers always produce the same
+   sequence of results. The state lives in the game's manager object; the Memory window
+   shows it as *RNG state x / y / z / w*.
+2. **The seed.** When the game starts, one 32-bit number (the seed) is spread over the
+   four state words, and the state is then only advanced by random draws.
+3. **Where the seed comes from.** The game uses the current time in seconds (Unix time) at
+   launch. Launch the same movie one second later and the state is different, so a drop
+   (for example 18 or 19 weapon points from a candle) can come out differently.
+4. **What the tool does.** With an RNG seed set (*Run > RNG seed...*), the hook gives the
+   game a clock frozen at that number. The game "launches" at that time every run, gets the
+   same seed, and so the same state at frame 1.
+5. **Why the state sometimes does not move.** Each draw advances the state, but a draw only
+   happens when the game needs a random result. Menus, boot and a standing player can go
+   for hundreds of frames without any, and the Memory window will show the same numbers
+   until something random happens.
+6. **What the seed cannot do.** It fixes the start only. If you change your inputs, the
+   game may draw a different number of random values before an event, and that event's
+   result changes too. Seed 0 makes all four state words 0, which xorshift never leaves, so
+   the RNG would never change; the real game seeds from the clock and cannot produce 0, so
+   that value is not a real case and is left as is.
+
+How it was found (addresses, constants, the code path of a drop):
+[docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md#rng).
+
 ## Build
 
 ### Download
@@ -137,6 +168,12 @@ captured against a different start point.
   to run. With a seed set, the game sees a frozen clock at that time, so every launch
   gets the same random numbers. The status bar shows the seed. Changing it restarts the
   game on the next Rewind / frame advance. Details: `docs/REVERSE_ENGINEERING.md`.
+- **Game memory window.** The **Memory** button in the menu bar opens a window that shows
+  the running game's health, weapon points (and max), score, X/Y speed, X/Y position
+  (physics and render copies), invisibility, difficulty, style, the four characters and
+  the four RNG state words. It updates 10 times a second for any COTM.exe that is running
+  (frozen or live) and shows `-` where the game has no value yet (menus, loading).
+  Read-only; the pointer chains come from the community cheat table.
 - Green frame numbers are the "greenzone": frames the live game has been advanced
   through. Editing a frame invalidates the greenzone after it.
 
@@ -150,7 +187,7 @@ restored.
 - Rewind = restart the game and fast-forward (still replays from frame 1). No true
   savestates: the game's anti-tamper makes snapshot/restore unreliable.
 - Keyboard only. No controller (DirectInput) support yet.
-- RNG is not seeded.
+- The RNG seed fixes the random numbers at launch only; changed inputs can still change later random results (see "How the game's RNG works").
 
 ## History
 
