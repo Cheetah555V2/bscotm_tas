@@ -678,6 +678,7 @@ static void* ProxyVt[29] = { PX_LIST(PX_ADDR) };
 // the game's callback only while the voice is alive and no restore is under way. Before the game's
 // callback can go away, XaKillCb stops forwarding and waits for the calls in flight.
 static volatile LONG XaCbGate;               // 1 = callbacks are dropped (a restore is under way)
+static volatile LONG XaOverflow;             // voices handed out untracked because the table was full (should stay 0)
 static volatile LONG ShimCalls, ShimForwarded;
 #define SH_BEGIN XaVoice* v = (XaVoice*)s->owner; InterlockedIncrement(&ShimCalls); InterlockedIncrement(&v->inflight); MemoryBarrier(); \
                  void* cb = v->cb; bool ok = v->cb_alive && !XaCbGate && cb;
@@ -716,8 +717,8 @@ static void XaCrashInfo(void* cb, char* out, int n) {
                       v.created, v.destroyed, (int)v.real_dead, (int)v.recreatable);
         }
     }
-    wsprintfA(out + lstrlenA(out), "%d voices match cb, %d live, XaSerial %u, slot0 serial %u, shim calls %ld forwarded %ld, gate %ld", found, live, XaSerial,
-              SlotSerial[0], ShimCalls, ShimForwarded, XaCbGate);
+    wsprintfA(out + lstrlenA(out), "%d voices match cb, %d live, XaSerial %u, slot0 serial %u, shim calls %ld forwarded %ld, gate %ld, TABLE OVERFLOWS %ld", found, live, XaSerial,
+              SlotSerial[0], ShimCalls, ShimForwarded, XaCbGate, XaOverflow);
     (void)n;
 }
 
@@ -772,8 +773,56 @@ static void XaFindInternal(HANDLE f, uintptr_t obj) {        // which tracked vo
             }
         }
     }
+    for (int i = 0; i < 1024; i++) {        // the voice object is `real`; the crashing frame works on its sub-object real + 0x8C
+        XaVoice& v = Voices[i];
+        if (!v.px.real || (uintptr_t)v.px.real + 0x8C != obj) continue;
+        uintptr_t cur = 0;
+        SIZE_T got = 0;
+        ReadProcessMemory(GetCurrentProcess(), (char*)v.px.real + 0xC4, &cur, 4, &got);
+        wsprintfA(b, "  THIS IS tracked voice#%d (proxy %08X real %08X): in_use %d real_dead %d created %u destroyed %u cb_alive %d; stored callback now %08X, our shim %08X, game cb %08X\r\n",
+                  i, (unsigned)(uintptr_t)&v.px, (unsigned)(uintptr_t)v.px.real, (int)v.in_use, (int)v.real_dead, v.created, v.destroyed, (int)v.cb_alive,
+                  (unsigned)cur, (unsigned)(uintptr_t)&v.shim, (unsigned)(uintptr_t)v.cb);
+        WriteFile(f, b, lstrlenA(b), &w, nullptr);
+        hits++;
+    }
     wsprintfA(b, "  %d tracked voices point at the crashing XAudio2 object\r\n", hits);
     WriteFile(f, b, lstrlenA(b), &w, nullptr);
+}
+// Layout probe (diagnosis): where does XAudio2 keep the callback pointer it was given? Searches the returned
+// voice object and the objects it points to (two levels) for the shim and for the game's callback.
+static char ProbeLog[8192];
+static int  ProbeLen;
+static volatile LONG NProbes;
+static void ProbeAdd(const char* s) { int n = lstrlenA(s); if (ProbeLen + n < (int)sizeof ProbeLog - 1) { memcpy(ProbeLog + ProbeLen, s, n); ProbeLen += n; ProbeLog[ProbeLen] = 0; } }
+static bool Plausible(uintptr_t p) { return p >= 0x10000 && p < 0x7FFE0000; }
+static void ProbeVoice(void* real, void* shim, void* cb) {
+    if (InterlockedIncrement(&NProbes) > 4) return;
+    char b[200];
+    wsprintfA(b, "probe: real %08X shim %08X gamecb %08X\r\n", (unsigned)(uintptr_t)real, (unsigned)(uintptr_t)shim, (unsigned)(uintptr_t)cb);
+    ProbeAdd(b);
+    static uintptr_t l0[0x80], l1[0x80], l2[0x40];
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), real, l0, sizeof l0, &got)) return;
+    for (SIZE_T i = 0; i < got / 4; i++) {
+        if (l0[i] == (uintptr_t)shim || l0[i] == (uintptr_t)cb) {
+            wsprintfA(b, "  real+%X holds the %s\r\n", (unsigned)(i * 4), l0[i] == (uintptr_t)cb ? "GAME callback" : "shim"); ProbeAdd(b);
+        }
+        if (i == 0 || !Plausible(l0[i])) continue;
+        SIZE_T g1 = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), (void*)l0[i], l1, sizeof l1, &g1)) continue;
+        for (SIZE_T j = 0; j < g1 / 4; j++) {
+            if (l1[j] == (uintptr_t)shim || l1[j] == (uintptr_t)cb) {
+                wsprintfA(b, "  [real+%X]=%08X +%X holds the %s\r\n", (unsigned)(i * 4), (unsigned)l0[i], (unsigned)(j * 4), l1[j] == (uintptr_t)cb ? "GAME callback" : "shim"); ProbeAdd(b);
+            }
+            if (!Plausible(l1[j]) || j == 0) continue;
+            SIZE_T g2 = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), (void*)l1[j], l2, sizeof l2, &g2)) continue;
+            for (SIZE_T k = 0; k < g2 / 4; k++)
+                if (l2[k] == (uintptr_t)shim || l2[k] == (uintptr_t)cb) {
+                    wsprintfA(b, "  [[real+%X]+%X]=%08X +%X holds the %s\r\n", (unsigned)(i * 4), (unsigned)(j * 4), (unsigned)l1[j], (unsigned)(k * 4), l2[k] == (uintptr_t)cb ? "GAME callback" : "shim"); ProbeAdd(b);
+                }
+        }
+    }
 }
 struct FirstCreate { uint32_t real, vt, f34, f38, shim, cb; };
 static FirstCreate FirstCreates[8];
@@ -787,6 +836,8 @@ static void NoteFirstCreate(void* real, void* shim, void* cb) {
     FirstCreates[i] = { (uint32_t)(uintptr_t)real, (uint32_t)w[0], (uint32_t)w[0x34 / 4], (uint32_t)w[0x38 / 4], (uint32_t)(uintptr_t)shim, (uint32_t)(uintptr_t)cb };
 }
 static void DumpFirstCreates(HANDLE f) {
+    DWORD wp;
+    WriteFile(f, ProbeLog, ProbeLen, &wp, nullptr);
     char b[200];
     DWORD w;
     for (LONG i = 0; i < NFirstCreates && i < 8; i++) {
@@ -801,7 +852,9 @@ static void __stdcall H_DestroyVoice(Proxy* self) {
     if (v >= Voices && v < Voices + 1024 && v->in_use && !v->real_dead) {
         void* real = v->px.real;
         v->real_dead = true;
-        if (AnySlot()) v->destroyed = ++XaSerial; else v->in_use = false;
+        uint32_t newest = 0;                 // only a voice that existed when a slot was saved can be needed again by a restore
+        for (int i = 0; i < 8; i++) if (SlotSerial[i] > newest) newest = SlotSerial[i];
+        if (newest && v->created <= newest) v->destroyed = ++XaSerial; else v->in_use = false;
         XaEv(2, v, real, v->cb);
         XaKillCb(v);
         LeaveCriticalSection(&XaCs);
@@ -818,7 +871,9 @@ static HRESULT __stdcall H_CreateSource(void* self, void** pp, const void* fmt, 
     EnterCriticalSection(&XaCs);
     XaVoice* v = nullptr;
     for (auto& c : Voices) if (!c.in_use) { v = &c; break; }
-    if (!v) {                                 // table full: hand out the real one
+    if (!v) {                                 // table full: hand out the real one (untracked: a restore cannot protect the game from it)
+        XaOverflow++;
+        XaEv(31, nullptr, nullptr, cb);
         LeaveCriticalSection(&XaCs);
         return R_CreateSrc(self, pp, fmt, fl, freq, cb, sends, chain);
     }
@@ -842,6 +897,7 @@ static HRESULT __stdcall H_CreateSource(void* self, void** pp, const void* fmt, 
     v->flags = fl; v->maxfreq = freq;
     XaEv(1, v, real, cb);
     NoteFirstCreate(real, &v->shim, cb);
+    if (cb) ProbeVoice(real, &v->shim, cb);
     const WAVEFORMATEX* wf = (const WAVEFORMATEX*)fmt;
     uint32_t n = wf ? sizeof(WAVEFORMATEX) + wf->cbSize : 0;
     v->recreatable = wf && n <= sizeof v->fmt && !chain;
