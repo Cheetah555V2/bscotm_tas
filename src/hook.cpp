@@ -11,7 +11,7 @@
 #include <utility>
 #include <tlhelp32.h>
 #include "common.h"
-
+#include "savestate.h"
 static Shm*      S;
 static uintptr_t PollRet;
 static uint8_t   BitOf[256];
@@ -114,9 +114,79 @@ static bool IsSleeper(DWORD tid) {
     for (int i = 0; i < MAXSLEEPERS && Sleepers[i].tid; i++) if (Sleepers[i].tid == tid) return Sleepers[i].n >= 3;
     return false;
 }
-static void  WINAPI H_Sleep(DWORD ms) { if (ms) NoteSleep(); R_Sleep(Shorten(ms)); }
-static DWORD WINAPI H_Wait(HANDLE h, DWORD ms) { return R_Wait(h, Shorten(ms)); }
-static DWORD WINAPI H_WaitEx(HANDLE h, DWORD ms, BOOL a) { return R_WaitEx(h, Shorten(ms), a); }
+// ---- idle gate: lets a savestate stop the game's own threads at a safe point ------------
+// A background thread of the game (it loops on Sleep(8)) runs game code and takes the game's
+// locks. Copying or rewriting memory under it would leave a lock half taken. So these
+// threads are tracked, count as idle while inside a Sleep/Wait, and when the gate is closed
+// they park on the way out of the call. A savestate proceeds only once all of them are idle.
+struct GThread { DWORD tid; HANDLE h; volatile LONG idle; };
+static GThread GT[128];
+static volatile LONG NGT;
+static volatile LONG GateClosed;
+static DWORD GateTls = TLS_OUT_OF_INDEXES;
+
+static GThread* GateMe() {
+    if (GateTls == TLS_OUT_OF_INDEXES) return nullptr;
+    GThread* g = (GThread*)TlsGetValue(GateTls);
+    if (g) return g;
+    DWORD me = GetCurrentThreadId();
+    for (LONG i = 0; i < NGT; i++) if (GT[i].tid == me) { TlsSetValue(GateTls, &GT[i]); return &GT[i]; }
+    return nullptr;
+}
+static inline void GateEnter(GThread* g) { if (g) { g->idle = 1; MemoryBarrier(); } }
+static void GateLeave(GThread* g) {          // about to run game code again
+    if (!g) return;
+    for (;;) {
+        g->idle = 0;
+        MemoryBarrier();
+        if (!GateClosed) return;
+        g->idle = 1;
+        MemoryBarrier();
+        while (GateClosed) Sleep(1);
+    }
+}
+static void GateRegister(HANDLE game_handle, DWORD tid) {
+    HANDLE d;
+    if (NGT >= 128 || !DuplicateHandle(GetCurrentProcess(), game_handle, GetCurrentProcess(), &d, SYNCHRONIZE, FALSE, 0)) return;
+    GT[NGT].tid = tid; GT[NGT].h = d; GT[NGT].idle = 0;
+    MemoryBarrier();
+    NGT++;
+}
+static bool ParkAll() {
+    GateClosed = 1;
+    MemoryBarrier();
+    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 3000;) {
+        bool all = true;
+        for (LONG i = 0; i < NGT; i++)
+            if (!GT[i].idle && WaitForSingleObject(GT[i].h, 0) != WAIT_OBJECT_0) all = false;
+        if (all) return true;
+        Sleep(0);
+    }
+    return false;
+}
+static void UnparkAll() { GateClosed = 0; MemoryBarrier(); }
+
+static void  WINAPI H_Sleep(DWORD ms) {
+    if (ms) NoteSleep();
+    GThread* g = GateMe();
+    GateEnter(g);
+    R_Sleep(Shorten(ms));
+    GateLeave(g);
+}
+static DWORD WINAPI H_Wait(HANDLE h, DWORD ms) {
+    GThread* g = GateMe();
+    GateEnter(g);
+    DWORD r = R_Wait(h, Shorten(ms));
+    GateLeave(g);
+    return r;
+}
+static DWORD WINAPI H_WaitEx(HANDLE h, DWORD ms, BOOL a) {
+    GThread* g = GateMe();
+    GateEnter(g);
+    DWORD r = R_WaitEx(h, Shorten(ms), a);
+    GateLeave(g);
+    return r;
+}
 
 // ---- d3d9: optionally drop vsync -----------------------------------------------
 // Direct3DCreate9 is wrapped so we can patch IDirect3D9::CreateDevice (slot 16 of
@@ -367,6 +437,7 @@ static HANDLE WINAPI H_Ct(LPSECURITY_ATTRIBUTES a, SIZE_T sz, LPTHREAD_START_ROU
     HANDLE h = R_Ct(a, sz, fn, p, fl, id);
     if (h && RngWatch && SuspendThread(h) != (DWORD)-1) { SetWatch(h, RngWatch); ResumeThread(h); }   // RNG log: watch new threads too
     HANDLE d;
+    if (h && GateTls != TLS_OUT_OF_INDEXES) GateRegister(h, GetThreadId(h));
     if (h && !(fl & CREATE_SUSPENDED) &&    // the game may close h at once, so keep our own copy
         DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &d, SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0)) {
         EnterCriticalSection(&ThCs);
@@ -432,6 +503,232 @@ static void HistSample(uint32_t marker) {
     MemoryBarrier();
     S->hist_n = i + 1;
 }
+
+// ---- game heap -> arena (savestates) ----------------------------------------------
+static LPVOID (WINAPI *R_HeapAlloc)(HANDLE, DWORD, SIZE_T);
+static BOOL   (WINAPI *R_HeapFree)(HANDLE, DWORD, LPVOID);
+static LPVOID (WINAPI *R_HeapReAlloc)(HANDLE, DWORD, LPVOID, SIZE_T);
+static SIZE_T (WINAPI *R_HeapSize)(HANDLE, DWORD, LPCVOID);
+
+static LPVOID WINAPI H_HeapAlloc(HANDLE h, DWORD fl, SIZE_T n) {
+    void* p = arena::Alloc(n, (fl & HEAP_ZERO_MEMORY) != 0);
+    return p ? p : R_HeapAlloc(h, fl, n);
+}
+
+static BOOL WINAPI H_HeapFree(HANDLE h, DWORD fl, LPVOID p) {
+    if (!p) return TRUE;
+    if (arena::Contains(p)) { arena::Free(p); return TRUE; }
+    return R_HeapFree(h, fl, p);
+}
+
+static LPVOID WINAPI H_HeapReAlloc(HANDLE h, DWORD fl, LPVOID p, SIZE_T n) {
+    if (!p || !arena::Contains(p)) return R_HeapReAlloc(h, fl, p, n);
+    size_t old = arena::RequestedSize(p), cap = arena::Capacity(p);
+    bool zero = (fl & HEAP_ZERO_MEMORY) != 0;
+    if (n <= cap) {
+        arena::SetRequested(p, n);
+        if (zero && n > old) memset((char*)p + old, 0, n - old);
+        return p;
+    }
+    if (fl & HEAP_REALLOC_IN_PLACE_ONLY) return nullptr;
+    void* q = arena::Alloc(n, false);
+    if (!q) q = R_HeapAlloc(h, fl & ~HEAP_ZERO_MEMORY, n);
+    if (!q) return nullptr;
+    memcpy(q, p, old < n ? old : n);
+    if (zero && n > old) memset((char*)q + old, 0, n - old);
+    arena::Free(p);
+    return q;
+}
+
+static SIZE_T WINAPI H_HeapSize(HANDLE h, DWORD fl, LPCVOID p) {
+    return p && arena::Contains(p) ? arena::RequestedSize(p) : R_HeapSize(h, fl, p);
+}
+
+// ---- XAudio2 voices (savestates) -------------------------------------------------
+// The game keeps pointers to its XAudio2 source voices, and each voice keeps a pointer to a
+// callback object in the game's heap. Putting the heap back therefore needs care:
+//   - a voice created after the save must be destroyed before the restore (its callback
+//     object is about to disappear), and
+//   - a voice the game destroyed after the save must exist again afterwards, because the
+//     restored game memory points at it.
+// So the game is handed a stand-in object (same layout: vtable pointer first) per source
+// voice. Every call is forwarded to the real voice; DestroyVoice is the only one handled here.
+// A destroyed voice can then be recreated behind the same stand-in pointer.
+struct Proxy { void** vt; void* real; };
+struct XaVoice {
+    Proxy px;
+    bool in_use, real_dead, recreatable;
+    uint32_t created, destroyed;             // XaSerial values
+    uint8_t fmt[128]; uint32_t flags; float maxfreq; void* cb;
+    uint32_t nsends; struct { uint32_t flags; void* out; } sends[4];
+};
+static XaVoice  Voices[1024];
+static uint32_t XaSerial;                    // bumped on every create / destroy / save
+static uint32_t SlotSerial[8];               // XaSerial when each slot was saved (0 = empty)
+static CRITICAL_SECTION XaCs;
+static void*    XaObject;                    // the IXAudio2 the voices came from
+typedef HRESULT (__stdcall *PFN_CreateSrc)(void*, void**, const void*, UINT32, float, void*, const void*, const void*);
+static PFN_CreateSrc R_CreateSrc;
+static HRESULT (WINAPI *R_CoCreate)(const GUID&, LPUNKNOWN, DWORD, const GUID&, LPVOID*);
+
+#define PX_LIST(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) \
+    X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28)
+#define PX_DECL(n) extern "C" void px##n() __asm__("_bscotm_px" #n);
+#define PX_ADDR(n) (void*)px##n,
+#define PX_DEF(n) __asm__(".text\n.globl _bscotm_px" #n "\n_bscotm_px" #n ":\n" \
+    "    mov 4(%esp), %eax\n    mov 4(%eax), %eax\n    mov %eax, 4(%esp)\n    mov (%eax), %eax\n    jmp *" #n "*4(%eax)\n");
+PX_LIST(PX_DECL)
+PX_LIST(PX_DEF)
+static void* ProxyVt[29] = { PX_LIST(PX_ADDR) };
+
+static bool AnySlot() { for (int i = 0; i < 8; i++) if (SlotSerial[i]) return true; return false; }
+
+static void XaReap() {                       // forget destroyed voices that no saved slot can bring back
+    uint32_t keep = 0xFFFFFFFFu;
+    for (int i = 0; i < 8; i++) if (SlotSerial[i] && SlotSerial[i] < keep) keep = SlotSerial[i];
+    for (auto& v : Voices) if (v.in_use && v.destroyed && v.destroyed < keep) v.in_use = false;
+}
+
+static void __stdcall H_DestroyVoice(Proxy* self) {
+    EnterCriticalSection(&XaCs);
+    XaVoice* v = (XaVoice*)self;
+    if (v >= Voices && v < Voices + 1024 && v->in_use && !v->real_dead) {
+        void* real = v->px.real;
+        v->real_dead = true;
+        if (AnySlot()) v->destroyed = ++XaSerial; else v->in_use = false;
+        LeaveCriticalSection(&XaCs);
+        ((void (__stdcall*)(void*))(*(void***)real)[18])(real);
+        return;
+    }
+    LeaveCriticalSection(&XaCs);
+}
+
+static HRESULT __stdcall H_CreateSource(void* self, void** pp, const void* fmt, UINT32 fl, float freq, void* cb,
+                                         const void* sends, const void* chain) {
+    void* real = nullptr;
+    HRESULT hr = R_CreateSrc(self, &real, fmt, fl, freq, cb, sends, chain);
+    if (hr != 0 || !real || !pp) { if (pp) *pp = real; return hr; }
+    EnterCriticalSection(&XaCs);
+    XaVoice* v = nullptr;
+    for (auto& c : Voices) if (!c.in_use) { v = &c; break; }
+    if (!v) { LeaveCriticalSection(&XaCs); *pp = real; return hr; }       // table full: hand out the real one
+    memset(v, 0, sizeof *v);
+    v->px.vt = ProxyVt;
+    v->px.real = real;
+    v->in_use = true;
+    v->created = ++XaSerial;
+    v->flags = fl; v->maxfreq = freq; v->cb = cb;
+    const WAVEFORMATEX* wf = (const WAVEFORMATEX*)fmt;
+    uint32_t n = wf ? sizeof(WAVEFORMATEX) + wf->cbSize : 0;
+    v->recreatable = wf && n <= sizeof v->fmt && !chain;
+    if (v->recreatable) memcpy(v->fmt, wf, n);
+    if (sends) {                              // XAUDIO2_VOICE_SENDS { SendCount, pSends }
+        uint32_t cnt = *(const uint32_t*)sends;
+        const uint32_t* d = *(const uint32_t* const*)((const char*)sends + 4);
+        if (cnt > 4) v->recreatable = false;
+        else { v->nsends = cnt; for (uint32_t i = 0; i < cnt; i++) { v->sends[i].flags = d[i * 2]; v->sends[i].out = (void*)d[i * 2 + 1]; } }
+    }
+    LeaveCriticalSection(&XaCs);
+    *pp = &v->px;
+    return hr;
+}
+
+static HRESULT WINAPI H_CoCreate(const GUID& clsid, LPUNKNOWN outer, DWORD ctx, const GUID& iid, LPVOID* out) {
+    HRESULT hr = R_CoCreate(clsid, outer, ctx, iid, out);
+    static const GUID xa27 = {0x5a508685, 0xa254, 0x4fba, {0x9b, 0x82, 0x9a, 0x24, 0xb0, 0x03, 0x06, 0xaf}};
+    static const GUID xa27d = {0xdb05ea35, 0x0329, 0x4d4b, {0xa5, 0x3a, 0x6d, 0xea, 0xd0, 0x3d, 0x3d, 0x38}};
+    if (hr == 0 && out && *out && !R_CreateSrc && (!memcmp(&clsid, &xa27, sizeof(GUID)) || !memcmp(&clsid, &xa27d, sizeof(GUID)))) {
+        void** vt = *(void***)*out;          // IXAudio2: slot 8 = CreateSourceVoice
+        DWORD old;
+        if (VirtualProtect(&vt[8], 4, PAGE_READWRITE, &old)) {
+            XaObject = *out;
+            R_CreateSrc = (PFN_CreateSrc)vt[8];
+            vt[8] = (void*)H_CreateSource;
+            ProxyVt[18] = (void*)H_DestroyVoice;
+            VirtualProtect(&vt[8], 4, old, &old);
+        }
+    }
+    return hr;
+}
+
+// StopEngine returns only when no callback into the game is running or can start, so the game
+// memory can be copied without the audio thread reading it half way.
+static void XaPause()  { if (XaObject) ((void (__stdcall*)(void*))(*(void***)XaObject)[12])(XaObject); }
+static void XaResume() { if (XaObject) ((HRESULT (__stdcall*)(void*))(*(void***)XaObject)[11])(XaObject); }
+
+static void XaOnSave(int slot) {
+    EnterCriticalSection(&XaCs);
+    SlotSerial[slot] = ++XaSerial;
+    XaReap();
+    LeaveCriticalSection(&XaCs);
+}
+
+static void XaBeforeRestore(int slot) {
+    EnterCriticalSection(&XaCs);
+    uint32_t T = SlotSerial[slot];
+    for (auto& v : Voices) {
+        if (!v.in_use) continue;
+        if (v.created > T) {                  // born after the save: gone before the memory is put back
+            if (!v.real_dead) ((void (__stdcall*)(void*))(*(void***)v.px.real)[18])(v.px.real);
+            v.in_use = false;
+        } else if (v.destroyed > T) {         // destroyed after the save: bring it back behind the same pointer
+            struct { uint32_t n; void* p; } sl = {v.nsends, v.sends};
+            void* nv = nullptr;
+            if (v.recreatable && R_CreateSrc && R_CreateSrc(XaObject, &nv, v.fmt, v.flags, v.maxfreq, v.cb, v.nsends ? &sl : nullptr, nullptr) == 0 && nv) {
+                v.px.real = nv;
+                v.real_dead = false;
+                v.destroyed = 0;
+            }
+        }
+    }
+    LeaveCriticalSection(&XaCs);
+}
+
+// ---- savestate commands (handled while the game is held at a marker) ---------------
+// After the memory is put back, this fixes up the hook's own state and the game re-enters the
+// poll call from its first instruction, so the marker is handled again and the game freezes
+// at the same marker it was saved at.
+static void SnapAfterCopy(const snap::Slot& sn) {
+    Shm* s = S;
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    VirtBase = sn.virt;
+    RealBase = q.QuadPart;
+    CurSpeed = 1000;
+    s->speed_milli = 1000;
+    s->frame = sn.frame_before;
+    s->advance = 0;
+    s->hold = 1;
+    s->paused = 0;
+    NPending = 0;
+    XaResume();
+    s->snap_result = 1;
+    MemoryBarrier();
+    s->snap_cmd = 0;
+}
+
+static void HandleSnap(Shm* s, uint32_t f, int64_t frozen) {
+    uint32_t cmd = s->snap_cmd, slot = s->snap_slot;
+    if (slot >= (uint32_t)snap::MAX_SLOTS || !(s->features & FEAT_ARENA_OK)) {
+        s->snap_result = 2;
+    } else if (cmd == 1) {
+        XaPause();
+        bool ok = snap::Save((int)slot, frozen, f - 1);
+        XaResume();
+        if (ok) XaOnSave((int)slot);
+        s->snap_frame[slot] = ok ? f : 0;
+        s->snap_result = ok ? 1 : 2;
+    } else if (cmd == 2 && snap::Slots[slot].valid) {
+        XaBeforeRestore((int)slot);
+        XaPause();
+        snap::Restore(&snap::Slots[slot], SnapAfterCopy);      // does not return
+    } else {
+        s->snap_result = 2;
+    }
+    MemoryBarrier();
+    s->snap_cmd = 0;
+}
+
 // ---- frame advance: block the game thread at a frame marker ----------------------
 // The game is stopped before frame f reads its input, so the host can still edit
 // keys[f - 1]. The virtual clock is frozen meanwhile; otherwise the limiter would
@@ -442,6 +739,7 @@ static void Hold(Shm* s, uint32_t f) {
     int64_t frozen = VNow(q.QuadPart);
     s->paused = f;
     while (s->hold) {
+        if (s->snap_cmd) HandleSnap(s, f, frozen);
         uint32_t a = s->advance;        // atomic: the host may reset it to abort a batch
         if (a && InterlockedCompareExchange((volatile LONG*)&s->advance, (LONG)(a - 1), (LONG)a) == (LONG)a) break;
         Sleep(1);
@@ -488,7 +786,8 @@ static void Marker(Shm* s) {
     if (s->hold) { SetCmdSkip(false); Hold(s, f); UpdateCmdSkip(); }
 }
 
-static __attribute__((noinline)) SHORT WINAPI H_Gaks(int vk) {
+static __attribute__((noinline, used)) SHORT WINAPI H_Gaks(int vk) __asm__("_bscotm_gaks");
+static __attribute__((noinline, used)) SHORT WINAPI H_Gaks(int vk) {
     if ((uintptr_t)__builtin_return_address(0) != PollRet) return R_Gaks(vk);
     Shm* s = S;
     s->polls++;
@@ -544,7 +843,25 @@ static void Init() {
     HMODULE exe = GetModuleHandleW(NULL);
     PollRet = (uintptr_t)exe + POLL_RET_RVA;
 
-    bool ok = PatchIat(exe, "user32.dll", "GetAsyncKeyState", (void*)H_Gaks, &R_Gaks);
+    snap::PollSite = PollRet;
+    bool ok = PatchIat(exe, "user32.dll", "GetAsyncKeyState", (void*)snap::PollStub, &R_Gaks);
+    if (S->features & FEAT_SAVESTATE) {
+        if (arena::Init()) {
+            snap::FindSections(exe);
+            GateTls = TlsAlloc();                   // the gate is only used by savestates
+            snap::ParkHook = ParkAll;
+            snap::UnparkHook = UnparkAll;
+            PatchIat(exe, "kernel32.dll", "HeapAlloc", (void*)H_HeapAlloc, &R_HeapAlloc);
+            PatchIat(exe, "kernel32.dll", "HeapFree", (void*)H_HeapFree, &R_HeapFree);
+            PatchIat(exe, "kernel32.dll", "HeapReAlloc", (void*)H_HeapReAlloc, &R_HeapReAlloc);
+            PatchIat(exe, "kernel32.dll", "HeapSize", (void*)H_HeapSize, &R_HeapSize);
+            InitializeCriticalSection(&XaCs);
+            PatchIat(exe, "ole32.dll", "CoCreateInstance", (void*)H_CoCreate, &R_CoCreate);
+            S->features |= FEAT_ARENA_OK;
+        } else {
+            S->features |= FEAT_ARENA_FAIL;
+        }
+    }
 
     // Clock hooks are optional: a missing import just means that clock stays real.
     InitializeCriticalSection(&Cs);
