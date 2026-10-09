@@ -25,7 +25,7 @@ enum {
     IDC_MEM_HIST, IDC_MEM_GRAPH, IDC_MEM_CSV, IDC_MEM_CLR,
     IDM_HELP_START, IDM_HELP_KEYS, IDM_HELP_TROUBLE, IDM_HELP_ABOUT, IDM_HELP_GUIDE, IDC_HELP_TOPICS,
     IDM_RNGLOG, IDM_VERIFY, IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
-    IDM_SAVESTATES, IDM_SAVESTATE_NOW,
+    IDM_SAVESTATES, IDM_SAVESTATE_NOW, IDM_SSINTERVAL,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
     IDC_BASE = 300, IDC_PRE, IDC_RNG_CHK, IDC_RNG_CLR, IDC_RNG_CSV,
@@ -81,7 +81,7 @@ struct App {
     int liveRecRow = 0;           // movie row the live recording started at
     bool pendingStep = false;     // step once the resync job finishes
     bool pendingRun = false;      // run to the cursor once the resync job finishes
-    bool useStates = false;       // Run > Use savestates: launch the game with the private heap so states can be saved
+    bool useStates = true;        // Run > Use savestates (on by default): launch the game with the private heap so states can be saved
     int  ssEvery = 2000;          // automatic state every this many frames while the game is advanced (0 = never)
     bool ssManual[8] = {};        // slots saved by hand (never evicted automatically)
     int  chunkFrom = 0;           // first row of the batch being run (Run to cursor runs in pieces so states can be saved between them)
@@ -2504,8 +2504,9 @@ void BuildMenu(HWND w) {
     add(r, IDM_RNGSEED, L"RNG see&d...");
     add(r, IDM_VERIFY, L"&Verify fast-forward...");
     AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
-    add(r, IDM_SAVESTATES, L"Use &savestates (experimental; applies at the next launch)");
+    add(r, IDM_SAVESTATES, L"Use &savestates (applies at the next launch)");
     add(r, IDM_SAVESTATE_NOW, L"Save s&tate at the game's position\tShift+F5");
+    add(r, IDM_SSINTERVAL, L"Savestate &interval (frames)...");
     A.speedMenu = CreatePopupMenu();
     add(A.speedMenu, IDM_SPEED0, L"Real time (1x)");
     add(A.speedMenu, IDM_SPEED1, L"4x");
@@ -2581,7 +2582,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 std::wstring sp = IniGet(L"last", L"speed");
                 A.speed = sp.empty() ? 3 : std::max(0, std::min(3, _wtoi(sp.c_str())));
                 CheckMenuRadioItem(A.speedMenu, IDM_SPEED0, IDM_SPEED3, IDM_SPEED0 + A.speed, MF_BYCOMMAND);
-                A.useStates = IniGet(L"last", L"savestates") == L"1";
+                A.useStates = IniGet(L"last", L"savestates") != L"0";
                 std::wstring ev = IniGet(L"last", L"ssevery");
                 if (!ev.empty()) A.ssEvery = std::max(0, _wtoi(ev.c_str()));
             }
@@ -2604,6 +2605,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 en(id, !A.busy);
             CheckMenuItem(m, IDM_SAVESTATES, MF_BYCOMMAND | (A.useStates ? MF_CHECKED : MF_UNCHECKED));
             en(IDM_SAVESTATES, !A.busy);
+            en(IDM_SSINTERVAL, !A.busy);
             en(IDM_SAVESTATE_NOW, !A.busy && StatesOn());
             en(IDM_NOTE_DEL, !A.busy && SelectionHasNote());
             en(IDM_BM_DEL, !A.busy && RowIsBm(A.cursor));
@@ -2668,6 +2670,22 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     SetMsg(A.useStates ? L"Savestates on: the game launched from now on can save and load states (Rewind and Jump use them)."
                                        : L"Savestates off for the next launch.");
                     break;
+                case IDM_SSINTERVAL: {
+                    if (A.busy) break;
+                    std::wstring t = std::to_wstring(A.ssEvery);
+                    if (!AskText(L"Savestate interval", L"Frames between automatic savestates while the game is advanced (0 = never; 100 - 20000):", t)) break;
+                    wchar_t* end = nullptr;
+                    long n = wcstol(t.c_str(), &end, 10);
+                    if (t.empty() || *end || n < 0 || (n > 0 && n < 100) || n > 20000) {
+                        MessageBoxW(A.wnd, L"Enter 0, or a number of frames from 100 to 20000.", L"Savestate interval", MB_ICONERROR);
+                        break;
+                    }
+                    A.ssEvery = (int)n;
+                    IniSet(L"last", L"ssevery", std::to_wstring(A.ssEvery));
+                    SetMsg(n ? L"A savestate is made every " + std::to_wstring(n) + L" frames while the game is advanced. Shorter = faster rewinds, more memory."
+                             : L"No automatic savestates (Shift+F5 still saves one by hand).");
+                    break;
+                }
                 case IDM_SAVESTATE_NOW:
                     if (A.busy) break;
                     if (!StatesOn()) { SetMsg(A.useStates ? L"No frozen game that can save states. Rewind to cursor (F6) first." : L"Savestates are off (Run > Use savestates), then Rewind to cursor (F6)."); break; }
