@@ -95,8 +95,13 @@ struct Shm {
     volatile uint32_t snap_stats[4];    // hook -> host, per save: [0] pages in the pool, [1] pages that had to be copied, [2] pages in the state, [3] pool pages free
     volatile uint32_t snap_time[8];     // hook -> host, ms per phase of the last save: [0] engine pause, [1] park threads, [2] compare pages, [3] reserve pool, [4] open+freeze, [5] copy, [6] total in Save, [7] engine resume
     volatile uint32_t quant_hz;         // host -> hook: snap the clocks the game reads to a grid of 1/quant_hz s (0 = off)
-    volatile uint32_t quant_lock;       // host -> hook: with quant_hz, also lock time to the frame markers (experimental: the game exits with code 143)
+    volatile uint32_t quant_lock;       // host -> hook: with quant_hz: 2 = clamp the clock to at most 2 steps ahead of the last frame marker; 1 = lock to the markers (experimental: the game exits with code 143)
     volatile uint32_t px_cnt[32];       // diagnosis: calls the game made on its XAudio2 source voices, by vtable slot
     volatile uint32_t sh_cnt[8];        // diagnosis: callbacks XAudio2 delivered, by IXAudio2VoiceCallback method
+    volatile uint32_t lockstep;         // host -> hook, experiment: release the game's Sleep-loop thread N times per frame marker (0 = off)
+    volatile uint32_t gap_hist[8];      // diagnosis: frame markers by the number of clock-grid steps since the previous one (0, 1, 2, 3, 4+)
+    volatile uint32_t gap_n;            // diagnosis: markers (from the 3000th on) whose gap was not exactly 1 step, ...
+    volatile uint32_t gap_log[64];      // ... as (marker << 4 | steps), first 64
+    uint16_t thr_log[4][12288];         // diagnosis: at each marker (index = marker): cumulative Sleep / Wait calls of the other threads, then of the marker thread
     uint16_t keys[MAX_FRAMES];
 };
