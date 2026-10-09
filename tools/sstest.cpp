@@ -143,9 +143,11 @@ static int RunTo(Session& ss, const Frames& mv, uint32_t row, uint32_t speed) {
     uint32_t cur = ss.Row();
     if (row <= cur) return 1;
     if (row > mv.size()) return 0;
+    DWORD t0 = GetTickCount();
     if (!ss.BeginSteps(mv.data() + cur, row - cur, speed)) return 0;
     int r;
     while (!(r = ss.PollSteps())) Sleep(2);
+    if (getenv("SSTEST_TIME") && row - cur >= 500) { DWORD ms = GetTickCount() - t0; printf("  [run %u..%u at %ux: %lu ms = %.1f frames/s = %.1fx real time]\n", cur, row, speed / 1000, ms, (row - cur) * 1000.0 / (ms ? ms : 1), (row - cur) * 1000.0 / (ms ? ms : 1) / 60.0); }
     return r > 0;
 }
 
@@ -197,7 +199,7 @@ int wmain(int argc, wchar_t** argv) {
     if (argc < 2) { puts("usage: sstest movie.bscotm --exe X --dll X --baseline X --prelude X [--at N] [--gap N] [--reps N] [--speed N]"); return 2; }
     RunParams p;
     std::wstring moviePath = argv[1], preludePath;
-    uint32_t at = 2000, gap = 300, reps = 3, speed = 16000, altoff = 0, alts = 3, soak = 0, cmpupto = 0, cmpchunk = 2000, cmpvariant = 0, nostates = 0, peekat = 0, cntfrom = 0, cntto = 0, dropcb = 0, rngscan = 0, maskarg = 0, dumprow = 0, quant = 60, lockarg = 0, loadatarg = 0; std::string dumppath = "dump.bin";
+    uint32_t at = 2000, gap = 300, reps = 3, speed = 24000, altoff = 0, alts = 3, soak = 0, cmpupto = 0, cmpchunk = 2000, cmpvariant = 0, nostates = 0, peekat = 0, cntfrom = 0, cntto = 0, dropcb = 0, rngscan = 0, maskarg = 0, dumprow = 0, quant = 60, lockarg = 2, lockstep = 0, loadatarg = 0; std::string dumppath = "dump.bin";
     for (int i = 2; i + 1 < argc; i += 2) {
         std::wstring k = argv[i], v = argv[i + 1];
         if (k == L"--exe") p.exe = v;
@@ -223,6 +225,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (k == L"--mask") maskarg = _wtoi(v.c_str());
         else if (k == L"--quant") quant = _wtoi(v.c_str());
         else if (k == L"--lock") lockarg = _wtoi(v.c_str());
+        else if (k == L"--lockstep") lockstep = _wtoi(v.c_str());
         else if (k == L"--loadat") loadatarg = _wtoi(v.c_str());
         else if (k == L"--dump") dumprow = _wtoi(v.c_str());
         else if (k == L"--dumpfile") { char b[512]; WideCharToMultiByte(CP_ACP, 0, v.c_str(), -1, b, 512, nullptr, nullptr); dumppath = b; }
@@ -244,14 +247,15 @@ int wmain(int argc, wchar_t** argv) {
     p.savestates = !nostates;
     p.drop_callbacks = dropcb != 0;
     p.quant_hz = quant;
-    p.quant_lock = lockarg != 0;
+    p.quant_lock = lockarg;
+    p.lockstep = lockstep;
     p.hist = true;
     p.speed_milli = speed;
     p.speed_mask = maskarg ? (uint32_t)maskarg : SPEED_ALL;
     if (!soak && !cmpupto && !peekat && !cntto && !rngscan && !dumprow && at + gap + 1 >= p.movie.size()) { puts("movie too short for --at + --gap"); return 2; }
 
     if (cmpupto) {      // determinism of the editor's way of running: continuous vs in chunks with states vs with a load in the middle
-        struct Run { std::vector<HistEntry> h; bool ok = false; };
+        struct Run { std::vector<HistEntry> h; bool ok = false; std::vector<uint16_t> t[4]; };
         auto once = [&](const char* name, uint32_t chunk, uint32_t loadAt, uint32_t spd = 0, bool nosave = false) {
             Run r;
             Session s2;
@@ -283,6 +287,10 @@ int wmain(int argc, wchar_t** argv) {
                     }
                 }
             }
+            for (int k = 0; k < 4; k++) r.t[k].assign((const uint16_t*)s2.s->thr_log[k], (const uint16_t*)s2.s->thr_log[k] + 12288);
+            printf("%s: markers by grid steps since the previous (0,1,2,3,4+): %u %u %u %u %u; irregular after 3000:", name, s2.s->gap_hist[0], s2.s->gap_hist[1], s2.s->gap_hist[2], s2.s->gap_hist[3], s2.s->gap_hist[4]);
+            for (uint32_t i = 0; i < s2.s->gap_n && i < 64; i++) printf(" %u:%u", s2.s->gap_log[i] >> 4, s2.s->gap_log[i] & 15);
+            printf("\n");
             s2.Close();
             KillGame();
             r.ok = true;
@@ -302,6 +310,21 @@ int wmain(int argc, wchar_t** argv) {
             size_t ok = Compare(x.h, y.h, same);
             printf("%s: %zu matching frames before %s\n", what, ok, same ? "the end (IDENTICAL)" : "the first difference (above)");
         };
+        if (a.ok && b.ok && cmpvariant == 3) {      // thread experiment: how often did each side sleep / wait per marker, in the two runs?
+            static const char* TN[4] = {"other threads' Sleep", "other threads' Wait", "marker thread's Sleep", "marker thread's Wait"};
+            for (int k = 0; k < 4; k++) {
+                uint32_t differing = 0, first = 0;
+                for (uint32_t m = 4001; m < 11000 && m < 12288; m++) {
+                    int da = (uint16_t)(a.t[k][m] - a.t[k][m - 1]), db = (uint16_t)(b.t[k][m] - b.t[k][m - 1]);
+                    if (da != db) { differing++; if (!first) first = m; }
+                }
+                printf("%s: per-marker count differs in %u of 6999 markers (first at %u);  per marker around 10480..10494:\n  run 1:", TN[k], differing, first);
+                for (uint32_t m = 10480; m <= 10494; m++) printf(" %d", (uint16_t)(a.t[k][m] - a.t[k][m - 1]));
+                printf("\n  run 2:");
+                for (uint32_t m = 10480; m <= 10494; m++) printf(" %d", (uint16_t)(b.t[k][m] - b.t[k][m - 1]));
+                printf("\n  totals up to 10492: %u vs %u\n", (uint16_t)(a.t[k][10492] - a.t[k][4000]), (uint16_t)(b.t[k][10492] - b.t[k][4000]));
+            }
+        }
         if (a.ok && b.ok) diff("continuous vs chunked+saves", a, b);
         if (a.ok && c.ok) diff("continuous vs chunked+load ", a, c);
         return 0;

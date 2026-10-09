@@ -59,6 +59,18 @@ static int64_t Quant(int64_t v) {
     uint32_t hz = S->quant_hz;
     if (!hz) return v;
     int64_t step = Freq / hz;
+    if (S->quant_lock >= 2) {           // clamp: the clock may run at most quant_lock grid steps ahead of what the last frame marker was served (stalls cannot lengthen a measured frame)
+        if (v < V0) return v;
+        int64_t g = V0 + (v - V0) / step * step;
+        if (!LockOn) return g;
+        EnterCriticalSection(&Cs);
+        int64_t cap = LockServed + (int64_t)S->quant_lock * step, r = g;
+        LARGE_INTEGER rn; R_Qpc(&rn);
+        if (g > cap && rn.QuadPart - LockMarkReal < Freq * 4) r = cap;      // no marker for 4 s of real time (a hung or very long load): let the clock run; any release costs determinism
+        if (r < LockServed) r = LockServed;
+        LeaveCriticalSection(&Cs);
+        return r;
+    }
     if (LockOn) {
         int64_t t = LockBase + (int64_t)(int32_t)(S->frame - LockF0) * step;
         if (!S->paused) {           // no marker for a while (loading, a menu transition): let time run on the grid so nothing stalls
@@ -77,6 +89,15 @@ static int64_t Quant(int64_t v) {
 static void LockAtMarker(uint32_t f, int64_t vnow) {
     if (!S->quant_hz || !S->quant_lock) return;
     int64_t step = Freq / S->quant_hz;
+    if (S->quant_lock >= 2) {
+        int64_t t = Quant(vnow);
+        if (!LockOn) { LockServed = t; MemoryBarrier(); LockOn = 1; return; }
+        EnterCriticalSection(&Cs);
+        if (t > LockServed) LockServed = t;
+        { LARGE_INTEGER mn; R_Qpc(&mn); LockMarkReal = mn.QuadPart; }
+        LeaveCriticalSection(&Cs);
+        return;
+    }
     LARGE_INTEGER n;
     R_Qpc(&n);
     if (!LockOn) {
@@ -244,6 +265,9 @@ static DWORD GameTidList(DWORD* out, DWORD max) {
     return n;
 }
 
+static volatile LONG MarkerTid;                        // diagnosis: the thread that runs the frame markers, and how often each side sleeps / waits
+static volatile LONG ThrCnt[4];                      // other-thread Sleep, other-thread Wait, marker-thread Sleep, marker-thread Wait
+static inline void NoteThr(int wait) { ThrCnt[((LONG)GetCurrentThreadId() == MarkerTid ? 2 : 0) + wait]++; }
 struct SleepSite { uint32_t ret, ms, n; };
 static SleepSite SleepSites[16];                       // diagnosis: the tracked game thread's Sleep calls by call site and duration
 static void NoteSleepSite(uint32_t ret, uint32_t ms) {
@@ -252,17 +276,39 @@ static void NoteSleepSite(uint32_t ret, uint32_t ms) {
         if (!SleepSites[i].ret) { SleepSites[i] = { ret, ms, 1 }; return; }
     }
 }
+// Experiment (Shm::lockstep = N): a background thread that polls in a short Sleep loop is released by the frame marker, N times
+// per frame and one wake at a time, so its work happens at fixed points of the frame instead of whenever the scheduler runs it.
+static HANDLE LsSem;
+static volatile LONG LsEpoch, LsParked;
+static void LockstepWait() {
+    InterlockedIncrement(&LsEpoch);
+    LsParked = 1;
+    MemoryBarrier();
+    R_Wait(LsSem, 100);
+    LsParked = 0;
+}
+static void LockstepRelease(uint32_t n) {
+    for (uint32_t k = 0; k < n && LsParked; k++) {
+        LONG e0 = LsEpoch;
+        ReleaseSemaphore(LsSem, 1, nullptr);
+        LARGE_INTEGER a, b; R_Qpc(&a);
+        while (LsEpoch == e0) { R_Qpc(&b); if (b.QuadPart - a.QuadPart > Freq * 5) return; SwitchToThread(); }
+    }
+}
 static void  WINAPI H_Sleep(DWORD ms) {
     if (ms) NoteSleep();
+    NoteThr(0);
     GThread* g = GateMe();
     if (g) NoteSleepSite((uint32_t)(uintptr_t)__builtin_return_address(0), ms);
     GateEnter(g, true);
-    PreciseWait(ms, [&](DWORD t) { R_Sleep(t); return (DWORD)WAIT_TIMEOUT; });
+    if (S->lockstep && LsSem && ms && ms <= 16 && (LONG)GetCurrentThreadId() != MarkerTid && IsSleeper(GetCurrentThreadId())) LockstepWait();
+    else PreciseWait(ms, [&](DWORD t) { R_Sleep(t); return (DWORD)WAIT_TIMEOUT; });
     GateLeave(g, true);
 }
 static DWORD WINAPI H_Wait(HANDLE h, DWORD ms) {
     GThread* g = GateMe();
     GateEnter(g);
+    NoteThr(1);
     DWORD r = PreciseWait(ms, [&](DWORD t) { return R_Wait(h, t); });
     GateLeave(g);
     return r;
@@ -270,6 +316,7 @@ static DWORD WINAPI H_Wait(HANDLE h, DWORD ms) {
 static DWORD WINAPI H_WaitEx(HANDLE h, DWORD ms, BOOL a) {
     GThread* g = GateMe();
     GateEnter(g);
+    NoteThr(1);
     DWORD r = PreciseWait(ms, [&](DWORD t) { return R_WaitEx(h, t, a); });
     GateLeave(g);
     return r;
@@ -1319,6 +1366,7 @@ static void Hold(Shm* s, uint32_t f) {
     EnterCriticalSection(&Cs);
     VirtBase = frozen;
     RealBase = q.QuadPart;
+    LockMarkReal = q.QuadPart;               // the wait for the host is not a stall
     LeaveCriticalSection(&Cs);
     if (s->mode == M_RECORD) Cur = 0;       // recording starts from a clean frame
     s->paused = 0;
@@ -1331,6 +1379,20 @@ static void Marker(Shm* s) {
     s->frame = f;
     { LARGE_INTEGER qq; R_Qpc(&qq); LockAtMarker(f, VNow(qq.QuadPart)); }     // frame-locked clock: starts at the first marker
     RngCheck();
+    MarkerTid = (LONG)GetCurrentThreadId();
+    if (f < 12288) for (int i = 0; i < 4; i++) s->thr_log[i][f] = (uint16_t)ThrCnt[i];
+    if (s->lockstep) LockstepRelease(s->lockstep);
+    if (s->quant_hz) {      // diagnosis: how many grid steps passed since the previous marker
+        static int64_t prevq;
+        LARGE_INTEGER qq; R_Qpc(&qq);
+        int64_t vn = VNow(qq.QuadPart), step = Freq / s->quant_hz, cur = vn < V0 ? vn : V0 + (vn - V0) / step * step;     // the raw grid time, whatever the clamp serves
+        if (prevq && cur >= prevq) {
+            uint32_t d = (uint32_t)((cur - prevq) / step);
+            s->gap_hist[d > 4 ? 4 : d]++;
+            if (d != 2 && f > 3000 && s->gap_n < 64) s->gap_log[s->gap_n++] = f << 4 | (d > 15 ? 15 : d);
+        }
+        prevq = cur;
+    }
     memcpy((void*)s->px_cnt, PxCnt, sizeof PxCnt);
     memcpy((void*)s->sh_cnt, (const void*)ShC, sizeof ShC);
     if (s->hist_on) HistSample(f);
@@ -1467,6 +1529,7 @@ static void Init() {
     // Clock hooks are optional: a missing import just means that clock stays real.
     InitializeCriticalSection(&Cs);
     InitializeCriticalSection(&ThCs);
+    LsSem = CreateSemaphoreW(nullptr, 0, 1000, nullptr);
     PatchIat(exe, "kernel32.dll", "CreateThread", (void*)H_Ct, &R_Ct);
     LARGE_INTEGER f, q;
     QueryPerformanceFrequency(&f);

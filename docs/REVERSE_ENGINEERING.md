@@ -723,6 +723,32 @@ and 16x in every run (0 of 14 deviated), and a continuous run, a run stopped and
 loads a state midway are identical frame by frame. At 25x 2 of 8 runs landed up to 9 frames early, at 50x always 6 frames
 early (10486), so the editor's fastest speed is now 16x. Boosting the process priority made 50x worse.
 
+Why the fastest speed was still not exact (v0.9.3): the game runs one frame per **2** grid steps (30 logic updates a second), and
+the free-running grid clock lets a stalled thread inflate a frame: `sstest --cmp` now prints how many grid steps lay between
+consecutive frame markers. At 16x, 10-20 markers per run had 3 or more steps (a thread was descheduled for more than the ~1 ms
+a frame lasts in real time; at 32x it was 100-200) and they fall on different frames in every run, so now and then a run
+measured a longer frame near the refill (1 of 6 pairs at 16x was a frame off). Fix (`quant_lock = 2`, default): the clock a
+thread reads may run at most 2 steps ahead of what the last frame marker was served, so the pacer always measures exactly one
+frame, whatever the scheduler does; a pause of more than a second without a marker (loading) is let through. The value served at
+the last marker travels in the savestate (the clamp is released only after 4 s of real time without a marker; a release after
+a game-second of game time let a 20 ms hiccup at 50x jump the clock by 60 frames). Result: the refill lands on 10492 in 12 of
+12 pairs at 16x and 24x in the first measurement (continuous, chunked with saves, chunked with a load: identical), but later
+batches of 10 pairs at 24x showed 2-4 of 20 runs a frame off (always +-1, mostly the first run of a pair), at 32x about 1 pair
+in 8 and at 50x 1 in 8 to 1 in 2 depending on the variant.
+
+What the remaining scatter is: scheduling noise. Not the savestates (the same scatter with them off), not the audio callbacks
+(all swallowed: still scattered, one run landed on 10446), not GetTickCount/GetTickCount64/SleepEx (the game does not call
+them). Counting calls per frame marker (`sstest --cmp ... --variant 3` prints it): the marker thread makes exactly 3 waits
+per frame every time, but its own Sleep polling goes from 0 to 110 calls a frame, and the game's background thread that loops
+on Sleep(8) wakes 2-5 times a frame (about 4.2 on average, totals differing by 50 over 10,000 frames), so its work lands at
+different points of the frame in every run. Running that thread in lockstep (`Shm::lockstep` = N, `sstest --lockstep 4`: the
+frame marker releases it N times per frame and waits for each wake to finish) makes its count a constant 4 per frame and gave
+7 of 8 exact pairs at 50x (against 3 of 8 without), but at 24x it made no measurable difference, so it stays off by default.
+A busy CPU (8 spinning processes next to the game) moves the refill anywhere from 10490 to 10503 at 24x, so what is left is the
+game depending on real-time interleaving of the marker thread, the background thread and the driver. A fully deterministic
+replay at higher speeds would need the threads scheduled by the hook (one runnable game thread at a time); not done. The
+fastest speed stays 24x; run replays on an otherwise idle machine.
+
 Tried and abandoned: a frame-locked clock (time advances only at frame markers). The game terminates itself with exit code
 143 a few seconds in (a timing check in the protection layer, not through the exe's imports).
 

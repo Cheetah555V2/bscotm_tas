@@ -266,7 +266,8 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     s->hist_on = p.hist ? 1 : 0;
     s->features = (p.savestates ? FEAT_SAVESTATE : 0) | (p.drop_callbacks ? FEAT_DROPCB : 0);
     s->quant_hz = p.quant_hz;
-    s->quant_lock = p.quant_lock ? 1 : 0;
+    s->quant_lock = p.quant_lock;
+    s->lockstep = p.lockstep;
 
     STARTUPINFOW si{};
     si.cb = sizeof si;
