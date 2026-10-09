@@ -699,12 +699,32 @@ thread only counts as stopped when it is in its idle `Sleep(8)` loop (`exe+2BDDA
 Remaining: about 1 in 24 early-frame (100) saves still restored badly; saves at frames 400 to 11000 passed in all runs
 made after the change. Per-phase timings of the last save are in `Shm::snap_time` (shown by `tools/sstest`).
 
-### Replay nondeterminism after the stage 1 boss dies (test3.bscotm, around frame 10550-10600)
+### Replays that drift after the stage 1 boss dies (test3.bscotm, around frame 10350-10600)
 
-Not caused by savestates: continuous fast replays disagree with each other, with savestates off, and with a real-time (1x)
-replay. The player is standing still after the boss kill and the stage-clear health refill (9 -> 12) happens at
-different frames. In the same 140 frames of two identical runs the game made 16 vs 20 `SubmitSourceBuffer` calls and
-received 12 vs 16 buffer callbacks: the game's music streaming is driven by XAudio2 callbacks, which arrive on the audio
-thread in real time, so anything in the game that waits for audio events lands on a different frame each run. The
-counters are in `Shm::px_cnt` / `Shm::sh_cnt` (`tools/sstest --cntfrom A --cntto B`). A fix would have to deliver the
-callbacks on a frame schedule instead of by the audio thread (a virtual audio clock).
+After the boss kill the player stands still while the game plays its stage-clear sequence, and the health refill (9 to 12)
+is the first visible step. In v0.9.1 it landed on a different frame depending on how the movie was replayed: about 10350 at
+50x with drawing on, 10560-10600 at 50x with all speed-ups (and a few frames of run-to-run jitter), 10673 at 4x, and a
+real-time run differed again; stopping the game every 50 frames changed it too. Savestates are not the cause (the same
+differences exist with them off), and neither is audio: with every XAudio2 callback swallowed it was identical.
+
+What the game does: the pacer thread decides when to run a frame by measuring elapsed time with `QueryPerformanceCounter`,
+and timers in the stage-clear sequence add up those measured frame times. The hook scaled the clocks by the replay speed,
+and two things made the measured frame times differ from one replay to the next:
+
+1. `Sleep(n)` was shortened to `n/speed` ms rounded up to a whole millisecond, which is 50 ms of game time at 50x (three
+   frames). The frame limiter overslept and the game measured long frames.
+2. At high speed a frame is only a fraction of a millisecond of real time, shorter than normal thread preemption, so the
+   pacer often saw two frame boundaries at once.
+
+Fix (on by default, `RunParams::quant_hz = 60`): the clocks the game reads (QPC, `timeGetTime`, file time) are snapped
+down to a 1/60 s grid, so the time between two frames is an exact multiple of a frame, and waits are exact (the part under
+about 4 ms of real time is polled instead of slept). Result on test3.bscotm: the refill lands on frame 10492 at 1x, 4x, 8x
+and 16x in every run (0 of 14 deviated), and a continuous run, a run stopped and saved every 2000 frames and a run that
+loads a state midway are identical frame by frame. At 25x 2 of 8 runs landed up to 9 frames early, at 50x always 6 frames
+early (10486), so the editor's fastest speed is now 16x. Boosting the process priority made 50x worse.
+
+Tried and abandoned: a frame-locked clock (time advances only at frame markers). The game terminates itself with exit code
+143 a few seconds in (a timing check in the protection layer, not through the exe's imports).
+
+Tools: `tools/sstest --cmp ROW --variant N` compares whole runs (1 = chunked without saves, 2 = real time, 3 = a second
+continuous run) and prints the frame where health goes 9 to 12; `--rngscan`, `--dump` plus `tools/dumpdiff` compare game memory.

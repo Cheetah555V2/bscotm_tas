@@ -1620,7 +1620,7 @@ const HelpTopic HELP_TOPICS[] = {
      L"Resume live (F11): unfreeze the game and take over with the keyboard (not recorded).\r\n"
      L"Stop (F9): end the current run.\r\n\r\n"
      L"Fast-forward\r\n"
-     L"Rewind and the jumps run the game faster than real time. The speed is in Run > Fast-forward speed (default: Max, 50x). The game window may look frozen or garbled while it fast-forwards; audio is garbled too. Only the last frames before the stopping point are drawn.\r\n\r\n"
+     L"Rewind and the jumps run the game faster than real time. The speed is in Run > Fast-forward speed (default: Max, 16x). The game window may look frozen or garbled while it fast-forwards; audio is garbled too. Only the last frames before the stopping point are drawn.\r\n\r\n"
      L"The game window\r\n"
      L"The game accepts the tool's input even when the editor has focus. To type into the game yourself (Record here, Resume live), click the game window first."},
     {L"Frame advance and run",
@@ -1961,7 +1961,7 @@ DWORD WINAPI JobThread(LPVOID a) {
     return 0;
 }
 
-const uint32_t SPEEDS[4] = {1000, 4000, 16000, 50000};
+const uint32_t SPEEDS[4] = {1000, 2000, 8000, 16000};     // 16x is the fastest speed at which the game plays out exactly as in real time (25x was off by up to 9 frames in 2 of 8 runs, 50x always; see docs)
 
 // The parts of a run that do not depend on what it is for: game, hook, saves, prelude and RNG seed.
 bool FillParams(RunParams& p) {
@@ -2063,7 +2063,7 @@ static bool OpenGameProc(GameProc& g, int tries) {            // like AttachGame
 
 static bool VerifyPass(const VerifyArgs& va, uint32_t mask, const wchar_t* label, VerifyRun& out) {
     RunParams p = va.p;
-    p.speed_milli = 50000;
+    p.speed_milli = 16000;
     p.speed_mask = mask;
     p.hold = true;
     p.record = false;
@@ -2080,7 +2080,7 @@ static bool VerifyPass(const VerifyArgs& va, uint32_t mask, const wchar_t* label
     int pos = 1;
     for (int cp : va.cps) {
         if (cp > pos) {
-            if (!ss.BeginSteps(p.movie.data() + pos, (uint32_t)(cp - pos), 50000)) { out.error = "could not run the game"; break; }
+            if (!ss.BeginSteps(p.movie.data() + pos, (uint32_t)(cp - pos), 16000)) { out.error = "could not run the game"; break; }
             int r;
             while (!(r = ss.PollSteps())) {
                 if (A.stop) ss.AbortSteps();
@@ -2606,9 +2606,9 @@ void BuildMenu(HWND w) {
     add(r, IDM_SSINTERVAL, L"Savestate &interval (frames)...");
     A.speedMenu = CreatePopupMenu();
     add(A.speedMenu, IDM_SPEED0, L"Real time (1x)");
-    add(A.speedMenu, IDM_SPEED1, L"4x");
-    add(A.speedMenu, IDM_SPEED2, L"16x");
-    add(A.speedMenu, IDM_SPEED3, L"Max (50x)");
+    add(A.speedMenu, IDM_SPEED1, L"2x");
+    add(A.speedMenu, IDM_SPEED2, L"8x");
+    add(A.speedMenu, IDM_SPEED3, L"Max (16x)");
     AppendMenuW(r, MF_POPUP, (UINT_PTR)A.speedMenu, L"Fast-forward &speed (rewind / record from cursor)");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)f, L"&File");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)e, L"&Edit");

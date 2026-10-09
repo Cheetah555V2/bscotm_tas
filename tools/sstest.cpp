@@ -26,6 +26,8 @@ static void Grab(Session& ss, uint32_t from, std::vector<HistEntry>& out) {
 // After a failed run: where is every thread of the game stopped? (module + offset of eip, and whether it is waiting)
 static void PostMortem(Session& ss) {
     DWORD pid = GetProcessId(ss.proc);
+    DWORD ec = 0;
+    if (GetExitCodeProcess(ss.proc, &ec) && ec != STILL_ACTIVE) printf("  the game process has exited with code 0x%08lX\n", ec);
     printf("  post-mortem of the game (pid %lu), alive=%d, game marker=%u, frame counter=%u:\n", pid, ss.Alive() ? 1 : 0, ss.s->paused, ss.s->frame);
     std::vector<MODULEENTRY32W> mods;
     HANDLE ms = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
@@ -75,6 +77,65 @@ static void Peek(Session& ss, const char* when) {
         else printf("  %s=%u", f.name, f.kind == 0 ? (v & 0xFF) : v);
     }
     printf("\n");
+}
+
+// Dump of the game's writable memory (the arena and the exe's writable sections) for tools/dumpdiff.
+static void WriteBlock(FILE* f, HANDLE proc, uintptr_t base, const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
+    uint32_t b = (uint32_t)base, n = (uint32_t)ranges.size();
+    fwrite(&b, 4, 1, f); fwrite(&n, 4, 1, f);
+    std::vector<uint8_t> buf;
+    for (auto& r : ranges) {
+        fwrite(&r.first, 4, 1, f); fwrite(&r.second, 4, 1, f);
+        buf.resize(r.second);
+        SIZE_T g = 0;
+        if (!ReadProcessMemory(proc, (void*)(base + r.first), buf.data(), r.second, &g)) memset(buf.data(), 0xEE, r.second);
+        fwrite(buf.data(), 1, r.second, f);
+    }
+}
+static bool DumpGame(Session& ss, const char* path) {
+    // the arena: the biggest reserved private allocation
+    uintptr_t abase = 0, asize = 0;
+    MEMORY_BASIC_INFORMATION mi;
+    for (uintptr_t a = 0x10000; a < 0x7FFE0000;) {
+        if (!VirtualQueryEx(ss.proc, (void*)a, &mi, sizeof mi)) break;
+        if (mi.Type == MEM_PRIVATE && mi.AllocationBase == mi.BaseAddress) {
+            uintptr_t total = 0, q = (uintptr_t)mi.BaseAddress;
+            MEMORY_BASIC_INFORMATION m2;
+            while (VirtualQueryEx(ss.proc, (void*)q, &m2, sizeof m2) && m2.AllocationBase == mi.AllocationBase) { total += m2.RegionSize; q += m2.RegionSize; }
+            if (total >= (200u << 20) && total > asize) { abase = (uintptr_t)mi.AllocationBase; asize = total; }
+        }
+        a = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+    }
+    if (!abase) return false;
+    std::vector<std::pair<uint32_t, uint32_t>> ar;
+    for (uintptr_t q = abase; q < abase + asize;) {
+        if (!VirtualQueryEx(ss.proc, (void*)q, &mi, sizeof mi)) break;
+        if (mi.State == MEM_COMMIT && (mi.Protect & PAGE_READWRITE)) ar.push_back({(uint32_t)(q - abase), (uint32_t)mi.RegionSize});
+        q += mi.RegionSize;
+    }
+    HMODULE mods[256]; DWORD need = 0;
+    EnumProcessModules(ss.proc, mods, sizeof mods, &need);
+    uintptr_t ebase = (uintptr_t)mods[0];
+    std::vector<uint8_t> hdr(0x1000);
+    SIZE_T g = 0;
+    ReadProcessMemory(ss.proc, (void*)ebase, hdr.data(), hdr.size(), &g);
+    auto nt = (IMAGE_NT_HEADERS*)(hdr.data() + ((IMAGE_DOS_HEADER*)hdr.data())->e_lfanew);
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    std::vector<std::pair<uint32_t, uint32_t>> er;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_WRITE) || !memcmp(sec->Name, ".bind", 5)) continue;
+        uint32_t n = sec->Misc.VirtualSize > sec->SizeOfRawData ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+        er.push_back({sec->VirtualAddress, (n + 4095) & ~4095u});
+    }
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    uint32_t asz = (uint32_t)asize;
+    fwrite(&asz, 4, 1, f);
+    WriteBlock(f, ss.proc, abase, ar);
+    WriteBlock(f, ss.proc, ebase, er);
+    fclose(f);
+    printf("dumped %zu arena ranges and %zu exe section ranges to %s (arena %08X, exe %08X)\n", ar.size(), er.size(), path, (unsigned)abase, (unsigned)ebase);
+    return true;
 }
 
 
@@ -136,7 +197,7 @@ int wmain(int argc, wchar_t** argv) {
     if (argc < 2) { puts("usage: sstest movie.bscotm --exe X --dll X --baseline X --prelude X [--at N] [--gap N] [--reps N] [--speed N]"); return 2; }
     RunParams p;
     std::wstring moviePath = argv[1], preludePath;
-    uint32_t at = 2000, gap = 300, reps = 3, speed = 50000, altoff = 0, alts = 3, soak = 0, cmpupto = 0, cmpchunk = 2000, cmpvariant = 0, nostates = 0, peekat = 0, cntfrom = 0, cntto = 0;
+    uint32_t at = 2000, gap = 300, reps = 3, speed = 16000, altoff = 0, alts = 3, soak = 0, cmpupto = 0, cmpchunk = 2000, cmpvariant = 0, nostates = 0, peekat = 0, cntfrom = 0, cntto = 0, dropcb = 0, rngscan = 0, maskarg = 0, dumprow = 0, quant = 60, lockarg = 0, loadatarg = 0; std::string dumppath = "dump.bin";
     for (int i = 2; i + 1 < argc; i += 2) {
         std::wstring k = argv[i], v = argv[i + 1];
         if (k == L"--exe") p.exe = v;
@@ -157,6 +218,14 @@ int wmain(int argc, wchar_t** argv) {
         else if (k == L"--peek") peekat = _wtoi(v.c_str());
         else if (k == L"--cntfrom") cntfrom = _wtoi(v.c_str());
         else if (k == L"--cntto") cntto = _wtoi(v.c_str());
+        else if (k == L"--dropcb") dropcb = _wtoi(v.c_str());
+        else if (k == L"--rngscan") rngscan = _wtoi(v.c_str());
+        else if (k == L"--mask") maskarg = _wtoi(v.c_str());
+        else if (k == L"--quant") quant = _wtoi(v.c_str());
+        else if (k == L"--lock") lockarg = _wtoi(v.c_str());
+        else if (k == L"--loadat") loadatarg = _wtoi(v.c_str());
+        else if (k == L"--dump") dumprow = _wtoi(v.c_str());
+        else if (k == L"--dumpfile") { char b[512]; WideCharToMultiByte(CP_ACP, 0, v.c_str(), -1, b, 512, nullptr, nullptr); dumppath = b; }
     }
     std::string err;
     Movie m;
@@ -173,10 +242,13 @@ int wmain(int argc, wchar_t** argv) {
     p.hold = true;
     p.target = 1;
     p.savestates = !nostates;
+    p.drop_callbacks = dropcb != 0;
+    p.quant_hz = quant;
+    p.quant_lock = lockarg != 0;
     p.hist = true;
     p.speed_milli = speed;
-    p.speed_mask = SPEED_ALL;
-    if (!soak && !cmpupto && !peekat && !cntto && at + gap + 1 >= p.movie.size()) { puts("movie too short for --at + --gap"); return 2; }
+    p.speed_mask = maskarg ? (uint32_t)maskarg : SPEED_ALL;
+    if (!soak && !cmpupto && !peekat && !cntto && !rngscan && !dumprow && at + gap + 1 >= p.movie.size()) { puts("movie too short for --at + --gap"); return 2; }
 
     if (cmpupto) {      // determinism of the editor's way of running: continuous vs in chunks with states vs with a load in the middle
         struct Run { std::vector<HistEntry> h; bool ok = false; };
@@ -215,11 +287,16 @@ int wmain(int argc, wchar_t** argv) {
             KillGame();
             r.ok = true;
             printf("%s: %zu samples\n", name, r.h.size());
+            {   // when does health first become 12 after row 10000? (the stage-clear refill)
+                uint32_t prev = 0, at12 = 0;
+                for (const auto& e : r.h) { if (e.frame > 10000 + p.prelude.size() && prev == 9 && e.v[0] == 12) { at12 = e.frame; break; } prev = e.v[0]; }
+                printf("%s: health 9 -> 12 at marker %u\n", name, at12);
+            }
             return r;
         };
         Run a = once("continuous", 0, 0);
         Run b = a.ok ? (cmpvariant == 1 ? once("chunked, NO saves", cmpchunk, 0, 0, true) : cmpvariant == 3 ? once("continuous fast, second run", 0, 0) : cmpvariant == 2 ? once("continuous REAL TIME 1x", 0, 0, 1000) : once("chunked+saves", cmpchunk, 0)) : Run();
-        Run c = (b.ok && cmpvariant == 0) ? once("chunked+load", cmpchunk, cmpupto / 2) : Run();
+        Run c = (b.ok && cmpvariant == 0) ? once("chunked+load", cmpchunk, loadatarg ? loadatarg : cmpupto / 2) : Run();
         auto diff = [&](const char* what, const Run& x, const Run& y) {
             bool same;
             size_t ok = Compare(x.h, y.h, same);
@@ -236,6 +313,30 @@ int wmain(int argc, wchar_t** argv) {
     RunResult rr = RunJob(p, cb, &ss);
     if (!rr.ok || !ss.Active()) { printf("launch failed: %s\n", rr.error.c_str()); return 1; }
     printf("game frozen at row %u, arena %s\n", ss.Row(), (ss.s->features & FEAT_ARENA_OK) ? "ok" : "NOT ok");
+
+    if (dumprow) {
+        if (!RunTo(ss, p.movie, dumprow, speed)) { puts("FAIL"); ss.Close(); KillGame(); return 1; }
+        DumpGame(ss, dumppath.c_str());
+        ss.Close();
+        KillGame();
+        return 0;
+    }
+
+    if (rngscan) {      // RNG state and health at rows rngscan, +step, ... up to cntto
+        for (uint32_t row = rngscan; row <= cntto; row += cntfrom ? cntfrom : 25) {
+            if (!RunTo(ss, p.movie, row, speed)) { puts("FAIL"); break; }
+            HMODULE mods[256]; DWORD need = 0; uintptr_t base = 0;
+            if (EnumProcessModules(ss.proc, mods, sizeof mods, &need) && need) base = (uintptr_t)mods[0];
+            auto rd = [&](uintptr_t a, uint32_t& v) { SIZE_T g = 0; return ReadProcessMemory(ss.proc, (void*)a, &v, 4, &g) && g == 4; };
+            uint32_t m = 0, rx = 0, ry = 0, rz = 0, rw = 0;
+            if (rd(base + 0x48365C, m) && m) { rd(m + 0x2F4, rx); rd(m + 0x2F8, ry); rd(m + 0x2FC, rz); rd(m + 0x300, rw); }
+            uint32_t hp = ss.s->hist_n ? ss.s->hist_buf[(ss.s->hist_n - 1) % HIST_MAX].v[0] : 0;
+            printf("row %u: rng %08X %08X %08X %08X  hp %u\n", row, rx, ry, rz, rw, hp);
+        }
+        ss.Close();
+        KillGame();
+        return 0;
+    }
 
     if (cntto) {        // which XAudio2 methods does the game call, and which callbacks arrive, between two rows?
         static const char* PXN[29] = {"GetVoiceDetails", "SetOutputVoices", "SetEffectChain", "EnableEffect", "DisableEffect", "GetEffectState", "SetEffectParameters",
@@ -259,7 +360,7 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     if (peekat) {       // what would the Memory window show?
-        if (!RunTo(ss, p.movie, peekat, speed)) { puts("FAIL: running"); ss.Close(); KillGame(); return 1; }
+        if (!RunTo(ss, p.movie, peekat, speed)) { printf("FAIL: running (game marker %u)\n", ss.s->frame); PostMortem(ss); ss.Close(); KillGame(); return 1; }
         Peek(ss, "at the stopping point");
         if (!nostates) {
             if (!ss.SaveState(0)) { puts("FAIL: SaveState"); ss.Close(); KillGame(); return 1; }

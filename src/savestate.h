@@ -187,6 +187,7 @@ struct Slot {
     uint32_t fs0 = 0;
     uint32_t frame_before = 0;
     int64_t virt = 0;
+    int64_t aux[2] = {};                    // the hook's frame-locked clock state at the save (LockBase, LockServed)
     ThreadRec th[MAX_THREADS];
     int nth = 0;
     uint8_t* tmem = nullptr;
@@ -194,6 +195,7 @@ struct Slot {
 };
 static Slot Slots[MAX_SLOTS];
 static int LastSlot = -1;                   // the most recently saved or loaded slot: the next save is compared with it
+static int64_t Aux[2];                       // set by the hook just before Save; stored in the slot
 static volatile uint32_t* Stats;             // -> Shm::snap_stats
 static volatile uint32_t* Times;             // -> Shm::snap_time
 
@@ -387,6 +389,7 @@ static bool Save(int slot, int64_t virt, uint32_t frame_before) {
     sn.fs0 = __readfsdword(0);
     sn.frame_before = frame_before;
     sn.virt = virt;
+    sn.aux[0] = Aux[0]; sn.aux[1] = Aux[1];
     sn.valid = true;
     LastSlot = slot;
     return true;

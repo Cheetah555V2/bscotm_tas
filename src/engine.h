@@ -18,6 +18,9 @@ struct RunParams {
     bool record = false;        // after `target` frames, keep recording until stopped
     bool hold = false;          // after `target` frames, freeze the game for frame advance
     bool savestates = false;    // give the game a private heap so SaveState/LoadState work
+    bool drop_callbacks = false;    // diagnosis: swallow every XAudio2 callback (needs savestates: the callbacks go through the hook's shims)
+    uint32_t quant_hz = 60;          // snap the game's clocks to 1/quant_hz s (60 = one frame): makes timer-driven events land on the same frame at any speed
+    bool quant_lock = false;        // experimental: time advances only at frame markers (the game terminates itself a few seconds in)
     uint32_t speed_milli = 1000;    // clock speed while replaying (1000 = 1x)
     uint32_t speed_mask = 31;       // SPEED_* clocks that run at that speed
     bool seeded = false;            // the game sees a frozen clock at Unix time `seed` (its RNG seed)
