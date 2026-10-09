@@ -48,9 +48,53 @@ static int64_t VNow(int64_t real) {
     return v;
 }
 
+// With Shm::quant_hz set, the clocks the game reads are made independent of thread scheduling. Until the first frame
+// marker they are snapped down to a grid of 1/quant_hz s; from then on time is frame-locked: it advances only at frame
+// markers, by exactly one grid step each, so the time the game measures between two frames is the same on every run,
+// at every speed, with or without pauses. (A pure function of the frame number, so a savestate load gives the same clock.)
+static volatile LONG LockOn;
+static int64_t LockBase, LockServed, LockMarkReal;
+static uint32_t LockF0;
+static int64_t Quant(int64_t v) {
+    uint32_t hz = S->quant_hz;
+    if (!hz) return v;
+    int64_t step = Freq / hz;
+    if (LockOn) {
+        int64_t t = LockBase + (int64_t)(int32_t)(S->frame - LockF0) * step;
+        if (!S->paused) {           // no marker for a while (loading, a menu transition): let time run on the grid so nothing stalls
+            LARGE_INTEGER n;
+            R_Qpc(&n);
+            int64_t since = n.QuadPart - LockMarkReal, grace = Freq / 33;
+            if (since > grace) t += (since - grace) * Speed() / 1000 / step * step;
+        }
+        if (t < LockServed) t = LockServed; else LockServed = t;
+        return t;
+    }
+    if (v < V0) return v;
+    return V0 + (v - V0) / step * step;
+}
+// At every frame marker: start the frame-locked clock at the first one; later keep it from running behind what the game was told.
+static void LockAtMarker(uint32_t f, int64_t vnow) {
+    if (!S->quant_hz || !S->quant_lock) return;
+    int64_t step = Freq / S->quant_hz;
+    LARGE_INTEGER n;
+    R_Qpc(&n);
+    if (!LockOn) {
+        LockBase = V0 + (vnow - V0) / step * step;
+        LockF0 = f;
+        LockServed = LockBase;
+        LockMarkReal = n.QuadPart;
+        MemoryBarrier();
+        LockOn = 1;
+        return;
+    }
+    int64_t t = LockBase + (int64_t)(int32_t)(f - LockF0) * step;
+    if (LockServed > t) LockBase += (LockServed - t + step - 1) / step * step;     // time never runs backwards
+    LockMarkReal = n.QuadPart;
+}
 static BOOL WINAPI H_Qpc(LARGE_INTEGER* o) {
     BOOL r = R_Qpc(o);
-    if (r && (S->speed_mask & SPEED_QPC)) o->QuadPart = VNow(o->QuadPart);
+    if (r && (S->speed_mask & SPEED_QPC)) o->QuadPart = Quant(VNow(o->QuadPart));
     return r;
 }
 
@@ -59,7 +103,7 @@ static DWORD WINAPI H_Tgt() {
     if (!(S->speed_mask & SPEED_MMTIME)) return r;
     LARGE_INTEGER q;
     R_Qpc(&q);
-    return T0ms + (DWORD)((VNow(q.QuadPart) - V0) * 1000 / Freq);
+    return T0ms + (DWORD)((Quant(VNow(q.QuadPart)) - V0) * 1000 / Freq);
 }
 
 // RNG seed: the game seeds its generator from the Unix time at launch. Its static C runtime reads the
@@ -84,7 +128,7 @@ static void WINAPI H_Ft(FILETIME* f) {
     if (!(S->speed_mask & SPEED_FILETIME)) return;
     LARGE_INTEGER q;
     R_Qpc(&q);
-    uint64_t t = Ft0 + (uint64_t)((VNow(q.QuadPart) - V0) * 10000000 / Freq);
+    uint64_t t = Ft0 + (uint64_t)((Quant(VNow(q.QuadPart)) - V0) * 10000000 / Freq);
     f->dwLowDateTime = (DWORD)t;
     f->dwHighDateTime = (DWORD)(t >> 32);
 }
@@ -95,6 +139,34 @@ static DWORD Shorten(DWORD ms) {
     if (sp <= 1000) return ms;
     DWORD n = (DWORD)((uint64_t)ms * 1000 / sp);
     return n ? n : 1;
+}
+
+// Exact scaled waits. At speed s a game wait of `ms` should take ms/s of real time. Rounding that up to whole
+// milliseconds (Sleep(1)) would be 50 ms of game time at 50x, i.e. several frames, and the game would measure
+// those frames as long: timers that add up the measured frame time would run fast. So the time left under ~4 ms of real time is
+// waited for by polling instead of sleeping.
+static bool PreciseTarget(DWORD ms, int64_t& target) {
+    if (!(S->speed_mask & SPEED_SLEEP) || !ms || ms == INFINITE) return false;
+    uint32_t sp = Speed();
+    if (sp <= 1000) return false;
+    LARGE_INTEGER n;
+    R_Qpc(&n);
+    target = n.QuadPart + (int64_t)ms * Freq / sp;
+    return true;
+}
+template <class F> static DWORD PreciseWait(DWORD ms, F wait) {
+    int64_t tgt;
+    if (!PreciseTarget(ms, tgt)) return wait(ms);
+    for (;;) {
+        LARGE_INTEGER n;
+        R_Qpc(&n);
+        int64_t rem = tgt - n.QuadPart;
+        if (rem <= 0) return wait(0);                  // a last look: WAIT_TIMEOUT if still not signalled
+        DWORD slice = rem > Freq / 250 ? (DWORD)(rem * 1000 / Freq) - 1 : 0;      // more than 4 ms left: block for most of it
+        DWORD r = wait(slice);
+        if (r != WAIT_TIMEOUT) return r;
+        if (!slice) SwitchToThread();
+    }
 }
 
 // Threads that poll in a Sleep loop (the game has one that does Sleep(8) for its whole life) are counted
@@ -134,12 +206,13 @@ static GThread* GateMe() {
     return nullptr;
 }
 static inline void GateEnter(GThread* g, bool quiet = false) { if (g) { g->quiet = quiet; g->idle = 1; MemoryBarrier(); } }
-static void GateLeave(GThread* g) {          // about to run game code again
+static void GateLeave(GThread* g, bool quiet = false) {          // about to run game code again; quiet: it came out of a plain Sleep
     if (!g) return;
     for (;;) {
         g->idle = 0; g->quiet = 0;
         MemoryBarrier();
         if (!GateClosed) return;
+        g->quiet = quiet;                     // parked in the gate: as quiet as the call it came out of (a thread that woke from Sleep(8) is between jobs)
         g->idle = 1;
         MemoryBarrier();
         while (GateClosed) Sleep(1);
@@ -184,20 +257,20 @@ static void  WINAPI H_Sleep(DWORD ms) {
     GThread* g = GateMe();
     if (g) NoteSleepSite((uint32_t)(uintptr_t)__builtin_return_address(0), ms);
     GateEnter(g, true);
-    R_Sleep(Shorten(ms));
-    GateLeave(g);
+    PreciseWait(ms, [&](DWORD t) { R_Sleep(t); return (DWORD)WAIT_TIMEOUT; });
+    GateLeave(g, true);
 }
 static DWORD WINAPI H_Wait(HANDLE h, DWORD ms) {
     GThread* g = GateMe();
     GateEnter(g);
-    DWORD r = R_Wait(h, Shorten(ms));
+    DWORD r = PreciseWait(ms, [&](DWORD t) { return R_Wait(h, t); });
     GateLeave(g);
     return r;
 }
 static DWORD WINAPI H_WaitEx(HANDLE h, DWORD ms, BOOL a) {
     GThread* g = GateMe();
     GateEnter(g);
-    DWORD r = R_WaitEx(h, Shorten(ms), a);
+    DWORD r = PreciseWait(ms, [&](DWORD t) { return R_WaitEx(h, t, a); });
     GateLeave(g);
     return r;
 }
@@ -791,8 +864,11 @@ static HRESULT (WINAPI *R_CoCreate)(const GUID&, LPUNKNOWN, DWORD, const GUID&, 
     X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28)
 #define PX_DECL(n) extern "C" void px##n() __asm__("_bscotm_px" #n);
 #define PX_ADDR(n) (void*)px##n,
-#define PX_DEF(n) __asm__(".text\n.globl _bscotm_px" #n "\n_bscotm_px" #n ":\n" \
+#define PX_DEF(n) __asm__(".text\n.globl _bscotm_px" #n "\n_bscotm_px" #n ":\n    lock incl _bscotm_pxcnt+" #n "*4\n" \
     "    mov 4(%esp), %eax\n    mov 4(%eax), %eax\n    mov %eax, 4(%esp)\n    mov (%eax), %eax\n    jmp *" #n "*4(%eax)\n");
+extern "C" uint32_t PxCnt[32] __asm__("_bscotm_pxcnt");
+uint32_t PxCnt[32];
+static volatile uint32_t ShC[8];                       // diagnosis: callbacks received by the shims, by method
 PX_LIST(PX_DECL)
 PX_LIST(PX_DEF)
 static void* ProxyVt[29] = { PX_LIST(PX_ADDR) };
@@ -808,16 +884,16 @@ static volatile LONG XaOverflow;             // voices handed out untracked beca
 static volatile LONG XaLost;                 // voices that existed at a save but could not be brought back by a restore
 static volatile LONG ShimCalls, ShimForwarded;
 #define SH_BEGIN XaVoice* v = (XaVoice*)s->owner; InterlockedIncrement(&ShimCalls); InterlockedIncrement(&v->inflight); MemoryBarrier(); \
-                 void* cb = v->cb; bool ok = v->cb_alive && !XaCbGate && cb;
+                 void* cb = v->cb; bool ok = v->cb_alive && !XaCbGate && cb && !(S->features & FEAT_DROPCB);
 #define SH_END   if (ok) InterlockedIncrement(&ShimForwarded); InterlockedDecrement(&v->inflight);
 #define SH_VT(i) (*(void***)cb)[i]
-static void __stdcall Sh0(XaShimT* s, UINT32 n)       { SH_BEGIN if (ok) ((void (__stdcall*)(void*, UINT32))SH_VT(0))(cb, n); SH_END }
-static void __stdcall Sh1(XaShimT* s)                 { SH_BEGIN if (ok) ((void (__stdcall*)(void*))SH_VT(1))(cb); SH_END }
-static void __stdcall Sh2(XaShimT* s)                 { SH_BEGIN if (ok) ((void (__stdcall*)(void*))SH_VT(2))(cb); SH_END }
-static void __stdcall Sh3(XaShimT* s, void* c)        { SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(3))(cb, c); SH_END }
-static void __stdcall Sh4(XaShimT* s, void* c)        { SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(4))(cb, c); SH_END }
-static void __stdcall Sh5(XaShimT* s, void* c)        { SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(5))(cb, c); SH_END }
-static void __stdcall Sh6(XaShimT* s, void* c, HRESULT hr) { SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*, HRESULT))SH_VT(6))(cb, c, hr); SH_END }
+static void __stdcall Sh0(XaShimT* s, UINT32 n)       { ShC[0]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*, UINT32))SH_VT(0))(cb, n); SH_END }
+static void __stdcall Sh1(XaShimT* s)                 { ShC[1]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*))SH_VT(1))(cb); SH_END }
+static void __stdcall Sh2(XaShimT* s)                 { ShC[2]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*))SH_VT(2))(cb); SH_END }
+static void __stdcall Sh3(XaShimT* s, void* c)        { ShC[3]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(3))(cb, c); SH_END }
+static void __stdcall Sh4(XaShimT* s, void* c)        { ShC[4]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(4))(cb, c); SH_END }
+static void __stdcall Sh5(XaShimT* s, void* c)        { ShC[5]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(5))(cb, c); SH_END }
+static void __stdcall Sh6(XaShimT* s, void* c, HRESULT hr) { ShC[6]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*, HRESULT))SH_VT(6))(cb, c, hr); SH_END }
 static void* ShimVt[7] = { (void*)Sh0, (void*)Sh1, (void*)Sh2, (void*)Sh3, (void*)Sh4, (void*)Sh5, (void*)Sh6 };
 
 static void XaWaitIdle(XaVoice* v) {
@@ -1123,12 +1199,17 @@ static void XaBeforeRestore(int slot) {
 // ---- savestate commands (handled while the game is held at a marker) ---------------
 // After the memory is put back, this fixes up the hook's own state and the game re-enters the
 // poll call from its first instruction, so the marker is handled again and the game freezes
+static int64_t RestoreVirt;
+static bool RestoreVirtOn;
 // at the same marker it was saved at.
 static void SnapAfterCopy(const snap::Slot& sn) {
     Shm* s = S;
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     VirtBase = sn.virt;
+    RestoreVirt = sn.virt; RestoreVirtOn = true;     // the freeze that follows must not let time run on (it would shift the 1/60 s grid)
+    LockBase = sn.aux[0]; LockServed = sn.aux[1];     // the frame-locked clock continues from the saved moment
+    { LARGE_INTEGER lq; R_Qpc(&lq); LockMarkReal = lq.QuadPart; }
     RealBase = q.QuadPart;
     CurSpeed = 1000;
     s->speed_milli = 1000;
@@ -1188,6 +1269,7 @@ static void HandleSnap(Shm* s, uint32_t f, int64_t frozen) {
         DWORD hp0 = GetTickCount();
         XaPause();
         DWORD hp1 = GetTickCount();
+        snap::Aux[0] = LockBase; snap::Aux[1] = LockServed;
         bool ok = snap::Save((int)slot, frozen, f - 1);
         DWORD hp2 = GetTickCount();
         if (ok) WriteThreadInfo();
@@ -1225,6 +1307,7 @@ static void Hold(Shm* s, uint32_t f) {
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     int64_t frozen = VNow(q.QuadPart);
+    if (RestoreVirtOn) { frozen = RestoreVirt; RestoreVirtOn = false; }     // right after a load the game is frozen at exactly the saved time
     s->paused = f;
     while (s->hold) {
         if (s->snap_cmd) HandleSnap(s, f, frozen);
@@ -1246,7 +1329,10 @@ static void Marker(Shm* s) {
     JoinThreads();
     uint32_t f = s->frame + 1;
     s->frame = f;
+    { LARGE_INTEGER qq; R_Qpc(&qq); LockAtMarker(f, VNow(qq.QuadPart)); }     // frame-locked clock: starts at the first marker
     RngCheck();
+    memcpy((void*)s->px_cnt, PxCnt, sizeof PxCnt);
+    memcpy((void*)s->sh_cnt, (const void*)ShC, sizeof ShC);
     if (s->hist_on) HistSample(f);
     if (s->mode == M_RECORD) {
         if (s->armed && s->rec_count < MAX_FRAMES) s->keys[s->rec_count++] = (uint16_t)Cur;
@@ -1297,6 +1383,28 @@ static __attribute__((noinline, used)) SHORT WINAPI H_Gaks(int vk) {
 }
 
 // ---- IAT patching ------------------------------------------------------------
+// Diagnosis: who ends the game process, and from where? -> %TEMP%\bscotm_exit.txt
+static VOID (WINAPI *R_ExitProcess)(UINT);
+static BOOL (WINAPI *R_TermProcess)(HANDLE, UINT);
+static void LogExit(const char* what, UINT code, HANDLE target) {
+    char path[MAX_PATH + 32], b[300];
+    GetTempPathA(MAX_PATH, path);
+    strcat(path, "bscotm_exit.txt");
+    HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w;
+    uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+    uintptr_t* sp = (uintptr_t*)__builtin_frame_address(0);
+    wsprintfA(b, "%s(code %u, target %p) tid %lu marker %u virt-locked %d\r\n", what, code, (void*)target, GetCurrentThreadId(), S ? S->frame : 0, (int)LockOn);
+    WriteFile(f, b, lstrlenA(b), &w, nullptr);
+    for (int i = 0; i < 48; i++) {
+        uintptr_t v = sp[i];
+        if (v >= base && v < base + 0x800000) { wsprintfA(b, "  [sp+%02X] exe+%X\r\n", i * 4, (unsigned)(v - base)); WriteFile(f, b, lstrlenA(b), &w, nullptr); }
+    }
+    CloseHandle(f);
+}
+static VOID WINAPI H_ExitProcess(UINT c) { LogExit("ExitProcess", c, GetCurrentProcess()); R_ExitProcess(c); }
+static BOOL WINAPI H_TermProcess(HANDLE h, UINT c) { if (h == GetCurrentProcess() || GetProcessId(h) == GetCurrentProcessId()) LogExit("TerminateProcess", c, h); return R_TermProcess(h, c); }
 static bool PatchIat(HMODULE m, const char* dll, const char* fn, void* hook, void* real_out) {
     BYTE* base = (BYTE*)m;
     auto nt  = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
@@ -1374,6 +1482,8 @@ static void Init() {
         PatchIat(exe, "winmm.dll", "timeGetTime", (void*)H_Tgt, &R_Tgt);
         PatchIat(exe, "kernel32.dll", "GetSystemTimeAsFileTime", (void*)H_Ft, &R_Ft);
         PatchIat(exe, "kernel32.dll", "Sleep", (void*)H_Sleep, &R_Sleep);
+        PatchIat(exe, "kernel32.dll", "ExitProcess", (void*)H_ExitProcess, &R_ExitProcess);
+        PatchIat(exe, "kernel32.dll", "TerminateProcess", (void*)H_TermProcess, &R_TermProcess);
         PatchIat(exe, "kernel32.dll", "WaitForSingleObject", (void*)H_Wait, &R_Wait);
         PatchIat(exe, "kernel32.dll", "WaitForSingleObjectEx", (void*)H_WaitEx, &R_WaitEx);
     }

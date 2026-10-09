@@ -25,7 +25,7 @@ static const uint32_t POLL_RET_RVA = 0x2A5960;
 enum Mode   : uint32_t { M_IDLE = 0, M_RECORD = 1, M_PLAY = 2 };
 enum Status : uint32_t { ST_HOOKED = 1, ST_PLAY_END = 2, ST_RESUMED = 4, ST_HOOK_FAIL = 8, ST_NORENDER_BAD = 16 };
 
-enum Feature : uint32_t { FEAT_SAVESTATE = 1, FEAT_ARENA_OK = 2, FEAT_ARENA_FAIL = 4 };
+enum Feature : uint32_t { FEAT_SAVESTATE = 1, FEAT_ARENA_OK = 2, FEAT_ARENA_FAIL = 4, FEAT_DROPCB = 8 };
 
 // Clocks the hook can speed up (it patches COTM.exe's own imports of these).
 enum SpeedMask : uint32_t {
@@ -94,5 +94,9 @@ struct Shm {
     volatile uint32_t snap_diag[8]; // hook -> host: [0] threads captured at the last save, [1] restored at the last load, [2] mismatched (skipped), [3] missing, [4]/[5] first mismatch saved/now eip
     volatile uint32_t snap_stats[4];    // hook -> host, per save: [0] pages in the pool, [1] pages that had to be copied, [2] pages in the state, [3] pool pages free
     volatile uint32_t snap_time[8];     // hook -> host, ms per phase of the last save: [0] engine pause, [1] park threads, [2] compare pages, [3] reserve pool, [4] open+freeze, [5] copy, [6] total in Save, [7] engine resume
+    volatile uint32_t quant_hz;         // host -> hook: snap the clocks the game reads to a grid of 1/quant_hz s (0 = off)
+    volatile uint32_t quant_lock;       // host -> hook: with quant_hz, also lock time to the frame markers (experimental: the game exits with code 143)
+    volatile uint32_t px_cnt[32];       // diagnosis: calls the game made on its XAudio2 source voices, by vtable slot
+    volatile uint32_t sh_cnt[8];        // diagnosis: callbacks XAudio2 delivered, by IXAudio2VoiceCallback method
     uint16_t keys[MAX_FRAMES];
 };

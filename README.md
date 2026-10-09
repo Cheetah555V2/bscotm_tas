@@ -26,7 +26,7 @@ back. The whole tool is two small native files (no Python, no Frida):
   (`QueryPerformanceCounter`, `timeGetTime`, `GetSystemTimeAsFileTime`, `Sleep`,
   `WaitForSingleObject`, again through the game's own import slots) and drops
   vsync when the D3D9 device is created. Both are needed: the game paces itself on
-  QPC *and* vsync. Frames stay deterministic (same end state at 1x and 50x), and
+  QPC *and* vsync. Frames stay deterministic (same end state at 1x and 16x; the clocks the game reads are snapped to a 1/60 s grid, see the docs), and
   the hook returns to real time exactly on the frame the replay ends. While
   fast-forwarding it also skips drawing (D3D `Present`/`Clear`/`Draw*` return at once,
   except for the last 2 frames so the frozen picture is real) and answers the game's
@@ -137,7 +137,7 @@ next advance first replays to the greenzone edge, then steps. Stepping forward o
 to go back, move the cursor and Rewind (it replays from frame 1 at speed).
 
 Rewind and Record from cursor fast-forward at the speed chosen in
-**Run > Fast-forward speed** (default Max, 50x: a 1461-frame prelude takes about
+**Run > Fast-forward speed** (default Max, 16x: a 1461-frame prelude takes about
 5 s instead of 26 s). Audio is garbled while fast-forwarding.
 
 **Baseline** is a snapshot of the game's save files restored before every
