@@ -195,6 +195,7 @@ struct Slot {
 static Slot Slots[MAX_SLOTS];
 static int LastSlot = -1;                   // the most recently saved or loaded slot: the next save is compared with it
 static volatile uint32_t* Stats;             // -> Shm::snap_stats
+static volatile uint32_t* Times;             // -> Shm::snap_time
 
 static void FindSections(HMODULE exe) {
     BYTE* base = (BYTE*)exe;
@@ -293,7 +294,20 @@ static bool Save(int slot, int64_t virt, uint32_t frame_before) {
         return nullptr;
     };
     const Slot* prev = (LastSlot >= 0 && Slots[LastSlot].valid) ? &Slots[LastSlot] : nullptr;
-    if (ParkHook) ParkHook();
+    DWORD tm0 = GetTickCount();
+    if (ParkHook && !ParkHook()) {              // a game thread is in the middle of a job: do not save a half-finished moment
+        if (UnparkHook) UnparkHook();
+        VirtualFree(newtab, 0, MEM_RELEASE);
+        return false;
+    }
+    DWORD tm1 = GetTickCount();
+    if (tm1 - tm0 > 20) {                          // stopping the threads took a while: the game is busy (loading), its jobs are half done
+        if (Times) Times[1] = tm1 - tm0;
+        if (Diag) Diag[0] = 0xFFFFFFFFu;
+        if (UnparkHook) UnparkHook();
+        VirtualFree(newtab, 0, MEM_RELEASE);
+        return false;
+    }
     uint32_t need = 0;
     for (uint32_t i = 0; i < npg; i++) {
         uint32_t len;
@@ -301,9 +315,12 @@ static bool Save(int slot, int64_t virt, uint32_t frame_before) {
         chg[i] = !(prev && i < prev->npg && !memcmp(p, Ptr(prev->pg[i]), len));
         need += chg[i];
     }
+    DWORD tm2 = GetTickCount();
     if (!Reserve(need + 16)) { if (UnparkHook) UnparkHook(); VirtualFree(newtab, 0, MEM_RELEASE); return false; }
+    DWORD tm3 = GetTickCount();
     Open();
     Freeze();
+    DWORD tm4 = GetTickCount();
     uint32_t built = 0;
     for (; built < npg; built++) {
         uint32_t len;
@@ -321,6 +338,7 @@ static bool Save(int slot, int64_t virt, uint32_t frame_before) {
         VirtualFree(newtab, 0, MEM_RELEASE);
         return false;
     }
+    DWORD tm5 = GetTickCount();
     memcpy(sn.mem, (void*)esp, ssz);
     uint32_t* oldtab = sn.pg;
     uint32_t oldn = sn.npg;
@@ -328,6 +346,7 @@ static bool Save(int slot, int64_t virt, uint32_t frame_before) {
     sn.pg = newtab;
     sn.npg = npg;
     if (Stats) { Stats[0] = InUse; Stats[1] = need; Stats[2] = npg; Stats[3] = NFree; }
+    if (Times) { Times[1] = tm1 - tm0; Times[2] = tm2 - tm1; Times[3] = tm3 - tm2; Times[4] = tm4 - tm3; Times[5] = tm5 - tm4; }
     sn.nth = 0;
     if (GameTids && sn.tmem) {
         DWORD tids[MAX_THREADS];

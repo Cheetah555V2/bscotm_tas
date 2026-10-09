@@ -689,3 +689,12 @@ same procedure (step 1 to find the HP series, step 2 to get the object and its v
 
 Not everything with HP at +0x3DC is an enemy: a generic scan for "vtable object with HP <= max HP at
 +0x3DC/+0x3E0" finds hundreds of unrelated objects (UI and effect classes), so a known vtable is required.
+
+### Saving while the game is loading (found after v0.9.0)
+
+A save made while the game is busy (stage assets loading) was restored wrongly in about one run in three at frame 100.
+Every failing run had a long "park the game's threads" phase (140-310 ms); every passing run had 0. The hook now
+refuses such a save (stopping the threads took more than ~20 ms), the host retries a few times 250 ms apart, and a
+thread only counts as stopped when it is in its idle `Sleep(8)` loop (`exe+2BDDAC`), not in an arbitrary wait.
+Remaining: about 1 in 24 early-frame (100) saves still restored badly; saves at frames 400 to 11000 passed in all runs
+made after the change. Per-phase timings of the last save are in `Shm::snap_time` (shown by `tools/sstest`).

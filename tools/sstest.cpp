@@ -22,6 +22,36 @@ static void Grab(Session& ss, uint32_t from, std::vector<HistEntry>& out) {
 }
 
 // Runs from the current row to `row`. 1 = ok, 0 = failed (the game stopped answering).
+#include <tlhelp32.h>
+// After a failed run: where is every thread of the game stopped? (module + offset of eip, and whether it is waiting)
+static void PostMortem(Session& ss) {
+    DWORD pid = GetProcessId(ss.proc);
+    printf("  post-mortem of the game (pid %lu), alive=%d, game marker=%u, frame counter=%u:\n", pid, ss.Alive() ? 1 : 0, ss.s->paused, ss.s->frame);
+    std::vector<MODULEENTRY32W> mods;
+    HANDLE ms = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (ms != INVALID_HANDLE_VALUE) { MODULEENTRY32W me{sizeof me}; for (BOOL ok = Module32FirstW(ms, &me); ok; ok = Module32NextW(ms, &me)) mods.push_back(me); CloseHandle(ms); }
+    HANDLE ts = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (ts == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{sizeof te};
+    for (BOOL ok = Thread32First(ts, &te); ok; ok = Thread32Next(ts, &te)) {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        SuspendThread(h);
+        CONTEXT c{};
+        c.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext(h, &c)) {
+            std::wstring where = L"?";
+            for (auto& m : mods) if (c.Eip >= (DWORD)(uintptr_t)m.modBaseAddr && c.Eip < (DWORD)(uintptr_t)m.modBaseAddr + m.modBaseSize) {
+                wchar_t b[300]; swprintf(b, 300, L"%ls+%X", m.szModule, (unsigned)(c.Eip - (DWORD)(uintptr_t)m.modBaseAddr)); where = b;
+            }
+            wprintf(L"    tid %5lu eip %08X  %ls\n", te.th32ThreadID, (unsigned)c.Eip, where.c_str());
+        }
+        CloseHandle(h);        // left suspended on purpose: the game is killed right after
+    }
+    CloseHandle(ts);
+}
+
 static int RunTo(Session& ss, const Frames& mv, uint32_t row, uint32_t speed) {
     uint32_t cur = ss.Row();
     if (row <= cur) return 1;
@@ -144,6 +174,8 @@ int wmain(int argc, wchar_t** argv) {
         if (!ss.SaveState(0)) { puts("FAIL: SaveState"); code = 1; break; }
         printf("  saved in %lu ms\n", GetTickCount() - t0);
         printf("  game threads captured: %u (tracked tids %u, skipped %u)\n", ss.s->snap_diag[0], ss.s->snap_diag[6], ss.s->snap_diag[7]);
+        printf("  save phases (ms): engine pause %u, park threads %u, compare %u, reserve pool %u, open+freeze %u, copy %u | Save total %u, engine resume %u\n",
+               ss.s->snap_time[0], ss.s->snap_time[1], ss.s->snap_time[2], ss.s->snap_time[3], ss.s->snap_time[4], ss.s->snap_time[5], ss.s->snap_time[6], ss.s->snap_time[7]);
 
         uint32_t h0 = ss.s->hist_n;
         if (!RunTo(ss, p.movie, at + gap, speed)) { puts("FAIL: reference run crashed or hung"); code = 1; break; }
@@ -160,7 +192,7 @@ int wmain(int argc, wchar_t** argv) {
             printf("  threads restored %u, mismatched %u, missing %u (first mismatch eip saved %08X now %08X)\n", ss.s->snap_diag[1],
                    ss.s->snap_diag[2], ss.s->snap_diag[3], ss.s->snap_diag[4], ss.s->snap_diag[5]);
             h0 = ss.s->hist_n;
-            if (!RunTo(ss, p.movie, at + gap, speed)) { puts("  FAIL: crashed or hung while running on"); code = 1; break; }
+            if (!RunTo(ss, p.movie, at + gap, speed)) { puts("  FAIL: crashed or hung while running on"); PostMortem(ss); code = 1; break; }
             std::vector<HistEntry> got;
             Grab(ss, h0, got);
             bool same;
