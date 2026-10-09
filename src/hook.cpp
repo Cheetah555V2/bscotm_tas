@@ -119,7 +119,7 @@ static bool IsSleeper(DWORD tid) {
 // locks. Copying or rewriting memory under it would leave a lock half taken. So these
 // threads are tracked, count as idle while inside a Sleep/Wait, and when the gate is closed
 // they park on the way out of the call. A savestate proceeds only once all of them are idle.
-struct GThread { DWORD tid; HANDLE h; volatile LONG idle; };
+struct GThread { DWORD tid; HANDLE h; volatile LONG idle, quiet; };    // idle: inside a Sleep/Wait; quiet: inside a plain Sleep, i.e. between jobs
 static GThread GT[128];
 static volatile LONG NGT;
 static volatile LONG GateClosed;
@@ -133,11 +133,11 @@ static GThread* GateMe() {
     for (LONG i = 0; i < NGT; i++) if (GT[i].tid == me) { TlsSetValue(GateTls, &GT[i]); return &GT[i]; }
     return nullptr;
 }
-static inline void GateEnter(GThread* g) { if (g) { g->idle = 1; MemoryBarrier(); } }
+static inline void GateEnter(GThread* g, bool quiet = false) { if (g) { g->quiet = quiet; g->idle = 1; MemoryBarrier(); } }
 static void GateLeave(GThread* g) {          // about to run game code again
     if (!g) return;
     for (;;) {
-        g->idle = 0;
+        g->idle = 0; g->quiet = 0;
         MemoryBarrier();
         if (!GateClosed) return;
         g->idle = 1;
@@ -155,10 +155,10 @@ static void GateRegister(HANDLE game_handle, DWORD tid) {
 static bool ParkAll() {
     GateClosed = 1;
     MemoryBarrier();
-    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 3000;) {
+    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 2000;) {
         bool all = true;
         for (LONG i = 0; i < NGT; i++)
-            if (!GT[i].idle && WaitForSingleObject(GT[i].h, 0) != WAIT_OBJECT_0) all = false;
+            if (!(GT[i].idle && GT[i].quiet) && WaitForSingleObject(GT[i].h, 0) != WAIT_OBJECT_0) all = false;     // a thread in a wait is not enough: it may be half way through a job
         if (all) return true;
         Sleep(0);
     }
@@ -171,10 +171,19 @@ static DWORD GameTidList(DWORD* out, DWORD max) {
     return n;
 }
 
+struct SleepSite { uint32_t ret, ms, n; };
+static SleepSite SleepSites[16];                       // diagnosis: the tracked game thread's Sleep calls by call site and duration
+static void NoteSleepSite(uint32_t ret, uint32_t ms) {
+    for (int i = 0; i < 16; i++) {
+        if (SleepSites[i].ret == ret && SleepSites[i].ms == ms) { SleepSites[i].n++; return; }
+        if (!SleepSites[i].ret) { SleepSites[i] = { ret, ms, 1 }; return; }
+    }
+}
 static void  WINAPI H_Sleep(DWORD ms) {
     if (ms) NoteSleep();
     GThread* g = GateMe();
-    GateEnter(g);
+    if (g) NoteSleepSite((uint32_t)(uintptr_t)__builtin_return_address(0), ms);
+    GateEnter(g, true);
     R_Sleep(Shorten(ms));
     GateLeave(g);
 }
@@ -1165,6 +1174,10 @@ static void WriteThreadInfo() {              // diagnosis: where every other thr
         wsprintfA(b, "tid %5lu eip %08X esp %08X %s waiting in %s; started at %s\r\n", t.tid, t.eip, t.esp, t.tracked ? "TRACKED  " : "untracked", mod, smod);
         WriteFile(f, b, lstrlenA(b), &w, nullptr);
     }
+    for (int i = 0; i < 16 && SleepSites[i].ret; i++) {
+        wsprintfA(b, "  tracked-thread Sleep(%u) called from exe+%X : %u times\r\n", SleepSites[i].ms, (unsigned)(SleepSites[i].ret - (uint32_t)(uintptr_t)GetModuleHandleW(nullptr)), SleepSites[i].n);
+        WriteFile(f, b, lstrlenA(b), &w, nullptr);
+    }
     CloseHandle(f);
 }
 static void HandleSnap(Shm* s, uint32_t f, int64_t frozen) {
@@ -1172,13 +1185,23 @@ static void HandleSnap(Shm* s, uint32_t f, int64_t frozen) {
     if (slot >= (uint32_t)snap::MAX_SLOTS || !(s->features & FEAT_ARENA_OK)) {
         s->snap_result = 2;
     } else if (cmd == 1) {
+        DWORD hp0 = GetTickCount();
         XaPause();
+        DWORD hp1 = GetTickCount();
         bool ok = snap::Save((int)slot, frozen, f - 1);
+        DWORD hp2 = GetTickCount();
         if (ok) WriteThreadInfo();
         XaResume();
+        s->snap_time[0] = hp1 - hp0; s->snap_time[6] = hp2 - hp1; s->snap_time[7] = GetTickCount() - hp2;
         if (ok) XaOnSave((int)slot);
         s->snap_frame[slot] = ok ? f : 0;
         s->snap_result = ok ? 1 : 2;
+    } else if (cmd == 3) {                       // quiet check: can the game's threads be stopped at once?
+        DWORD t0 = GetTickCount();
+        bool ok = ParkAll();
+        DWORD dt = GetTickCount() - t0;
+        UnparkAll();
+        s->snap_result = (ok && dt <= 20) ? 1 : 2;
     } else if (cmd == 2 && snap::Slots[slot].valid) {
         ParkAll();                  // game worker threads must be idle before voices are destroyed: one may be using a voice we are about to kill
         XaCbGate = 1;               // from here on no callback reaches the game until the memory is back
@@ -1320,6 +1343,7 @@ static void Init() {
             snap::GameTids = GameTidList;
             snap::Diag = S->snap_diag;
             snap::Stats = S->snap_stats;
+            snap::Times = S->snap_time;
             PatchIat(exe, "kernel32.dll", "HeapAlloc", (void*)H_HeapAlloc, &R_HeapAlloc);
             PatchIat(exe, "kernel32.dll", "HeapFree", (void*)H_HeapFree, &R_HeapFree);
             PatchIat(exe, "kernel32.dll", "HeapReAlloc", (void*)H_HeapReAlloc, &R_HeapReAlloc);

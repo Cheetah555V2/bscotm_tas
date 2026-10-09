@@ -146,14 +146,23 @@ void Session::AbortSteps() {
 
 bool Session::SaveState(int slot) {
     if (!s || !s->paused || slot < 0 || slot > 7 || !(s->features & FEAT_ARENA_OK)) return false;
-    s->snap_slot = slot;
-    s->snap_result = 0;
-    MemoryBarrier();
-    s->snap_cmd = 1;
-    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 10000;) {
-        if (!s->snap_cmd) return s->snap_result == 1;
-        if (!Alive()) return false;
-        Sleep(1);
+    // The hook also refuses a save when stopping the threads takes a while; retry a few times.
+    for (int attempt = 0; attempt < 12; attempt++) {
+        s->snap_slot = slot;
+        s->snap_result = 0;
+        s->snap_diag[0] = 0;
+        MemoryBarrier();
+        s->snap_cmd = 1;
+        bool answered = false;
+        for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 10000;) {
+            if (!s->snap_cmd) { answered = true; break; }
+            if (!Alive()) return false;
+            Sleep(1);
+        }
+        if (!answered) return false;
+        if (s->snap_result == 1) return true;
+        if (s->snap_diag[0] != 0xFFFFFFFFu) return false;       // a real failure, not "busy"
+        Sleep(250);
     }
     return false;
 }
