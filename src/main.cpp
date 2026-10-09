@@ -25,6 +25,7 @@ enum {
     IDC_MEM_HIST, IDC_MEM_GRAPH, IDC_MEM_CSV, IDC_MEM_CLR,
     IDM_HELP_START, IDM_HELP_KEYS, IDM_HELP_TROUBLE, IDM_HELP_ABOUT, IDM_HELP_GUIDE, IDC_HELP_TOPICS,
     IDM_RNGLOG, IDM_VERIFY, IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
+    IDM_SAVESTATES, IDM_SAVESTATE_NOW, IDM_SSINTERVAL,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
     IDC_BASE = 300, IDC_PRE, IDC_RNG_CHK, IDC_RNG_CLR, IDC_RNG_CSV,
@@ -80,6 +81,10 @@ struct App {
     int liveRecRow = 0;           // movie row the live recording started at
     bool pendingStep = false;     // step once the resync job finishes
     bool pendingRun = false;      // run to the cursor once the resync job finishes
+    bool useStates = true;        // Run > Use savestates (on by default): launch the game with the private heap so states can be saved
+    int  ssEvery = 2000;          // automatic state every this many frames while the game is advanced (0 = never)
+    bool ssManual[8] = {};        // slots saved by hand (never evicted automatically)
+    int  chunkFrom = 0;           // first row of the batch being run (Run to cursor runs in pieces so states can be saved between them)
     bool stepping = false;        // a batch of frames is running (busy is set too)
     int runFrom = 0, runTarget = 0;   // rows the batch started at / will stop before
     bool busy = false, jobRecord = false, jobNew = false, jobHold = false;
@@ -115,10 +120,12 @@ std::string U8(const std::wstring& w) {
 // ---- status / title --------------------------------------------------------
 void SetMsg(const std::wstring& m) { SendMessageW(A.status, SB_SETTEXTW, 0, (LPARAM)m.c_str()); }
 
+int NumStates();
 void UpdateStatus() {
     int n = Size();
-    wchar_t b[192], sd[40] = L"";
+    wchar_t b[192], sd[64] = L"";
     if (A.movie.has_seed) swprintf(sd, 40, L"   seed %u", (unsigned)A.movie.seed);
+    if (int ns = NumStates()) swprintf(sd + wcslen(sd), 64 - wcslen(sd), L"   states %d", ns);
     double t = (A.cursor + 1) / 60.0, tt = n / 60.0;
     swprintf(b, 192, L"Frame %d / %d   (%d:%05.2f / %d:%05.2f)   game at %d%ls", n ? A.cursor + 1 : 0, n,
              (int)t / 60, t - 60 * ((int)t / 60), (int)tt / 60, tt - 60 * ((int)tt / 60), A.reached, sd);
@@ -2002,6 +2009,7 @@ void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, b
     // can be thawed without a burst of catch-up frames.
     p.speed_mask = p.speed_milli > 1000 ? SPEED_ALL : (SPEED_ALL & ~SPEED_NOVSYNC);
     p.hold = hold;
+    p.savestates = A.useStates && hold;
 
     A.jobRecord = record; A.jobNew = fresh; A.jobTarget = target; A.jobHold = hold;
     A.busy = true;
@@ -2193,6 +2201,87 @@ void FrameAdvance();
 void RunToCursor();
 void StopRecordHere();
 
+// ---- savestates --------------------------------------------------------------------------------
+// A state restores "the game frozen before movie row R". It is valid while no frame before R was edited
+// (R <= A.reached). Rewinding loads the latest valid state at or before the target instead of relaunching.
+bool StatesOn() {
+    return A.useStates && A.sess.Active() && A.sess.Alive() && A.sess.s && (A.sess.s->features & FEAT_ARENA_OK);
+}
+
+int NumStates() {
+    int n = 0;
+    if (A.sess.Active() && A.sess.s) for (int i = 0; i < 8; i++) { int r = A.sess.StateRow(i); if (r >= 0 && r <= A.reached) n++; }
+    return n;
+}
+
+// The slot to rewind from for a game that has to run row `next` next: the latest valid state at or before it.
+int BestState(int next) {
+    int best = -1, bestRow = -1;
+    for (int i = 0; i < 8; i++) {
+        int r = A.sess.StateRow(i);
+        if (r >= 0 && r <= A.reached && r <= next && r > bestRow) { best = i; bestRow = r; }
+    }
+    return best;
+}
+
+// The slot to save row `row` in: the same row, an empty or stale slot, or else the automatic state whose
+// neighbours are closest together (so the saved rows stay spread out).
+int PickSlot(int row) {
+    int empty = -1, stale = -1;
+    for (int i = 0; i < 8; i++) {
+        int r = A.sess.StateRow(i);
+        if (r == row) return i;
+        if (r < 0) { if (empty < 0) empty = i; }
+        else if (r > A.reached) { if (stale < 0) stale = i; }
+    }
+    if (empty >= 0) return empty;
+    if (stale >= 0) return stale;
+    int best = -1, bestGap = 0x7FFFFFFF;
+    for (int i = 0; i < 8; i++) {
+        if (A.ssManual[i]) continue;
+        int r = A.sess.StateRow(i), lo = 0, hi = r + std::max(A.ssEvery, 1000);
+        for (int j = 0; j < 8; j++) {
+            if (j == i) continue;
+            int q = A.sess.StateRow(j);
+            if (q >= 0 && q <= r) lo = std::max(lo, q);
+            if (q > r) hi = std::min(hi, q);
+        }
+        if (hi - lo < bestGap) { bestGap = hi - lo; best = i; }
+    }
+    return best;
+}
+
+// Saves the frozen game's position. Not for use while a batch is running.
+bool SaveStateAt(bool manual) {
+    if (!StatesOn()) return false;
+    int row = (int)A.sess.Row();
+    if (row < 0 || row > A.reached) return false;
+    int slot = PickSlot(row);
+    bool keep = A.sess.StateRow(slot) == row && A.ssManual[slot];      // saving over the same row keeps a manual state manual
+    if (slot < 0 || !A.sess.SaveState(slot)) return false;
+    A.ssManual[slot] = manual || keep;
+    return true;
+}
+
+// Puts the game back to the latest state at or before the cursor row and runs it forward from there.
+bool RewindWithState(int row) {
+    if (A.busy || !StatesOn()) return false;
+    int slot = BestState(row + 1);
+    if (slot < 0) return false;
+    int r = A.sess.StateRow(slot);
+    DWORD t0 = GetTickCount();
+    if (!A.sess.LoadState(slot)) {
+        A.sess.Close();
+        SetMsg(L"Loading the savestate failed; the game is gone. Rewind again to relaunch.");
+        return true;
+    }
+    SetMsg(L"Loaded the state at frame " + std::to_wstring(r) + L" (" + std::to_wstring(GetTickCount() - t0) + L" ms).");
+    UpdateStatus();
+    InvalidateRect(A.grid, nullptr, FALSE);
+    if (r <= row) RunToCursor();
+    return true;
+}
+
 void OnJobDone(RunResult* r) {
     if (A.thread) { WaitForSingleObject(A.thread, 2000); CloseHandle(A.thread); A.thread = nullptr; }
     A.busy = false;
@@ -2226,6 +2315,10 @@ void OnJobDone(RunResult* r) {
             A.sess = A.jobSess;
             A.jobSess = Session();
             SetMsg(L"Game frozen after frame " + std::to_wstring(r->played) + L". Press . to advance a frame, F11 to resume live.");
+            if (A.useStates) {
+                for (bool& m : A.ssManual) m = false;       // a new game has no states yet
+                if (SaveStateAt(false)) SetMsg(L"Game frozen after frame " + std::to_wstring(r->played) + L"; state saved. Press . to advance a frame, F11 to resume live.");
+            }
         } else {
             SetMsg(L"Reached frame " + std::to_wstring(r->played) + L". The game is left running.");
         }
@@ -2309,12 +2402,16 @@ void RunToCursor() {
     Step st; st.cur_before = A.cursor;
     EnsureRows(st, target);
     Commit(st);
-    Frames keys(A.movie.frames.begin() + row, A.movie.frames.begin() + target);
+    // With savestates the batch runs in pieces ending at multiples of ssEvery, with a state saved at each.
+    int end = target;
+    if (StatesOn() && A.ssEvery > 0) end = std::min(target, (row / A.ssEvery + 1) * A.ssEvery);
+    Frames keys(A.movie.frames.begin() + row, A.movie.frames.begin() + end);
     if (!A.sess.BeginSteps(keys.data(), (uint32_t)keys.size(), SPEEDS[A.speed])) {
         A.sess.Close();
         SetMsg(L"Could not start running the game.");
         return;
     }
+    A.chunkFrom = row;
     A.runFrom = row; A.runTarget = target;
     A.stepping = true;
     A.busy = true;
@@ -2352,15 +2449,27 @@ void JumpTo(int row) {
     int next = frozen ? (int)A.sess.Row() : -1;         // the row the frozen game runs next
     if (frozen && next >= 0 && next <= row) { RunToCursor(); return; }
     if (frozen && next == row + 1) { SetMsg(L"The game is already at frame " + std::to_wstring(row + 1) + L"."); return; }
+    if (RewindWithState(row)) return;
     StartJob(false, (uint32_t)(row + 1), false, false, true);
 }
 
 void PollRun() {
     int r = A.sess.PollSteps();
     if (r == 0) {
-        SetMsg(L"Running to the cursor: frame " + std::to_wstring(A.runFrom + (int)A.sess.StepsDone()) + L" / " +
+        SetMsg(L"Running to the cursor: frame " + std::to_wstring(A.chunkFrom + (int)A.sess.StepsDone()) + L" / " +
                std::to_wstring(A.runTarget) + L". Stop (F9) to cancel.");
         return;
+    }
+    if (r == 1 && StatesOn()) {
+        int row = (int)A.sess.Row();
+        A.reached = std::max(A.reached, row);
+        if (row >= 0 && (row == A.runTarget || (A.ssEvery > 0 && row % A.ssEvery == 0))) SaveStateAt(false);
+        if (row >= 0 && row < A.runTarget) {            // the next piece
+            int end = std::min(A.runTarget, A.ssEvery > 0 ? (row / A.ssEvery + 1) * A.ssEvery : A.runTarget);
+            Frames keys(A.movie.frames.begin() + row, A.movie.frames.begin() + end);
+            if (A.sess.BeginSteps(keys.data(), (uint32_t)keys.size(), SPEEDS[A.speed])) { A.chunkFrom = row; return; }
+            r = -1;
+        }
     }
     FinishRun(r, false);
 }
@@ -2491,6 +2600,10 @@ void BuildMenu(HWND w) {
     AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
     add(r, IDM_RNGSEED, L"RNG see&d...");
     add(r, IDM_VERIFY, L"&Verify fast-forward...");
+    AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
+    add(r, IDM_SAVESTATES, L"Use &savestates (applies at the next launch)");
+    add(r, IDM_SAVESTATE_NOW, L"Save s&tate at the game's position\tShift+F5");
+    add(r, IDM_SSINTERVAL, L"Savestate &interval (frames)...");
     A.speedMenu = CreatePopupMenu();
     add(A.speedMenu, IDM_SPEED0, L"Real time (1x)");
     add(A.speedMenu, IDM_SPEED1, L"4x");
@@ -2566,6 +2679,9 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 std::wstring sp = IniGet(L"last", L"speed");
                 A.speed = sp.empty() ? 3 : std::max(0, std::min(3, _wtoi(sp.c_str())));
                 CheckMenuRadioItem(A.speedMenu, IDM_SPEED0, IDM_SPEED3, IDM_SPEED0 + A.speed, MF_BYCOMMAND);
+                A.useStates = IniGet(L"last", L"savestates") != L"0";
+                std::wstring ev = IniGet(L"last", L"ssevery");
+                if (!ev.empty()) A.ssEvery = std::max(0, _wtoi(ev.c_str()));
             }
             RefreshCombos(IniGet(L"last", L"baseline"), IniGet(L"last", L"prelude"));
             EnableUi();
@@ -2584,6 +2700,10 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                            IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_RECORD, IDM_BASESAVE, IDM_STEP, IDM_RESUME, IDM_RECHERE,
                            IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED, IDM_VERIFY, IDM_BM_EDIT, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_REPEAT, IDM_PATTERN, IDM_FIND, IDM_FINDNEXT, IDM_FINDPREV, IDM_NOTENEXT, IDM_NOTEPREV})
                 en(id, !A.busy);
+            CheckMenuItem(m, IDM_SAVESTATES, MF_BYCOMMAND | (A.useStates ? MF_CHECKED : MF_UNCHECKED));
+            en(IDM_SAVESTATES, !A.busy);
+            en(IDM_SSINTERVAL, !A.busy);
+            en(IDM_SAVESTATE_NOW, !A.busy && StatesOn());
             en(IDM_NOTE_DEL, !A.busy && SelectionHasNote());
             en(IDM_BM_DEL, !A.busy && RowIsBm(A.cursor));
             en(IDM_UNDO, !A.busy && !A.undo.empty());
@@ -2637,7 +2757,39 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_HELP_ABOUT: ShowHelp(NUM_HELP_TOPICS - 1); break;
                 case IDM_RNGLOG: ShowRngLog(); break;
                 case IDM_PLAY: StartJob(false, (uint32_t)Size(), false, true); break;
-                case IDM_REWIND: StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true); break;
+                case IDM_REWIND:
+                    if (Size() && RewindWithState(std::min(A.cursor, Size() - 1))) break;
+                    StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true);
+                    break;
+                case IDM_SAVESTATES:
+                    A.useStates = !A.useStates;
+                    IniSet(L"last", L"savestates", A.useStates ? L"1" : L"0");
+                    SetMsg(A.useStates ? L"Savestates on: the game launched from now on can save and load states (Rewind and Jump use them)."
+                                       : L"Savestates off for the next launch.");
+                    break;
+                case IDM_SSINTERVAL: {
+                    if (A.busy) break;
+                    std::wstring t = std::to_wstring(A.ssEvery);
+                    if (!AskText(L"Savestate interval", L"Frames between automatic savestates while the game is advanced (0 = never; 100 - 20000):", t)) break;
+                    wchar_t* end = nullptr;
+                    long n = wcstol(t.c_str(), &end, 10);
+                    if (t.empty() || *end || n < 0 || (n > 0 && n < 100) || n > 20000) {
+                        MessageBoxW(A.wnd, L"Enter 0, or a number of frames from 100 to 20000.", L"Savestate interval", MB_ICONERROR);
+                        break;
+                    }
+                    A.ssEvery = (int)n;
+                    IniSet(L"last", L"ssevery", std::to_wstring(A.ssEvery));
+                    SetMsg(n ? L"A savestate is made every " + std::to_wstring(n) + L" frames while the game is advanced. Shorter = faster rewinds, more memory."
+                             : L"No automatic savestates (Shift+F5 still saves one by hand).");
+                    break;
+                }
+                case IDM_SAVESTATE_NOW:
+                    if (A.busy) break;
+                    if (!StatesOn()) { SetMsg(A.useStates ? L"No frozen game that can save states. Rewind to cursor (F6) first." : L"Savestates are off (Run > Use savestates), then Rewind to cursor (F6)."); break; }
+                    if (SaveStateAt(true)) SetMsg(L"State saved at frame " + std::to_wstring(A.sess.Row()) + L" (kept until the game is relaunched).");
+                    else SetMsg(L"Could not save a state here.");
+                    UpdateStatus();
+                    break;
                 case IDM_STEP: FrameAdvance(); break;
                 case IDM_RUNTO: RunToCursor(); break;
                 case IDM_RECHERE: RecordHere(); break;
@@ -2755,7 +2907,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
         {FCONTROL | FVIRTKEY, 'X', IDM_CUT},      {FCONTROL | FVIRTKEY, 'C', IDM_COPY},
         {FCONTROL | FVIRTKEY, 'V', IDM_PASTE},    {FCONTROL | FSHIFT | FVIRTKEY, 'V', IDM_PASTEINS},
         {FCONTROL | FVIRTKEY, 'A', IDM_SELALL},   {FVIRTKEY, VK_F5, IDM_PLAY},
-        {FVIRTKEY, VK_F6, IDM_REWIND},            {FVIRTKEY, VK_F7, IDM_RECFROM},
+        {FSHIFT | FVIRTKEY, VK_F5, IDM_SAVESTATE_NOW}, {FVIRTKEY, VK_F6, IDM_REWIND},            {FVIRTKEY, VK_F7, IDM_RECFROM},
         {FVIRTKEY, VK_F8, IDM_RECORD},            {FVIRTKEY, VK_F9, IDM_STOP},
         {FVIRTKEY, VK_OEM_PERIOD, IDM_STEP},      {FVIRTKEY, VK_F4, IDM_RUNTO},       {FVIRTKEY, VK_F1, IDM_HELP_GUIDE}, {FVIRTKEY, VK_F11, IDM_RESUME},       {FVIRTKEY, VK_F12, IDM_RECHERE},
         {FCONTROL | FVIRTKEY, 'B', IDM_BM_EDIT}, {FCONTROL | FSHIFT | FVIRTKEY, 'B', IDM_BM_DEL}, {FCONTROL | FVIRTKEY, 'G', IDM_GOTO}, {FCONTROL | FVIRTKEY, 'R', IDM_REPEAT}, {FCONTROL | FVIRTKEY, 'F', IDM_FIND}, {FVIRTKEY, VK_F3, IDM_FINDNEXT}, {FSHIFT | FVIRTKEY, VK_F3, IDM_FINDPREV}, {FALT | FVIRTKEY, VK_DOWN, IDM_NOTENEXT}, {FALT | FVIRTKEY, VK_UP, IDM_NOTEPREV}, {FCONTROL | FSHIFT | FVIRTKEY, 'R', IDM_PATTERN},
