@@ -149,9 +149,39 @@ static const int MAX_THREADS = 16;
 static const size_t THREAD_MEM = 4u << 20;
 struct ThreadRec { DWORD tid; uint32_t esp, base, off; CONTEXT ctx; };
 
+// ---- page pool: saved states share the pages that did not change ---------------------------------
+// A state is a table of 4 KB page indices (arena pages, then the exe's writable sections). When a page is
+// byte-identical to the same page of the previous state it is not copied again: both tables point at it
+// (reference counted). A game that changes little between two saves costs little per state, which matters
+// in a 32-bit process (2 GB address space).
+namespace pagepool {
+static const uint32_t PG = 4096, CHUNK_PAGES = 1024, MAX_CHUNKS = 160;     // chunks of 4 MB, at most 640 MB
+static uint8_t*  Chunk[MAX_CHUNKS];
+static uint32_t  NChunks;
+static uint16_t  Ref[MAX_CHUNKS * CHUNK_PAGES];
+static uint32_t  FreeList[MAX_CHUNKS * CHUNK_PAGES];
+static uint32_t  NFree, InUse;
+static inline uint8_t* Ptr(uint32_t i) { return Chunk[i >> 10] + (i & 1023) * PG; }
+static bool Grow() {
+    if (NChunks >= MAX_CHUNKS) return false;
+    uint8_t* c = (uint8_t*)VirtualAlloc(nullptr, CHUNK_PAGES * PG, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!c) return false;
+    Chunk[NChunks] = c;
+    for (uint32_t i = CHUNK_PAGES; i-- > 0;) FreeList[NFree++] = (NChunks << 10) + i;
+    NChunks++;
+    return true;
+}
+static bool Reserve(uint32_t n) { while (NFree < n) if (!Grow()) return false; return true; }
+static inline uint32_t Alloc() { uint32_t i = FreeList[--NFree]; Ref[i] = 1; InUse++; return i; }
+static inline void Retain(uint32_t i) { Ref[i]++; }
+static inline void Release(uint32_t i) { if (--Ref[i] == 0) { FreeList[NFree++] = i; InUse--; } }
+}  // namespace pagepool
+
 struct Slot {
-    uint8_t* mem = nullptr;
+    uint8_t* mem = nullptr;                 // the main thread's stack
     size_t cap = 0;
+    uint32_t* pg = nullptr;                 // page table: arena pages, then section pages (indices into the page pool)
+    uint32_t npg = 0, tabcap = 0;
     uint32_t arena_used = 0, sec_bytes = 0, stack_esp = 0, stack_bytes = 0;
     uint32_t regs[4] = {};
     uint32_t fs0 = 0;
@@ -163,6 +193,8 @@ struct Slot {
     bool valid = false;
 };
 static Slot Slots[MAX_SLOTS];
+static int LastSlot = -1;                   // the most recently saved or loaded slot: the next save is compared with it
+static volatile uint32_t* Stats;             // -> Shm::snap_stats
 
 static void FindSections(HMODULE exe) {
     BYTE* base = (BYTE*)exe;
@@ -239,21 +271,63 @@ static bool Save(int slot, int64_t virt, uint32_t frame_before) {
     uint32_t esp = SaveCtx[4], base = StackBase();
     if (esp >= base || base - esp > (8u << 20)) return false;
     uint32_t ssz = base - esp;
-    size_t total = (size_t)used + secs + ssz;
-    if (sn.cap < total) {
+    using namespace pagepool;
+    uint32_t anp = (used + PG - 1) / PG, npg = anp + secs / PG;
+    if (sn.cap < ssz) {                          // the main stack store (small)
         if (sn.mem) VirtualFree(sn.mem, 0, MEM_RELEASE);
-        sn.cap = (total + (16u << 20)) & ~((1u << 20) - 1);
+        sn.cap = (ssz + (1u << 20)) & ~((1u << 20) - 1);
         sn.mem = (uint8_t*)VirtualAlloc(nullptr, sn.cap, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (!sn.mem) { sn.cap = 0; sn.valid = false; return false; }
     }
-    if (!sn.tmem) sn.tmem = (uint8_t*)VirtualAlloc(nullptr, THREAD_MEM, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);     // before Freeze: no allocation while threads are stopped
-    uint8_t* d = sn.mem;
+    // everything that allocates is done before the threads are stopped
+    if (!sn.tmem) sn.tmem = (uint8_t*)VirtualAlloc(nullptr, THREAD_MEM, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    size_t tabbytes = (((size_t)npg * 4 + npg) + 4095) & ~(size_t)4095;
+    uint32_t* newtab = (uint32_t*)VirtualAlloc(nullptr, tabbytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!newtab) return false;
+    uint8_t* chg = (uint8_t*)(newtab + npg);     // chg[i] = page i differs from the previous state
+    auto srcpage = [&](uint32_t i, uint32_t& len) -> const uint8_t* {
+        if (i < anp) { len = (i + 1 == anp) ? used - i * PG : PG; return arena::Base + i * PG; }
+        uint32_t off = (i - anp) * PG;
+        for (int s = 0; s < NumSections; s++) { if (off < Sections[s].n) { len = PG; return Sections[s].p + off; } off -= Sections[s].n; }
+        len = 0;
+        return nullptr;
+    };
+    const Slot* prev = (LastSlot >= 0 && Slots[LastSlot].valid) ? &Slots[LastSlot] : nullptr;
     if (ParkHook) ParkHook();
+    uint32_t need = 0;
+    for (uint32_t i = 0; i < npg; i++) {
+        uint32_t len;
+        const uint8_t* p = srcpage(i, len);
+        chg[i] = !(prev && i < prev->npg && !memcmp(p, Ptr(prev->pg[i]), len));
+        need += chg[i];
+    }
+    if (!Reserve(need + 16)) { if (UnparkHook) UnparkHook(); VirtualFree(newtab, 0, MEM_RELEASE); return false; }
     Open();
     Freeze();
-    memcpy(d, arena::Base, used); d += used;
-    for (int i = 0; i < NumSections; i++) { memcpy(d, Sections[i].p, Sections[i].n); d += Sections[i].n; }
-    memcpy(d, (void*)esp, ssz);
+    uint32_t built = 0;
+    for (; built < npg; built++) {
+        uint32_t len;
+        const uint8_t* p = srcpage(built, len);
+        if (!chg[built]) { newtab[built] = prev->pg[built]; Retain(newtab[built]); continue; }
+        if (!NFree) break;
+        uint32_t idx = Alloc();
+        memcpy(Ptr(idx), p, len);
+        newtab[built] = idx;
+    }
+    if (built < npg) {                           // the pool ran dry: undo
+        for (uint32_t j = 0; j < built; j++) Release(newtab[j]);
+        Thaw();
+        if (UnparkHook) UnparkHook();
+        VirtualFree(newtab, 0, MEM_RELEASE);
+        return false;
+    }
+    memcpy(sn.mem, (void*)esp, ssz);
+    uint32_t* oldtab = sn.pg;
+    uint32_t oldn = sn.npg;
+    if (oldtab) for (uint32_t j = 0; j < oldn; j++) Release(oldtab[j]);
+    sn.pg = newtab;
+    sn.npg = npg;
+    if (Stats) { Stats[0] = InUse; Stats[1] = need; Stats[2] = npg; Stats[3] = NFree; }
     sn.nth = 0;
     if (GameTids && sn.tmem) {
         DWORD tids[MAX_THREADS];
@@ -288,12 +362,14 @@ static bool Save(int slot, int64_t virt, uint32_t frame_before) {
     if (Diag) { Diag[0] = (uint32_t)sn.nth; }
     Thaw();
     if (UnparkHook) UnparkHook();
+    if (oldtab) VirtualFree(oldtab, 0, MEM_RELEASE);
     sn.arena_used = used; sn.sec_bytes = secs; sn.stack_esp = esp; sn.stack_bytes = ssz;
     for (int i = 0; i < 4; i++) sn.regs[i] = SaveCtx[i];
     sn.fs0 = __readfsdword(0);
     sn.frame_before = frame_before;
     sn.virt = virt;
     sn.valid = true;
+    LastSlot = slot;
     return true;
 }
 
@@ -307,10 +383,23 @@ extern "C" void PollStub() __asm__("_bscotm_pollstub");
 
 static __attribute__((used, noinline)) void DoRestore() {
     Slot& sn = *Pending;
-    const uint8_t* s = sn.mem;
-    memcpy(arena::Base, s, sn.arena_used); s += sn.arena_used;
-    for (int i = 0; i < NumSections; i++) { memcpy(Sections[i].p, s, Sections[i].n); s += Sections[i].n; }
-    memcpy((void*)sn.stack_esp, s, sn.stack_bytes);
+    {
+        using namespace pagepool;
+        uint32_t anp = (sn.arena_used + PG - 1) / PG;
+        for (uint32_t i = 0; i < sn.npg; i++) {
+            uint8_t* dst;
+            uint32_t len;
+            if (i < anp) { dst = arena::Base + i * PG; len = (i + 1 == anp) ? sn.arena_used - i * PG : PG; }
+            else {
+                uint32_t off = (i - anp) * PG;
+                dst = nullptr; len = 0;
+                for (int k = 0; k < NumSections; k++) { if (off < Sections[k].n) { dst = Sections[k].p + off; len = PG; break; } off -= Sections[k].n; }
+            }
+            if (dst) memcpy(dst, Ptr(sn.pg[i]), len);
+        }
+        LastSlot = (int)(&sn - Slots);          // the game now equals this state: the next save is compared with it
+    }
+    memcpy((void*)sn.stack_esp, sn.mem, sn.stack_bytes);
     if (Diag) { Diag[1] = Diag[2] = Diag[3] = Diag[4] = Diag[5] = 0; }
     for (int i = 0; i < sn.nth; i++) {
         const ThreadRec& r = sn.th[i];

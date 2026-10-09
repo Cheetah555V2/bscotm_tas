@@ -1319,6 +1319,7 @@ static void Init() {
             snap::UnparkHook = UnparkAll;
             snap::GameTids = GameTidList;
             snap::Diag = S->snap_diag;
+            snap::Stats = S->snap_stats;
             PatchIat(exe, "kernel32.dll", "HeapAlloc", (void*)H_HeapAlloc, &R_HeapAlloc);
             PatchIat(exe, "kernel32.dll", "HeapFree", (void*)H_HeapFree, &R_HeapFree);
             PatchIat(exe, "kernel32.dll", "HeapReAlloc", (void*)H_HeapReAlloc, &R_HeapReAlloc);

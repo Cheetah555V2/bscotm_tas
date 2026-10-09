@@ -5,6 +5,7 @@
 //   sstest movie.bscotm --exe COTM.exe --dll bscotm_hook.dll --baseline <dir> --prelude <file>
 //          [--at 2000] [--gap 300] [--reps 3] [--speed 50000]
 #include <windows.h>
+#include <psapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
@@ -63,7 +64,7 @@ int wmain(int argc, wchar_t** argv) {
     if (argc < 2) { puts("usage: sstest movie.bscotm --exe X --dll X --baseline X --prelude X [--at N] [--gap N] [--reps N] [--speed N]"); return 2; }
     RunParams p;
     std::wstring moviePath = argv[1], preludePath;
-    uint32_t at = 2000, gap = 300, reps = 3, speed = 50000, altoff = 0, alts = 3;
+    uint32_t at = 2000, gap = 300, reps = 3, speed = 50000, altoff = 0, alts = 3, soak = 0;
     for (int i = 2; i + 1 < argc; i += 2) {
         std::wstring k = argv[i], v = argv[i + 1];
         if (k == L"--exe") p.exe = v;
@@ -76,6 +77,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (k == L"--speed") speed = _wtoi(v.c_str());
         else if (k == L"--altoff") altoff = _wtoi(v.c_str());
         else if (k == L"--alts") alts = _wtoi(v.c_str());
+        else if (k == L"--soak") soak = _wtoi(v.c_str());
     }
     std::string err;
     Movie m;
@@ -95,7 +97,7 @@ int wmain(int argc, wchar_t** argv) {
     p.hist = true;
     p.speed_milli = speed;
     p.speed_mask = SPEED_ALL;
-    if (at + gap + 1 >= p.movie.size()) { puts("movie too short for --at + --gap"); return 2; }
+    if (!soak && at + gap + 1 >= p.movie.size()) { puts("movie too short for --at + --gap"); return 2; }
 
     printf("launching (savestates on)...\n");
     Session ss;
@@ -103,6 +105,36 @@ int wmain(int argc, wchar_t** argv) {
     RunResult rr = RunJob(p, cb, &ss);
     if (!rr.ok || !ss.Active()) { printf("launch failed: %s\n", rr.error.c_str()); return 1; }
     printf("game frozen at row %u, arena %s\n", ss.Row(), (ss.s->features & FEAT_ARENA_OK) ? "ok" : "NOT ok");
+
+    if (soak) {         // memory use over a long movie: run forward, save a state into a rotating slot every `soak` frames
+        auto mem = [&](const char* tag, uint32_t row, DWORD ms) {
+            PROCESS_MEMORY_COUNTERS_EX m{};
+            GetProcessMemoryInfo(ss.proc, (PROCESS_MEMORY_COUNTERS*)&m, sizeof m);
+            printf("%-6s row %6u: private %5.0f MB  working set %5.0f MB  peak working set %5.0f MB  (%lu ms)\n", tag, row, m.PrivateUsage / 1048576.0,
+                   m.WorkingSetSize / 1048576.0, m.PeakWorkingSetSize / 1048576.0, ms);
+            fflush(stdout);
+        };
+        mem("start", ss.Row(), 0);
+        uint32_t i = 0;
+        for (uint32_t row = soak; row + 2 < p.movie.size(); row += soak, i++) {
+            DWORD t0 = GetTickCount();
+            if (!RunTo(ss, p.movie, row, speed)) { printf("FAIL: running to row %u\n", row); ss.Close(); KillGame(); return 1; }
+            DWORD t1 = GetTickCount();
+            if (!ss.SaveState(i % 8)) { printf("FAIL: SaveState at row %u\n", row); ss.Close(); KillGame(); return 1; }
+            mem("saved", row, GetTickCount() - t1);
+            printf("         state pages %u, copied %u, pool in use %u pages (%.0f MB)\n", ss.s->snap_stats[2], ss.s->snap_stats[1], ss.s->snap_stats[0],
+                   ss.s->snap_stats[0] * 4096 / 1048576.0);
+            (void)t0;
+        }
+        printf("loading slot 0 and running 300 frames...\n");
+        if (!ss.LoadState(0)) puts("FAIL: LoadState");
+        else if (!RunTo(ss, p.movie, ss.Row() + 300, speed)) puts("FAIL: crashed or hung after the load");
+        else puts("ok: survived the load");
+        mem("end", ss.Row(), 0);
+        ss.Close();
+        KillGame();
+        return 0;
+    }
 
     int code = 0;
     do {

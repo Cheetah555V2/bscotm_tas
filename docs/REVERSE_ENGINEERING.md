@@ -654,6 +654,11 @@ Result on the stage 1 test movie: a save takes about 90 ms, a load 60-80 ms; sav
 (frames 100 to 11000), gaps of up to 6000 frames, 15 loads in a row from one session: all identical to the
 reference run frame by frame. Loading and then playing different inputs survives too (8/8, 1500 frames each).
 
+Memory: a state is a table of 4 KB page indices; pages unchanged since the previous state are shared (the first state is
+~81 MB, later ones copy 0.25-7 MB). Over a 74,000-frame movie (the test movie repeated 6 times) with a state every
+2000 frames in 8 rotating slots the game stays at about 350 MB and the pool at under 100 MB; before sharing, the 9th
+state failed (32-bit address space). GPU dedicated memory stayed at 48 MB on that run.
+
 Limits: the packed `COTM.exe` cannot be disassembled from disk (read the code bytes the crash log dumps); XAudio2
 voices' play position and queued buffers are not restored (sound only); D3D memory contents are not restored
 (picture only); nothing survives closing the game.
