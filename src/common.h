@@ -91,5 +91,6 @@ struct Shm {
     volatile uint32_t snap_slot;
     volatile uint32_t snap_result;  // 1 = ok, 2 = failed
     volatile uint32_t snap_frame[8];// marker number each slot was saved at (0 = empty)
+    volatile uint32_t snap_diag[8]; // hook -> host: [0] threads captured at the last save, [1] restored at the last load, [2] mismatched (skipped), [3] missing, [4]/[5] first mismatch saved/now eip
     uint16_t keys[MAX_FRAMES];
 };

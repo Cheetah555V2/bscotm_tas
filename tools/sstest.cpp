@@ -109,6 +109,7 @@ int wmain(int argc, wchar_t** argv) {
         DWORD t0 = GetTickCount();
         if (!ss.SaveState(0)) { puts("FAIL: SaveState"); code = 1; break; }
         printf("  saved in %lu ms\n", GetTickCount() - t0);
+        printf("  game threads captured: %u (tracked tids %u, skipped %u)\n", ss.s->snap_diag[0], ss.s->snap_diag[6], ss.s->snap_diag[7]);
 
         uint32_t h0 = ss.s->hist_n;
         if (!RunTo(ss, p.movie, at + gap, speed)) { puts("FAIL: reference run crashed or hung"); code = 1; break; }
@@ -122,6 +123,8 @@ int wmain(int argc, wchar_t** argv) {
             t0 = GetTickCount();
             if (!ss.LoadState(0)) { puts("  FAIL: LoadState"); code = 1; break; }
             printf("  loaded in %lu ms, marker %u row %u\n", GetTickCount() - t0, ss.s->paused, ss.Row());
+            printf("  threads restored %u, mismatched %u, missing %u (first mismatch eip saved %08X now %08X)\n", ss.s->snap_diag[1],
+                   ss.s->snap_diag[2], ss.s->snap_diag[3], ss.s->snap_diag[4], ss.s->snap_diag[5]);
             h0 = ss.s->hist_n;
             if (!RunTo(ss, p.movie, at + gap, speed)) { puts("  FAIL: crashed or hung while running on"); code = 1; break; }
             std::vector<HistEntry> got;

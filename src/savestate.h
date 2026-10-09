@@ -134,6 +134,21 @@ extern "C" uintptr_t PollSite __asm__("_bscotm_pollsite");
 uint32_t SaveCtx[5], RestoreCtx[5];
 uintptr_t PollSite;
 
+// ---- the game's own threads: registers and stacks ---------------------------------------
+// The game's long-lived threads (pacer, logic, ...) keep their own locals on their own stacks. Put back
+// only the heap and the main thread, and such a thread wakes up holding pointers to objects of another
+// moment. So at a save every tracked game thread (stopped inside a Sleep/Wait) has its registers and its
+// stack recorded; at a load the same is put back, but only for a thread stopped at the very same place
+// (same eip and esp), so a changed situation is reported instead of silently corrupted.
+static DWORD (*GameTids)(DWORD* out, DWORD max);     // the hook's tracked game threads
+struct ThreadInfo { DWORD tid; uint32_t eip, esp, start; bool tracked; };
+static ThreadInfo Info[64];
+static int NInfo;
+static volatile uint32_t* Diag;                       // -> Shm::snap_diag
+static const int MAX_THREADS = 16;
+static const size_t THREAD_MEM = 4u << 20;
+struct ThreadRec { DWORD tid; uint32_t esp, base, off; CONTEXT ctx; };
+
 struct Slot {
     uint8_t* mem = nullptr;
     size_t cap = 0;
@@ -142,6 +157,9 @@ struct Slot {
     uint32_t fs0 = 0;
     uint32_t frame_before = 0;
     int64_t virt = 0;
+    ThreadRec th[MAX_THREADS];
+    int nth = 0;
+    uint8_t* tmem = nullptr;
     bool valid = false;
 };
 static Slot Slots[MAX_SLOTS];
@@ -163,22 +181,44 @@ static void FindSections(HMODULE exe) {
 // are opened first because that allocates; between Freeze and Thaw only memcpy runs.
 static bool (*ParkHook)();                  // stops the game's own threads at an idle point
 static void (*UnparkHook)();
-static HANDLE Others[512];
-static int    NumOthers;
+static HANDLE   Others[512];
+static DWORD    OthersTid[512];
+static uint32_t OthersBase[512], OthersLimit[512];    // stack bounds (TEB.StackBase / StackLimit)
+static uint32_t OthersStart[512];                      // Win32 start address of each thread
+static int      NumOthers;
+
+typedef LONG (NTAPI *PFN_NtQueryInformationThread)(HANDLE, ULONG, PVOID, ULONG, PULONG);
 
 static void Open() {
     NumOthers = 0;
+    static PFN_NtQueryInformationThread NtQit = (PFN_NtQueryInformationThread)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
     HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (sn == INVALID_HANDLE_VALUE) return;
     THREADENTRY32 te{sizeof te};
     DWORD pid = GetCurrentProcessId(), me = GetCurrentThreadId();
     for (BOOL ok = Thread32First(sn, &te); ok && NumOthers < 512; ok = Thread32Next(sn, &te)) {
         if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
-        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
-        if (h) Others[NumOthers++] = h;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        uint32_t base = 0, limit = 0;
+        if (NtQit) {
+            struct { LONG exit; PVOID teb; DWORD pid, tid; ULONG_PTR aff; LONG prio, baseprio; } tbi = {};
+            if (NtQit(h, 0, &tbi, sizeof tbi, nullptr) == 0 && tbi.teb) {
+                base = *(uint32_t*)((char*)tbi.teb + 4);
+                limit = *(uint32_t*)((char*)tbi.teb + 8);
+            }
+        }
+        uint32_t start = 0;
+        if (NtQit) { uint32_t a = 0; if (NtQit(h, 9, &a, 4, nullptr) == 0) start = a; }     // ThreadQuerySetWin32StartAddress
+        OthersStart[NumOthers] = start;
+        Others[NumOthers] = h; OthersTid[NumOthers] = te.th32ThreadID; OthersBase[NumOthers] = base; OthersLimit[NumOthers] = limit;
+        NumOthers++;
     }
     CloseHandle(sn);
 }
+static int OtherIndex(DWORD tid) { for (int i = 0; i < NumOthers; i++) if (OthersTid[i] == tid) return i; return -1; }
+
 static void Freeze() {
     EnterCriticalSection(&arena::Cs);
     for (int i = 0; i < NumOthers; i++) SuspendThread(Others[i]);
@@ -206,6 +246,7 @@ static bool Save(int slot, int64_t virt, uint32_t frame_before) {
         sn.mem = (uint8_t*)VirtualAlloc(nullptr, sn.cap, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (!sn.mem) { sn.cap = 0; sn.valid = false; return false; }
     }
+    if (!sn.tmem) sn.tmem = (uint8_t*)VirtualAlloc(nullptr, THREAD_MEM, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);     // before Freeze: no allocation while threads are stopped
     uint8_t* d = sn.mem;
     if (ParkHook) ParkHook();
     Open();
@@ -213,6 +254,38 @@ static bool Save(int slot, int64_t virt, uint32_t frame_before) {
     memcpy(d, arena::Base, used); d += used;
     for (int i = 0; i < NumSections; i++) { memcpy(d, Sections[i].p, Sections[i].n); d += Sections[i].n; }
     memcpy(d, (void*)esp, ssz);
+    sn.nth = 0;
+    if (GameTids && sn.tmem) {
+        DWORD tids[MAX_THREADS];
+        DWORD n = GameTids(tids, MAX_THREADS);
+        uint32_t skipped = 0;
+        if (Diag) Diag[6] = n;
+        uint32_t off = 0;
+        for (DWORD t = 0; t < n && sn.nth < MAX_THREADS; t++) {
+            int k = OtherIndex(tids[t]);
+            if (k < 0 || !OthersBase[k]) { skipped++; continue; }
+            ThreadRec& r = sn.th[sn.nth];
+            r.ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            if (!GetThreadContext(Others[k], &r.ctx)) { skipped++; continue; }
+            uint32_t tesp = r.ctx.Esp, tbase = OthersBase[k];
+            if (tesp < OthersLimit[k] || tesp >= tbase || tbase - tesp > THREAD_MEM - off) { skipped++; continue; }
+            memcpy(sn.tmem + off, (void*)tesp, tbase - tesp);
+            r.tid = tids[t]; r.esp = tesp; r.base = tbase; r.off = off;
+            off += (tbase - tesp + 15) & ~15u;
+            sn.nth++;
+        }
+    NInfo = 0;                                  // every other thread of the process: where is it stopped, and does the hook track it?
+    for (int i = 0; i < NumOthers && NInfo < 64; i++) {
+        CONTEXT c;
+        c.ContextFlags = CONTEXT_CONTROL;
+        bool got = GetThreadContext(Others[i], &c) != 0;
+        bool tracked = false;
+        if (GameTids) { DWORD tt[MAX_THREADS]; DWORD nn = GameTids(tt, MAX_THREADS); for (DWORD q = 0; q < nn; q++) if (tt[q] == OthersTid[i]) tracked = true; }
+        Info[NInfo++] = { OthersTid[i], got ? c.Eip : 0, got ? c.Esp : 0, OthersStart[i], tracked };
+    }
+    if (Diag) Diag[7] = skipped;
+    }
+    if (Diag) { Diag[0] = (uint32_t)sn.nth; }
     Thaw();
     if (UnparkHook) UnparkHook();
     sn.arena_used = used; sn.sec_bytes = secs; sn.stack_esp = esp; sn.stack_bytes = ssz;
@@ -238,6 +311,23 @@ static __attribute__((used, noinline)) void DoRestore() {
     memcpy(arena::Base, s, sn.arena_used); s += sn.arena_used;
     for (int i = 0; i < NumSections; i++) { memcpy(Sections[i].p, s, Sections[i].n); s += Sections[i].n; }
     memcpy((void*)sn.stack_esp, s, sn.stack_bytes);
+    if (Diag) { Diag[1] = Diag[2] = Diag[3] = Diag[4] = Diag[5] = 0; }
+    for (int i = 0; i < sn.nth; i++) {
+        const ThreadRec& r = sn.th[i];
+        int k = OtherIndex(r.tid);
+        if (k < 0) { if (Diag) Diag[3]++; continue; }
+        CONTEXT cur;
+        cur.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (!GetThreadContext(Others[k], &cur) || cur.Esp != r.ctx.Esp || cur.Eip != r.ctx.Eip) {
+            if (Diag) { if (!Diag[2]) { Diag[4] = r.ctx.Eip; Diag[5] = GetThreadContext(Others[k], &cur) ? cur.Eip : 0; } Diag[2]++; }
+            continue;
+        }
+        memcpy((void*)r.esp, sn.tmem + r.off, r.base - r.esp);
+        CONTEXT set = r.ctx;
+        set.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        SetThreadContext(Others[k], &set);
+        if (Diag) Diag[1]++;
+    }
     for (int i = 0; i < 4; i++) RestoreCtx[i] = sn.regs[i];
     RestoreCtx[4] = sn.stack_esp;
     __asm__ volatile("mov %0, %%fs:0" : : "r"(sn.fs0));
