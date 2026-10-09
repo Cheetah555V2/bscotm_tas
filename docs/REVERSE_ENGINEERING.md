@@ -623,3 +623,37 @@ and *Verify fast-forward* still matches at all 20 checkpoints.
 Note: with the old join, in a later session the same harness (baseline restored, the 40-frame stepping of
 `comp`, or a direct `RunJob` to frame N) often never got out of the menus (health 0 at frame 3000) while the
 new code reached the same states as before every time; the reason for the old flakiness was not found.
+
+---
+
+## Update: savestates that work (branch `savestates`)
+
+The prototype's "running on after a load is unreliable" had a handful of concrete causes, each found with
+`tools/sstest.cpp` (save at frame N, run, load, run the same frames again, compare the per-frame values) and
+the hook's crash log (`%TEMP%\bscotm_crash.txt`: registers, stack with module names, code bytes at the fault).
+
+1. **The XAudio2 voice table overflowed.** The hook tracks every source voice so a restore can bring back the
+   ones the game destroyed after the save. It kept *every* destroyed voice until the next save; a few hundred
+   frames of sound effects filled the 1024 entries, and from then on voices were handed out untracked, with the
+   game's own callback pointer. After a restore the audio thread called those callbacks into rolled-back memory
+   (`XAudio2_7+2CC06`, `OnVoiceProcessingPassStart`). Now only voices that existed at a save are kept.
+2. **XAudio2 calls the game's callbacks on its own thread, at any time.** Each voice is given a hook-owned shim
+   callback object instead (it forwards while the voice is alive and no restore is under way; `DestroyVoice`
+   waits for calls in flight). The restore closes a gate, drains, and only then touches voices.
+3. **The game's worker threads were still running when voices were destroyed** for the restore (a stand-in
+   `Stop` on a dead voice). They are now parked first.
+4. **D3D9 resources were released twice.** The game releases textures/buffers after the save point; the restored
+   memory still points at them, and the game releases them again (the crashing code is a destructor calling
+   `[obj->vtable+8]`). With savestates on, `Release` of every D3D9 class the game creates is patched: the last
+   reference is kept and the game is told the object is gone. The cost is video memory that is not given back.
+5. **The game's long-lived thread** (`COTM.exe+31CC6E`) has its registers and stack recorded at a save and put back
+   at a load, but only if it is stopped at the same eip/esp (otherwise it is counted, not touched).
+   The other threads in the process (Windows thread pool, COM, the AMD driver, `inputhost`) are not game state.
+
+Result on the stage 1 test movie: a save takes about 90 ms, a load 60-80 ms; saves anywhere in the movie
+(frames 100 to 11000), gaps of up to 6000 frames, 15 loads in a row from one session: all identical to the
+reference run frame by frame. Loading and then playing different inputs survives too (8/8, 1500 frames each).
+
+Limits: the packed `COTM.exe` cannot be disassembled from disk (read the code bytes the crash log dumps); XAudio2
+voices' play position and queued buffers are not restored (sound only); D3D memory contents are not restored
+(picture only); nothing survives closing the game.

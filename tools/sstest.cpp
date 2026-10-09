@@ -63,7 +63,7 @@ int wmain(int argc, wchar_t** argv) {
     if (argc < 2) { puts("usage: sstest movie.bscotm --exe X --dll X --baseline X --prelude X [--at N] [--gap N] [--reps N] [--speed N]"); return 2; }
     RunParams p;
     std::wstring moviePath = argv[1], preludePath;
-    uint32_t at = 2000, gap = 300, reps = 3, speed = 50000;
+    uint32_t at = 2000, gap = 300, reps = 3, speed = 50000, altoff = 0, alts = 3;
     for (int i = 2; i + 1 < argc; i += 2) {
         std::wstring k = argv[i], v = argv[i + 1];
         if (k == L"--exe") p.exe = v;
@@ -74,6 +74,8 @@ int wmain(int argc, wchar_t** argv) {
         else if (k == L"--gap") gap = _wtoi(v.c_str());
         else if (k == L"--reps") reps = _wtoi(v.c_str());
         else if (k == L"--speed") speed = _wtoi(v.c_str());
+        else if (k == L"--altoff") altoff = _wtoi(v.c_str());
+        else if (k == L"--alts") alts = _wtoi(v.c_str());
     }
     std::string err;
     Movie m;
@@ -135,6 +137,19 @@ int wmain(int argc, wchar_t** argv) {
             if (same) good++;
         }
         printf("result: %d / %u identical\n", good, reps);
+
+        if (altoff) {       // the real use: load, then play different inputs. Not comparable, only has to survive.
+            for (uint32_t r = 1; r <= alts; r++) {
+                if (!ss.LoadState(0)) { puts("  FAIL: LoadState before the different-input run"); code = 1; break; }
+                uint32_t from = at + altoff * r;
+                if (from + gap >= p.movie.size()) from = (uint32_t)p.movie.size() - gap - 1;
+                if (!ss.BeginSteps(p.movie.data() + from, gap, speed)) { puts("  FAIL: BeginSteps"); code = 1; break; }
+                int pr;
+                while (!(pr = ss.PollSteps())) Sleep(2);
+                if (pr < 0) { printf("  FAIL: crashed or hung with different inputs (taken from row %u)\n", from); code = 1; break; }
+                printf("  different inputs (from row %u): survived %u frames\n", from, gap);
+            }
+        }
         if (good != (int)reps) code = 1;
     } while (0);
 
