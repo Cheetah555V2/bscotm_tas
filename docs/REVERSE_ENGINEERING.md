@@ -698,3 +698,13 @@ refuses such a save (stopping the threads took more than ~20 ms), the host retri
 thread only counts as stopped when it is in its idle `Sleep(8)` loop (`exe+2BDDAC`), not in an arbitrary wait.
 Remaining: about 1 in 24 early-frame (100) saves still restored badly; saves at frames 400 to 11000 passed in all runs
 made after the change. Per-phase timings of the last save are in `Shm::snap_time` (shown by `tools/sstest`).
+
+### Replay nondeterminism after the stage 1 boss dies (test3.bscotm, around frame 10550-10600)
+
+Not caused by savestates: continuous fast replays disagree with each other, with savestates off, and with a real-time (1x)
+replay. The player is standing still after the boss kill and the stage-clear health refill (9 -> 12) happens at
+different frames. In the same 140 frames of two identical runs the game made 16 vs 20 `SubmitSourceBuffer` calls and
+received 12 vs 16 buffer callbacks: the game's music streaming is driven by XAudio2 callbacks, which arrive on the audio
+thread in real time, so anything in the game that waits for audio events lands on a different frame each run. The
+counters are in `Shm::px_cnt` / `Shm::sh_cnt` (`tools/sstest --cntfrom A --cntto B`). A fix would have to deliver the
+callbacks on a frame schedule instead of by the audio thread (a virtual audio clock).

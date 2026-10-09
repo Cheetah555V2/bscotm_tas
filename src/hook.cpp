@@ -134,12 +134,13 @@ static GThread* GateMe() {
     return nullptr;
 }
 static inline void GateEnter(GThread* g, bool quiet = false) { if (g) { g->quiet = quiet; g->idle = 1; MemoryBarrier(); } }
-static void GateLeave(GThread* g) {          // about to run game code again
+static void GateLeave(GThread* g, bool quiet = false) {          // about to run game code again; quiet: it came out of a plain Sleep
     if (!g) return;
     for (;;) {
         g->idle = 0; g->quiet = 0;
         MemoryBarrier();
         if (!GateClosed) return;
+        g->quiet = quiet;                     // parked in the gate: as quiet as the call it came out of (a thread that woke from Sleep(8) is between jobs)
         g->idle = 1;
         MemoryBarrier();
         while (GateClosed) Sleep(1);
@@ -185,7 +186,7 @@ static void  WINAPI H_Sleep(DWORD ms) {
     if (g) NoteSleepSite((uint32_t)(uintptr_t)__builtin_return_address(0), ms);
     GateEnter(g, true);
     R_Sleep(Shorten(ms));
-    GateLeave(g);
+    GateLeave(g, true);
 }
 static DWORD WINAPI H_Wait(HANDLE h, DWORD ms) {
     GThread* g = GateMe();
@@ -791,8 +792,11 @@ static HRESULT (WINAPI *R_CoCreate)(const GUID&, LPUNKNOWN, DWORD, const GUID&, 
     X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28)
 #define PX_DECL(n) extern "C" void px##n() __asm__("_bscotm_px" #n);
 #define PX_ADDR(n) (void*)px##n,
-#define PX_DEF(n) __asm__(".text\n.globl _bscotm_px" #n "\n_bscotm_px" #n ":\n" \
+#define PX_DEF(n) __asm__(".text\n.globl _bscotm_px" #n "\n_bscotm_px" #n ":\n    lock incl _bscotm_pxcnt+" #n "*4\n" \
     "    mov 4(%esp), %eax\n    mov 4(%eax), %eax\n    mov %eax, 4(%esp)\n    mov (%eax), %eax\n    jmp *" #n "*4(%eax)\n");
+extern "C" uint32_t PxCnt[32] __asm__("_bscotm_pxcnt");
+uint32_t PxCnt[32];
+static volatile uint32_t ShC[8];                       // diagnosis: callbacks received by the shims, by method
 PX_LIST(PX_DECL)
 PX_LIST(PX_DEF)
 static void* ProxyVt[29] = { PX_LIST(PX_ADDR) };
@@ -811,13 +815,13 @@ static volatile LONG ShimCalls, ShimForwarded;
                  void* cb = v->cb; bool ok = v->cb_alive && !XaCbGate && cb;
 #define SH_END   if (ok) InterlockedIncrement(&ShimForwarded); InterlockedDecrement(&v->inflight);
 #define SH_VT(i) (*(void***)cb)[i]
-static void __stdcall Sh0(XaShimT* s, UINT32 n)       { SH_BEGIN if (ok) ((void (__stdcall*)(void*, UINT32))SH_VT(0))(cb, n); SH_END }
-static void __stdcall Sh1(XaShimT* s)                 { SH_BEGIN if (ok) ((void (__stdcall*)(void*))SH_VT(1))(cb); SH_END }
-static void __stdcall Sh2(XaShimT* s)                 { SH_BEGIN if (ok) ((void (__stdcall*)(void*))SH_VT(2))(cb); SH_END }
-static void __stdcall Sh3(XaShimT* s, void* c)        { SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(3))(cb, c); SH_END }
-static void __stdcall Sh4(XaShimT* s, void* c)        { SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(4))(cb, c); SH_END }
-static void __stdcall Sh5(XaShimT* s, void* c)        { SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(5))(cb, c); SH_END }
-static void __stdcall Sh6(XaShimT* s, void* c, HRESULT hr) { SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*, HRESULT))SH_VT(6))(cb, c, hr); SH_END }
+static void __stdcall Sh0(XaShimT* s, UINT32 n)       { ShC[0]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*, UINT32))SH_VT(0))(cb, n); SH_END }
+static void __stdcall Sh1(XaShimT* s)                 { ShC[1]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*))SH_VT(1))(cb); SH_END }
+static void __stdcall Sh2(XaShimT* s)                 { ShC[2]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*))SH_VT(2))(cb); SH_END }
+static void __stdcall Sh3(XaShimT* s, void* c)        { ShC[3]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(3))(cb, c); SH_END }
+static void __stdcall Sh4(XaShimT* s, void* c)        { ShC[4]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(4))(cb, c); SH_END }
+static void __stdcall Sh5(XaShimT* s, void* c)        { ShC[5]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(5))(cb, c); SH_END }
+static void __stdcall Sh6(XaShimT* s, void* c, HRESULT hr) { ShC[6]++; SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*, HRESULT))SH_VT(6))(cb, c, hr); SH_END }
 static void* ShimVt[7] = { (void*)Sh0, (void*)Sh1, (void*)Sh2, (void*)Sh3, (void*)Sh4, (void*)Sh5, (void*)Sh6 };
 
 static void XaWaitIdle(XaVoice* v) {
@@ -1247,6 +1251,8 @@ static void Marker(Shm* s) {
     uint32_t f = s->frame + 1;
     s->frame = f;
     RngCheck();
+    memcpy((void*)s->px_cnt, PxCnt, sizeof PxCnt);
+    memcpy((void*)s->sh_cnt, (const void*)ShC, sizeof ShC);
     if (s->hist_on) HistSample(f);
     if (s->mode == M_RECORD) {
         if (s->armed && s->rec_count < MAX_FRAMES) s->keys[s->rec_count++] = (uint16_t)Cur;
