@@ -433,6 +433,92 @@ static CRITICAL_SECTION ThCs;
 static HANDLE Pending[MAXIMUM_WAIT_OBJECTS];
 static int    NPending;
 
+// ---- crash log (savestate diagnosis): first fatal exception -> %TEMP%\bscotm_crash.txt ------------
+static void XaCrashInfo(void* cb, char* out, int n);     // defined with the voice table
+static bool XaIsShim(uintptr_t a);
+static void XaFindInternal(HANDLE f, uintptr_t obj);
+static void DumpFirstCreates(HANDLE f);
+static void XaDumpEvents(HANDLE f, uint32_t cb, uint32_t realv);
+static LONG CALLBACK CrashVeh(PEXCEPTION_POINTERS ep) {
+    DWORD c = ep->ExceptionRecord->ExceptionCode;
+    if (c != 0xC0000005 && c != 0xC0000094 && c != 0xC000001D && c != 0xC0000096 && c != 0xC00000FD && c != 0xC0000374 && c != 0xC0000409) return EXCEPTION_CONTINUE_SEARCH;
+    static volatile LONG once;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    char path[MAX_PATH + 32];
+    GetTempPathA(MAX_PATH, path);
+    strcat(path, "bscotm_crash.txt");
+    HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+    CONTEXT* x = ep->ContextRecord;
+    char b[512];
+    auto put = [&](const char* s) { DWORD w; WriteFile(f, s, (DWORD)strlen(s), &w, nullptr); };
+    wsprintfA(b, "code %08X at %08X (exe+%X) tid %lu marker %u\r\n", c, (unsigned)(uintptr_t)ep->ExceptionRecord->ExceptionAddress,
+              (unsigned)((uintptr_t)ep->ExceptionRecord->ExceptionAddress - base), GetCurrentThreadId(), S ? S->paused : 0);
+    put(b);
+    if (c == 0xC0000005 && ep->ExceptionRecord->NumberParameters >= 2) {
+        wsprintfA(b, "access %s of %08X\r\n", ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read", (unsigned)ep->ExceptionRecord->ExceptionInformation[1]);
+        put(b);
+    }
+    wsprintfA(b, "eax %08X ebx %08X ecx %08X edx %08X esi %08X edi %08X ebp %08X esp %08X\r\n", (unsigned)x->Eax, (unsigned)x->Ebx,
+              (unsigned)x->Ecx, (unsigned)x->Edx, (unsigned)x->Esi, (unsigned)x->Edi, (unsigned)x->Ebp, (unsigned)x->Esp);
+    put(b);
+    put("stack (exe RVAs marked *):\r\n");
+    auto modname = [&](uintptr_t a, char* out) {
+        HMODULE hm = nullptr;
+        out[0] = 0;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &hm) && hm) {
+            char full[MAX_PATH];
+            GetModuleFileNameA(hm, full, MAX_PATH);
+            const char* n = strrchr(full, '\\');
+            wsprintfA(out, "%s+%X", n ? n + 1 : full, (unsigned)(a - (uintptr_t)hm));
+        }
+    };
+    uintptr_t stk[64];
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), (void*)x->Esp, stk, sizeof stk, &got)) got = 0;
+    for (SIZE_T i = 0; i < got / 4; i++) {
+        uintptr_t v = stk[i];
+        bool in = v >= base && v < base + 0x800000;
+        wsprintfA(b, "  [esp+%02X] %08X%s\r\n", (unsigned)(i * 4), (unsigned)v, in ? " *" : "");
+        put(b);
+        char mn[300];
+        modname(v, mn);
+        if (mn[0]) { wsprintfA(b, "           %s\r\n", mn); put(b); }
+    }
+    char xi[1024];
+    XaCrashInfo((void*)x->Edx, xi, sizeof xi);
+    wsprintfA(b, "callback object (edx) %08X: ", (unsigned)x->Edx);
+    put(b);
+    put(xi);
+    put("\r\n");
+    uintptr_t arg0 = 0;
+    {
+        uintptr_t vo[24];
+        SIZE_T g1 = 0, g2 = 0;
+        ReadProcessMemory(GetCurrentProcess(), (void*)(x->Ebp + 8), &arg0, 4, &g1);
+        wsprintfA(b, "frame arg0 (XAudio2 voice) %08X\r\n", (unsigned)arg0);
+        put(b);
+        if (g1 == 4 && ReadProcessMemory(GetCurrentProcess(), (void*)arg0, vo, sizeof vo, &g2)) {
+            for (SIZE_T i = 0; i < g2 / 4; i++) {
+                bool shim = false;
+                shim = XaIsShim(vo[i]);
+                wsprintfA(b, "  voice+%02X: %08X%s\r\n", (unsigned)(i * 4), (unsigned)vo[i], shim ? "  <- a hook shim" : "");
+                put(b);
+            }
+        }
+    }
+    XaFindInternal(f, arg0);
+    DumpFirstCreates(f);
+    XaDumpEvents(f, (uint32_t)x->Edx, (uint32_t)arg0);
+    char mn0[300];
+    modname((uintptr_t)ep->ExceptionRecord->ExceptionAddress, mn0);
+    wsprintfA(b, "fault address module: %s\r\n", mn0[0] ? mn0 : "(none: not inside any module)");
+    put(b);
+    CloseHandle(f);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static HANDLE WINAPI H_Ct(LPSECURITY_ATTRIBUTES a, SIZE_T sz, LPTHREAD_START_ROUTINE fn, LPVOID p, DWORD fl, LPDWORD id) {
     HANDLE h = R_Ct(a, sz, fn, p, fl, id);
     if (h && RngWatch && SuspendThread(h) != (DWORD)-1) { SetWatch(h, RngWatch); ResumeThread(h); }   // RNG log: watch new threads too
@@ -555,14 +641,18 @@ static SIZE_T WINAPI H_HeapSize(HANDLE h, DWORD fl, LPCVOID p) {
 // voice. Every call is forwarded to the real voice; DestroyVoice is the only one handled here.
 // A destroyed voice can then be recreated behind the same stand-in pointer.
 struct Proxy { void** vt; void* real; };
+struct XaShimT { void** vt; void* owner; };     // what XAudio2 gets as the voice callback: lives in the hook, not the game heap
 struct XaVoice {
     Proxy px;
     bool in_use, real_dead, recreatable;
     uint32_t created, destroyed;             // XaSerial values
     uint8_t fmt[128]; uint32_t flags; float maxfreq; void* cb;
     uint32_t nsends; struct { uint32_t flags; void* out; } sends[4];
+    XaShimT shim;                            // shim.vt / shim.owner set when the voice is created
+    volatile LONG inflight, cb_alive;        // callbacks running through the shim / may the game callback still be called
 };
 static XaVoice  Voices[1024];
+static bool XaIsShim(uintptr_t a) { for (int k = 0; k < 1024; k++) if (a == (uintptr_t)&Voices[k].shim) return true; return false; }
 static uint32_t XaSerial;                    // bumped on every create / destroy / save
 static uint32_t SlotSerial[8];               // XaSerial when each slot was saved (0 = empty)
 static CRITICAL_SECTION XaCs;
@@ -581,7 +671,55 @@ PX_LIST(PX_DECL)
 PX_LIST(PX_DEF)
 static void* ProxyVt[29] = { PX_LIST(PX_ADDR) };
 
+// ---- callback shim: XAudio2 never holds a pointer into the game heap -------------------------
+// XAudio2 calls IXAudio2VoiceCallback methods on its own audio thread, at any time. After a restore
+// (or just after the game destroyed a voice and freed its callback) such a call lands in memory that
+// no longer holds the callback. So XAudio2 is given a shim object per voice; it forwards the call to
+// the game's callback only while the voice is alive and no restore is under way. Before the game's
+// callback can go away, XaKillCb stops forwarding and waits for the calls in flight.
+static volatile LONG XaCbGate;               // 1 = callbacks are dropped (a restore is under way)
+static volatile LONG ShimCalls, ShimForwarded;
+#define SH_BEGIN XaVoice* v = (XaVoice*)s->owner; InterlockedIncrement(&ShimCalls); InterlockedIncrement(&v->inflight); MemoryBarrier(); \
+                 void* cb = v->cb; bool ok = v->cb_alive && !XaCbGate && cb;
+#define SH_END   if (ok) InterlockedIncrement(&ShimForwarded); InterlockedDecrement(&v->inflight);
+#define SH_VT(i) (*(void***)cb)[i]
+static void __stdcall Sh0(XaShimT* s, UINT32 n)       { SH_BEGIN if (ok) ((void (__stdcall*)(void*, UINT32))SH_VT(0))(cb, n); SH_END }
+static void __stdcall Sh1(XaShimT* s)                 { SH_BEGIN if (ok) ((void (__stdcall*)(void*))SH_VT(1))(cb); SH_END }
+static void __stdcall Sh2(XaShimT* s)                 { SH_BEGIN if (ok) ((void (__stdcall*)(void*))SH_VT(2))(cb); SH_END }
+static void __stdcall Sh3(XaShimT* s, void* c)        { SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(3))(cb, c); SH_END }
+static void __stdcall Sh4(XaShimT* s, void* c)        { SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(4))(cb, c); SH_END }
+static void __stdcall Sh5(XaShimT* s, void* c)        { SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*))SH_VT(5))(cb, c); SH_END }
+static void __stdcall Sh6(XaShimT* s, void* c, HRESULT hr) { SH_BEGIN if (ok) ((void (__stdcall*)(void*, void*, HRESULT))SH_VT(6))(cb, c, hr); SH_END }
+static void* ShimVt[7] = { (void*)Sh0, (void*)Sh1, (void*)Sh2, (void*)Sh3, (void*)Sh4, (void*)Sh5, (void*)Sh6 };
+
+static void XaWaitIdle(XaVoice* v) {
+    for (DWORD t0 = GetTickCount(); v->inflight && GetTickCount() - t0 < 2000;) Sleep(0);
+}
+static void XaKillCb(XaVoice* v) {           // the game's callback object is about to go away
+    v->cb_alive = 0;
+    MemoryBarrier();
+    XaWaitIdle(v);
+}
+
 static bool AnySlot() { for (int i = 0; i < 8; i++) if (SlotSerial[i]) return true; return false; }
+
+static void XaCrashInfo(void* cb, char* out, int n) {
+    int found = 0, live = 0;
+    out[0] = 0;
+    for (int i = 0; i < 1024; i++) {
+        XaVoice& v = Voices[i];
+        if (!v.in_use) continue;
+        live++;
+        if (v.cb == cb) {
+            found++;
+            wsprintfA(out + lstrlenA(out), "voice#%d proxy %08X real %08X created %u destroyed %u real_dead %d recreatable %d; ", i, (unsigned)(uintptr_t)&v.px, (unsigned)(uintptr_t)v.px.real,
+                      v.created, v.destroyed, (int)v.real_dead, (int)v.recreatable);
+        }
+    }
+    wsprintfA(out + lstrlenA(out), "%d voices match cb, %d live, XaSerial %u, slot0 serial %u, shim calls %ld forwarded %ld, gate %ld", found, live, XaSerial,
+              SlotSerial[0], ShimCalls, ShimForwarded, XaCbGate);
+    (void)n;
+}
 
 static void XaReap() {                       // forget destroyed voices that no saved slot can bring back
     uint32_t keep = 0xFFFFFFFFu;
@@ -589,6 +727,74 @@ static void XaReap() {                       // forget destroyed voices that no 
     for (auto& v : Voices) if (v.in_use && v.destroyed && v.destroyed < keep) v.in_use = false;
 }
 
+struct XaEvt { uint32_t tick, tid, what, proxy, real, cb, serial, marker; };
+static XaEvt XaLog[1024];
+static volatile LONG XaLogN;
+static void XaEv(uint32_t what, const void* proxy, const void* real, const void* cb) {
+    LONG i = InterlockedIncrement(&XaLogN) - 1;
+    XaEvt& e = XaLog[i % 1024];
+    e.tick = GetTickCount(); e.tid = GetCurrentThreadId(); e.what = what;
+    e.proxy = (uint32_t)(uintptr_t)proxy; e.real = (uint32_t)(uintptr_t)real; e.cb = (uint32_t)(uintptr_t)cb;
+    e.serial = XaSerial; e.marker = S ? S->paused : 0;
+}
+static void XaDumpEvents(HANDLE f, uint32_t cb, uint32_t realv) {
+    char b[256];
+    DWORD w;
+    LONG n = XaLogN;
+    LONG from = n > 1024 ? n - 1024 : 0;
+    static const char* const NAME[] = {"?", "create", "destroy", "destroy-IGNORED", "recreate", "destroy-before-restore", "save", "restore-start", "pause", "after-copy", "", "", "destroy-returned", "", "", "", "", "", "", "", "shim-check", "SHIM@real+off", "GAMECB@real+off"};
+    for (LONG i = from; i < n; i++) {
+        const XaEvt& e = XaLog[i % 1024];
+        bool mine = e.cb == cb || e.real == realv;
+        bool mark = e.what == 6 || e.what == 7 || e.what == 9 || e.what == 21 || e.what == 22;
+        if (!mine && !mark) continue;
+        wsprintfA(b, "  evt %4ld t=%u tid=%u marker=%u serial=%u %-22s proxy=%08X real=%08X cb=%08X\r\n", i, e.tick, e.tid, e.marker, e.serial,
+                  NAME[e.what < 23 ? e.what : 0], e.proxy, e.real, e.cb);
+        WriteFile(f, b, lstrlenA(b), &w, nullptr);
+    }
+}
+static void XaFindInternal(HANDLE f, uintptr_t obj) {        // which tracked voice's object points at `obj`?
+    char b[256];
+    DWORD w;
+    int hits = 0;
+    for (int i = 0; i < 1024; i++) {
+        XaVoice& v = Voices[i];
+        if (!v.px.real) continue;
+        for (int k = 0; k < 0x80; k += 4) {
+            uintptr_t val;
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), (char*)v.px.real + k, &val, 4, &got) || got != 4) break;
+            if (val == obj || (val <= obj && obj < val + 0x400 && val > 0x10000 && (obj - val) % 4 == 0 && k > 0 && false)) {
+                wsprintfA(b, "  tracked voice#%d (proxy %08X real %08X) has [real+%02X] = the crashing XAudio2 object; in_use %d dead %d created %u destroyed %u cb_alive %d\r\n",
+                          i, (unsigned)(uintptr_t)&v.px, (unsigned)(uintptr_t)v.px.real, k, (int)v.in_use, (int)v.real_dead, v.created, v.destroyed, (int)v.cb_alive);
+                WriteFile(f, b, lstrlenA(b), &w, nullptr);
+                hits++;
+            }
+        }
+    }
+    wsprintfA(b, "  %d tracked voices point at the crashing XAudio2 object\r\n", hits);
+    WriteFile(f, b, lstrlenA(b), &w, nullptr);
+}
+struct FirstCreate { uint32_t real, vt, f34, f38, shim, cb; };
+static FirstCreate FirstCreates[8];
+static volatile LONG NFirstCreates;
+static void NoteFirstCreate(void* real, void* shim, void* cb) {
+    LONG i = InterlockedIncrement(&NFirstCreates) - 1;
+    if (i >= 8) return;
+    uintptr_t w[16] = {};
+    SIZE_T got = 0;
+    ReadProcessMemory(GetCurrentProcess(), real, w, sizeof w, &got);
+    FirstCreates[i] = { (uint32_t)(uintptr_t)real, (uint32_t)w[0], (uint32_t)w[0x34 / 4], (uint32_t)w[0x38 / 4], (uint32_t)(uintptr_t)shim, (uint32_t)(uintptr_t)cb };
+}
+static void DumpFirstCreates(HANDLE f) {
+    char b[200];
+    DWORD w;
+    for (LONG i = 0; i < NFirstCreates && i < 8; i++) {
+        const FirstCreate& c = FirstCreates[i];
+        wsprintfA(b, "  create#%ld real %08X [real]=%08X [+34]=%08X [+38]=%08X  (passed shim %08X, game cb %08X)\r\n", i, c.real, c.vt, c.f34, c.f38, c.shim, c.cb);
+        WriteFile(f, b, lstrlenA(b), &w, nullptr);
+    }
+}
 static void __stdcall H_DestroyVoice(Proxy* self) {
     EnterCriticalSection(&XaCs);
     XaVoice* v = (XaVoice*)self;
@@ -596,28 +802,46 @@ static void __stdcall H_DestroyVoice(Proxy* self) {
         void* real = v->px.real;
         v->real_dead = true;
         if (AnySlot()) v->destroyed = ++XaSerial; else v->in_use = false;
+        XaEv(2, v, real, v->cb);
+        XaKillCb(v);
         LeaveCriticalSection(&XaCs);
         ((void (__stdcall*)(void*))(*(void***)real)[18])(real);
+        XaEv(12, v, real, v->cb);               // the real DestroyVoice returned
         return;
     }
+    XaEv(3, self, nullptr, nullptr);            // ignored: not ours, already dead, or forgotten
     LeaveCriticalSection(&XaCs);
 }
 
 static HRESULT __stdcall H_CreateSource(void* self, void** pp, const void* fmt, UINT32 fl, float freq, void* cb,
                                          const void* sends, const void* chain) {
-    void* real = nullptr;
-    HRESULT hr = R_CreateSrc(self, &real, fmt, fl, freq, cb, sends, chain);
-    if (hr != 0 || !real || !pp) { if (pp) *pp = real; return hr; }
     EnterCriticalSection(&XaCs);
     XaVoice* v = nullptr;
     for (auto& c : Voices) if (!c.in_use) { v = &c; break; }
-    if (!v) { LeaveCriticalSection(&XaCs); *pp = real; return hr; }       // table full: hand out the real one
+    if (!v) {                                 // table full: hand out the real one
+        LeaveCriticalSection(&XaCs);
+        return R_CreateSrc(self, pp, fmt, fl, freq, cb, sends, chain);
+    }
     memset(v, 0, sizeof *v);
+    v->shim.vt = ShimVt;
+    v->shim.owner = v;
+    v->cb = cb;
+    v->cb_alive = 1;
+    void* real = nullptr;
+    HRESULT hr = R_CreateSrc(self, &real, fmt, fl, freq, cb ? (void*)&v->shim : nullptr, sends, chain);
+    if (hr != 0 || !real || !pp) {
+        memset(v, 0, sizeof *v);
+        LeaveCriticalSection(&XaCs);
+        if (pp) *pp = real;
+        return hr;
+    }
     v->px.vt = ProxyVt;
     v->px.real = real;
     v->in_use = true;
     v->created = ++XaSerial;
-    v->flags = fl; v->maxfreq = freq; v->cb = cb;
+    v->flags = fl; v->maxfreq = freq;
+    XaEv(1, v, real, cb);
+    NoteFirstCreate(real, &v->shim, cb);
     const WAVEFORMATEX* wf = (const WAVEFORMATEX*)fmt;
     uint32_t n = wf ? sizeof(WAVEFORMATEX) + wf->cbSize : 0;
     v->recreatable = wf && n <= sizeof v->fmt && !chain;
@@ -637,6 +861,20 @@ static HRESULT WINAPI H_CoCreate(const GUID& clsid, LPUNKNOWN outer, DWORD ctx, 
     HRESULT hr = R_CoCreate(clsid, outer, ctx, iid, out);
     static const GUID xa27 = {0x5a508685, 0xa254, 0x4fba, {0x9b, 0x82, 0x9a, 0x24, 0xb0, 0x03, 0x06, 0xaf}};
     static const GUID xa27d = {0xdb05ea35, 0x0329, 0x4d4b, {0xa5, 0x3a, 0x6d, 0xea, 0xd0, 0x3d, 0x3d, 0x38}};
+    if (out && *out && (clsid.Data1 == 0x5a508685 || clsid.Data1 == 0xdb05ea35)) {      // XAudio2 object created: note it
+        char path[MAX_PATH + 32], b[200];
+        GetTempPathA(MAX_PATH, path);
+        strcat(path, "bscotm_probe.txt");
+        HANDLE pf = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
+        if (pf != INVALID_HANDLE_VALUE) {
+            DWORD w;
+            void** vt = *(void***)*out;
+            wsprintfA(b, "CoCreate clsid %08X hr %08X obj %08X vtable %08X slot8 %08X patched-already %d\r\n", (unsigned)clsid.Data1, (unsigned)hr, (unsigned)(uintptr_t)*out,
+                      (unsigned)(uintptr_t)vt, (unsigned)(uintptr_t)vt[8], (int)(R_CreateSrc != nullptr));
+            WriteFile(pf, b, lstrlenA(b), &w, nullptr);
+            CloseHandle(pf);
+        }
+    }
     if (hr == 0 && out && *out && !R_CreateSrc && (!memcmp(&clsid, &xa27, sizeof(GUID)) || !memcmp(&clsid, &xa27d, sizeof(GUID)))) {
         void** vt = *(void***)*out;          // IXAudio2: slot 8 = CreateSourceVoice
         DWORD old;
@@ -659,6 +897,7 @@ static void XaResume() { if (XaObject) ((HRESULT (__stdcall*)(void*))(*(void***)
 static void XaOnSave(int slot) {
     EnterCriticalSection(&XaCs);
     SlotSerial[slot] = ++XaSerial;
+    XaEv(6, nullptr, nullptr, nullptr);
     XaReap();
     LeaveCriticalSection(&XaCs);
 }
@@ -666,18 +905,22 @@ static void XaOnSave(int slot) {
 static void XaBeforeRestore(int slot) {
     EnterCriticalSection(&XaCs);
     uint32_t T = SlotSerial[slot];
+    XaEv(7, nullptr, nullptr, nullptr);
     for (auto& v : Voices) {
         if (!v.in_use) continue;
         if (v.created > T) {                  // born after the save: gone before the memory is put back
+            XaEv(5, &v, v.px.real, v.cb);
+            XaKillCb(&v);
             if (!v.real_dead) ((void (__stdcall*)(void*))(*(void***)v.px.real)[18])(v.px.real);
             v.in_use = false;
         } else if (v.destroyed > T) {         // destroyed after the save: bring it back behind the same pointer
             struct { uint32_t n; void* p; } sl = {v.nsends, v.sends};
             void* nv = nullptr;
-            if (v.recreatable && R_CreateSrc && R_CreateSrc(XaObject, &nv, v.fmt, v.flags, v.maxfreq, v.cb, v.nsends ? &sl : nullptr, nullptr) == 0 && nv) {
+            if (v.recreatable && R_CreateSrc && R_CreateSrc(XaObject, &nv, v.fmt, v.flags, v.maxfreq, v.cb ? (void*)&v.shim : nullptr, v.nsends ? &sl : nullptr, nullptr) == 0 && nv) {
                 v.px.real = nv;
                 v.real_dead = false;
                 v.destroyed = 0;
+                XaEv(4, &v, nv, v.cb);
             }
         }
     }
@@ -701,6 +944,11 @@ static void SnapAfterCopy(const snap::Slot& sn) {
     s->hold = 1;
     s->paused = 0;
     NPending = 0;
+    XaEv(9, nullptr, nullptr, nullptr);
+    for (auto& v : Voices)                  // the game's memory is the saved one again: its callbacks are valid for the voices it knows
+        if (v.in_use && !v.real_dead) { v.cb_alive = 1; v.inflight = 0; }
+    MemoryBarrier();
+    XaCbGate = 0;
     XaResume();
     s->snap_result = 1;
     MemoryBarrier();
@@ -719,6 +967,9 @@ static void HandleSnap(Shm* s, uint32_t f, int64_t frozen) {
         s->snap_frame[slot] = ok ? f : 0;
         s->snap_result = ok ? 1 : 2;
     } else if (cmd == 2 && snap::Slots[slot].valid) {
+        XaCbGate = 1;               // from here on no callback reaches the game until the memory is back
+        MemoryBarrier();
+        for (auto& v : Voices) if (v.in_use) XaWaitIdle(&v);
         XaBeforeRestore((int)slot);
         XaPause();
         snap::Restore(&snap::Slots[slot], SnapAfterCopy);      // does not return
@@ -849,6 +1100,7 @@ static void Init() {
         if (arena::Init()) {
             snap::FindSections(exe);
             GateTls = TlsAlloc();                   // the gate is only used by savestates
+            AddVectoredExceptionHandler(1, CrashVeh);
             snap::ParkHook = ParkAll;
             snap::UnparkHook = UnparkAll;
             PatchIat(exe, "kernel32.dll", "HeapAlloc", (void*)H_HeapAlloc, &R_HeapAlloc);
