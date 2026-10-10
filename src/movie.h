@@ -11,6 +11,18 @@ typedef std::vector<KeyMask> Frames;    // one key bitmask per frame (see KEYS i
 // stores it as a "bookmark":true field).
 static const char kBookmarkFlag = '\x01';
 
+// A saved version of the movie (Branches window, like TAStudio's branches): its own inputs and notes, the movie row the
+// game was at when it was saved, and the settings that change what the game does.
+struct Branch {
+    std::string name, saved;          // saved: local time, "2026-10-11 14:03:27"
+    uint32_t frame = 0;               // the movie row the game ran next when it was saved (the cursor if no game was frozen)
+    std::vector<KeyMask> frames;
+    std::vector<std::string> notes;   // as Movie::notes
+    bool has_seed = false;
+    uint32_t seed = 0;
+    bool controller = false;
+};
+
 struct Movie {
     std::string author, created, prelude_id, prelude_desc;
     Frames frames;
@@ -19,6 +31,7 @@ struct Movie {
     bool controller = false;          // the game sees one virtual controller (the PAD_* keys); off = it sees none
     std::vector<std::string> notes;   // UTF-8 note per frame ("" = none); frames.size() long once loaded
     Frames prelude;     // embedded prelude (optional)
+    std::vector<Branch> branches;     // saved versions (optional "branches" in the file)
 
     bool Load(const std::wstring& path, std::string& err);
     bool Save(const std::wstring& path, std::string& err) const;
