@@ -245,6 +245,7 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
             if ((s = e.get("frame")) && s->t == J::Num && s->n >= 0) b.frame = (uint32_t)s->n;
             if ((s = e.get("rng_seed")) && s->t == J::Num && s->n >= 0 && s->n <= 4294967295.0) { b.has_seed = true; b.seed = (uint32_t)s->n; }
             b.controller = (s = e.get("controller")) && Truthy(*s);
+            if ((s = e.get("thumb")) && s->t == J::Str) b.thumb = s->s;
             Expand(*bf, b.frames);
             ReadNotes(e.get("notes"), b.frames.size(), b.notes);
             branches.push_back(std::move(b));
@@ -291,6 +292,7 @@ bool Movie::Save(const std::wstring& path, std::string& err) const {
             fprintf(f, ",\"frame\":%u", (unsigned)b.frame);
             if (b.has_seed) fprintf(f, ",\"rng_seed\":%u", (unsigned)b.seed); else fputs(",\"rng_seed\":null", f);
             if (b.controller) fputs(",\"controller\":true", f);
+            if (!b.thumb.empty()) { fputs(",\"thumb\":", f); Esc(f, b.thumb); }
             fputs(",\"frames\":", f);
             WriteFrames(f, b.frames);
             fputs(",\"notes\":", f);

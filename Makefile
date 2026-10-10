@@ -20,7 +20,7 @@ $B/app.o: src/app.rc src/app.manifest | $B
 	$(WINDRES) -O coff -i $< -o $@
 
 $B/bscotm_tas.exe: src/main.cpp src/engine.cpp src/movie.cpp src/common.h src/engine.h src/movie.h $B/app.o
-	$(CXX) $(CXXFLAGS) -mwindows -municode src/main.cpp src/engine.cpp src/movie.cpp $B/app.o -o $@ $(LDFLAGS) -lcomctl32 -lcomdlg32
+	$(CXX) $(CXXFLAGS) -mwindows -municode src/main.cpp src/engine.cpp src/movie.cpp $B/app.o -o $@ $(LDFLAGS) -lcomctl32 -lcomdlg32 -lole32 -lwindowscodecs -luuid
 
 $B/bscotm_hook.dll: src/hook.cpp src/common.h | $B
 	$(CXX) $(CXXFLAGS) -shared src/hook.cpp -o $@ $(LDFLAGS)
