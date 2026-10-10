@@ -122,15 +122,15 @@ int BitFromKey(const std::string& k) {
 
 // Sparse deltas ("same as previous, except...") -> dense masks.
 void Expand(const J& arr, Frames& out) {
-    uint16_t cur = 0;
+    KeyMask cur = 0;
     out.clear();
     out.reserve(arr.v.size());
     for (const J& f : arr.v) {
         for (size_t i = 0; i < f.keys.size(); i++) {
             int b = BitFromKey(f.keys[i]);
             if (b < 0) continue;
-            if (Truthy(f.v[i])) cur |= (uint16_t)(1u << b);
-            else cur &= (uint16_t)~(1u << b);
+            if (Truthy(f.v[i])) cur |= KeyBit(b);
+            else cur &= ~KeyBit(b);
         }
         out.push_back(cur);
     }
@@ -148,7 +148,7 @@ void Esc(FILE* f, const std::string& s) {
 
 void WriteFrames(FILE* f, const Frames& fr) {
     fputc('[', f);
-    uint16_t prev = 0;
+    KeyMask prev = 0;
     for (size_t i = 0; i < fr.size(); i++) {
         if (i) fputc(',', f);
         fputc('{', f);
@@ -156,7 +156,8 @@ void WriteFrames(FILE* f, const Frames& fr) {
         for (int b = 0; b < NUM_KEYS; b++) {
             int was = (prev >> b) & 1, now = (fr[i] >> b) & 1;
             if (was == now) continue;
-            fprintf(f, "%s\"%d\":%d", first ? "" : ",", KEYS[b].vk, now);
+            if (IsPadKey(b)) fprintf(f, "%s\"%s\":%d", first ? "" : ",", KEYS[b].name, now);     // controller keys have no VK: by name
+            else fprintf(f, "%s\"%d\":%d", first ? "" : ",", KEYS[b].vk, now);
             first = false;
         }
         fputc('}', f);
@@ -195,6 +196,8 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
     has_seed = false; seed = 0;
     const J* sd = root.get("rng_seed");
     if (sd && sd->t == J::Num && sd->n >= 0 && sd->n <= 4294967295.0) { has_seed = true; seed = (uint32_t)sd->n; }
+    const J* ct = root.get("controller");     // the game sees a (virtual) controller: see Movie::controller
+    controller = ct && Truthy(*ct);
     Expand(*fr, frames);
     notes.assign(frames.size(), std::string());
     const J* nt = root.get("notes");        // sparse: [{"frame": 12, "text": "..."}], frame is 1-based
@@ -216,8 +219,8 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
 bool Movie::Save(const std::wstring& path, std::string& err) const {
     FILE* f = _wfopen(path.c_str(), L"wb");
     if (!f) { err = "cannot write file"; return false; }
-    uint16_t used = 0;
-    for (uint16_t m : frames) used |= m;
+    KeyMask used = 0;
+    for (KeyMask m : frames) used |= m;
 
     fputs("{\"format\":\"bscotm-tas\",\"format_version\":1,"
           "\"game\":\"Bloodstained: Curse of the Moon\",\"game_version\":\"1.1.2\","
@@ -226,6 +229,7 @@ bool Movie::Save(const std::wstring& path, std::string& err) const {
     fputs(",\"created_utc\":", f);
     Esc(f, created);
     if (has_seed) fprintf(f, ",\"rng_seed\":%u", (unsigned)seed); else fputs(",\"rng_seed\":null", f);
+    if (controller) fputs(",\"controller\":true", f);       // only when on, so keyboard movies are written as before
     fputs(",\"anchors\":[],\"prelude_id\":", f);
     if (prelude_id.empty()) fputs("null", f); else Esc(f, prelude_id);
     fputs(",\"prelude_description\":", f);
@@ -234,7 +238,7 @@ bool Movie::Save(const std::wstring& path, std::string& err) const {
     if (prelude.empty()) fputs("null", f); else WriteFrames(f, prelude);
     fputs(",\"keys_used\":[", f);
     bool first = true;
-    for (int b = 0; b < NUM_KEYS; b++)
+    for (int b = 0; b < NUM_KB_KEYS; b++)          // keyboard keys only (they have a VK)
         if (used >> b & 1) { fprintf(f, "%s%d", first ? "" : ",", KEYS[b].vk); first = false; }
     fprintf(f, "],\"total_frames\":%u,\"frames\":", (unsigned)frames.size());
     WriteFrames(f, frames);

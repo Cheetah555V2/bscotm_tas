@@ -158,7 +158,7 @@ static bool Same(uint32_t a, uint32_t b) { return a == b; }
 static bool NoPlayer(const HistEntry& e) {
     float x, y;
     memcpy(&x, &e.v[5], 4); memcpy(&y, &e.v[6], 4);
-    return e.v[0] == 0 || e.v[0] > 255 || e.v[1] == 0xFFFFFFFFu || x != x || y != y || (x == 0 && y == 0);
+    return e.v[0] == 0 || e.v[0] > 255 || e.v[1] == 0xFFFFFFFFu || x != x || y != y || (x > -1 && x < 1 && y > -1 && y < 1);   // (the player is never at the origin; leftovers read as tiny numbers)
 }
 
 // Compares two runs of the same frames; prints the first difference. Returns the number of equal frames
@@ -221,8 +221,8 @@ static size_t Compare(const std::vector<HistEntry>& ref, const std::vector<HistE
 int wmain(int argc, wchar_t** argv) {
     if (argc < 2) { puts("usage: sstest movie.bscotm --exe X --dll X --baseline X --prelude X [--at N] [--gap N] [--reps N] [--speed N]"); return 2; }
     RunParams p;
-    std::wstring moviePath = argv[1], preludePath;
-    uint32_t at = 2000, gap = 300, reps = 3, speed = 24000, altoff = 0, alts = 3, soak = 0, cmpupto = 0, cmpchunk = 2000, cmpvariant = 0, nostates = 0, peekat = 0, cntfrom = 0, cntto = 0, dropcb = 0, rngscan = 0, maskarg = 0, dumprow = 0, quant = 60, lockarg = 3, lockstep = 0, loadatarg = 0, histarg = 1; std::string dumppath = "dump.bin";
+    std::wstring moviePath = argv[1], preludePath, otherPath;
+    uint32_t at = 2000, gap = 300, reps = 3, speed = 24000, altoff = 0, alts = 3, soak = 0, cmpupto = 0, cmpchunk = 2000, cmpvariant = 0, nostates = 0, peekat = 0, cntfrom = 0, cntto = 0, dropcb = 0, rngscan = 0, maskarg = 0, dumprow = 0, quant = 60, lockarg = 3, lockstep = 0, loadatarg = 0, histarg = 1, padarg = 2; std::string dumppath = "dump.bin";
     for (int i = 2; i + 1 < argc; i += 2) {
         std::wstring k = argv[i], v = argv[i + 1];
         if (k == L"--exe") p.exe = v;
@@ -251,6 +251,8 @@ int wmain(int argc, wchar_t** argv) {
         else if (k == L"--lockstep") lockstep = _wtoi(v.c_str());
         else if (k == L"--loadat") loadatarg = _wtoi(v.c_str());
         else if (k == L"--hist") histarg = _wtoi(v.c_str());
+        else if (k == L"--pad") padarg = _wtoi(v.c_str());       // 0 = no controller, 1 = the virtual controller; default: as the movie says
+        else if (k == L"--other") otherPath = v;      // --variant 3: the second run plays this movie instead (same length), e.g. a controller version of the first
         else if (k == L"--dump") dumprow = _wtoi(v.c_str());
         else if (k == L"--dumpfile") { char b[512]; WideCharToMultiByte(CP_ACP, 0, v.c_str(), -1, b, 512, nullptr, nullptr); dumppath = b; }
     }
@@ -265,6 +267,7 @@ int wmain(int argc, wchar_t** argv) {
     p.movie = m.frames;
     p.seeded = m.has_seed;
     p.seed = m.seed;
+    p.controller = padarg == 2 ? m.controller : padarg != 0;
     p.backup_dir = L"";
     p.hold = true;
     p.target = 1;
@@ -280,12 +283,15 @@ int wmain(int argc, wchar_t** argv) {
 
     if (cmpupto) {      // determinism of the editor's way of running: continuous vs in chunks with states vs with a load in the middle
         struct Run { std::string name; std::vector<HistEntry> h; bool ok = false; std::vector<uint16_t> t[4]; };
-        auto once = [&](const char* name, uint32_t chunk, uint32_t loadAt, uint32_t spd = 0, bool nosave = false, uint32_t launchTo = 0) {
+        Movie other;
+        if (!otherPath.empty() && !other.Load(otherPath, err)) { printf("other movie: %s\n", err.c_str()); return 2; }
+        auto once = [&](const char* name, uint32_t chunk, uint32_t loadAt, uint32_t spd = 0, bool nosave = false, uint32_t launchTo = 0, const Movie* alt = nullptr) {
             Run r;
             r.name = name;
             Session s2;
             RunCallbacks cb2;
             RunParams q = p;
+            if (alt) { q.movie = alt->frames; q.controller = alt->controller; }
             if (launchTo) q.target = launchTo;      // the editor's Rewind to cursor: the whole schedule is armed at launch
             if (spd) q.speed_milli = spd;
             RunResult rr2 = RunJob(q, cb2, &s2);
@@ -319,6 +325,9 @@ int wmain(int argc, wchar_t** argv) {
             printf("%s: markers by grid steps since the previous (0,1,2,3,4+): %u %u %u %u %u; irregular after 3000:", name, s2.s->gap_hist[0], s2.s->gap_hist[1], s2.s->gap_hist[2], s2.s->gap_hist[3], s2.s->gap_hist[4]);
             for (uint32_t i = 0; i < s2.s->gap_n && i < 64; i++) printf(" %u:%u", s2.s->gap_log[i] >> 4, s2.s->gap_log[i] & 15);
             printf("\n");
+            if (q.controller)
+                printf("%s: controller: real pads found %u, virtual pad reads %u (from the real pad %u), the game looked for controllers %u times\n",
+                       name, s2.s->pad_diag[0], s2.s->pad_diag[1], s2.s->pad_diag[2], s2.s->pad_diag[3]);
             if (q.quant_lock == 3)
                 printf("%s: frame clock: %u ticks/frame (freq %u), music wakes released %u, timed out %u, frames where time ran on by itself %u, markers that waited for real time %u\n",
                        name, s2.s->fc_diag[3], s2.s->fc_diag[4], s2.s->fc_diag[1], s2.s->fc_diag[2], s2.s->fc_diag[0], s2.s->fc_diag[5]);
@@ -339,7 +348,7 @@ int wmain(int argc, wchar_t** argv) {
             return r;
         };
         Run a = once("continuous", 0, 0);
-        Run b = a.ok ? (cmpvariant == 1 ? once("chunked, NO saves", cmpchunk, 0, 0, true) : cmpvariant == 3 ? once("continuous fast, second run", 0, 0) : cmpvariant == 2 ? once("continuous REAL TIME 1x", 0, 0, 1000) : cmpvariant == 4 ? once("editor rewind (armed at launch)", 0, 0, 0, false, cmpupto) : once("chunked+saves", cmpchunk, 0)) : Run();
+        Run b = a.ok ? (cmpvariant == 1 ? once("chunked, NO saves", cmpchunk, 0, 0, true) : cmpvariant == 3 ? once(otherPath.empty() ? "continuous fast, second run" : "the other movie", 0, 0, 0, false, 0, otherPath.empty() ? nullptr : &other) : cmpvariant == 2 ? once("continuous REAL TIME 1x", 0, 0, 1000) : cmpvariant == 4 ? once("editor rewind (armed at launch)", 0, 0, 0, false, cmpupto) : once("chunked+saves", cmpchunk, 0)) : Run();
         Run c = (b.ok && cmpvariant == 0) ? once("chunked+load", cmpchunk, loadatarg ? loadatarg : cmpupto / 2) : Run();
         int verdict = 0;      // exit code: 0 = every comparison identical, 1 = a difference, 2 = a run did not complete
         auto diff = [&](const Run& x, const Run& y) {
