@@ -97,6 +97,27 @@ struct App {
 } A;
 
 int S(int v) { return MulDiv(v, A.dpi, 96); }
+
+// A tool window placed next to the editor, moved (and if need be shrunk) into the work area of the editor's monitor,
+// so it never opens off screen when the editor hangs past an edge of the screen.
+RECT OnScreen(int x, int y, int w, int h, HWND on = nullptr) {
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(MonitorFromWindow(on ? on : A.wnd, MONITOR_DEFAULTTONEAREST), &mi);
+    const RECT& wa = mi.rcWork;
+    w = std::min(w, (int)(wa.right - wa.left));
+    h = std::min(h, (int)(wa.bottom - wa.top));
+    x = std::max((int)wa.left, std::min(x, (int)wa.right - w));
+    y = std::max((int)wa.top, std::min(y, (int)wa.bottom - h));
+    return RECT{x, y, x + w, y + h};
+}
+// The same for a tool window that is already open (it may have been left off screen), on the monitor it is on.
+void KeepOnScreen(HWND h) {
+    RECT r;
+    if (!GetWindowRect(h, &r)) return;
+    RECT n = OnScreen(r.left, r.top, r.right - r.left, r.bottom - r.top, h);
+    if (n.left != r.left || n.top != r.top || n.right != r.right || n.bottom != r.bottom)
+        SetWindowPos(h, nullptr, n.left, n.top, n.right - n.left, n.bottom - n.top, SWP_NOZORDER | SWP_NOACTIVATE);
+}
 int RowH()   { return S(18); }
 int HdrH()   { return S(24); }
 int FrameW() { return S(64); }
@@ -931,9 +952,10 @@ void ShowNotesList(bool bookmarks = false) {
     A.listBm = bookmarks;
     RECT pr;
     GetWindowRect(A.wnd, &pr);
+    RECT nr = OnScreen(pr.right - S(460), pr.top + S(90), S(440), S(360));
     A.notesWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmNotes", bookmarks ? L"Bookmarks" : L"Frame notes",
                                  WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
-                                 pr.right - S(460), pr.top + S(90), S(440), S(360), A.wnd, nullptr, nullptr, nullptr);
+                                 nr.left, nr.top, nr.right - nr.left, nr.bottom - nr.top, A.wnd, nullptr, nullptr, nullptr);
     if (!A.notesWnd) return;
     A.notesList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
@@ -1333,11 +1355,12 @@ LRESULT CALLBACK GraphProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowGraph() {
-    if (A.graphWnd) { SetForegroundWindow(A.graphWnd); return; }
+    if (A.graphWnd) { KeepOnScreen(A.graphWnd); SetForegroundWindow(A.graphWnd); return; }
     RECT pr;
     GetWindowRect(A.wnd, &pr);
+    RECT gr = OnScreen(pr.left + S(80), pr.top + S(100), S(900), S(500));
     A.graphWnd = CreateWindowExW(0, L"BscotmGraph", L"Value graph", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                                 pr.left + S(80), pr.top + S(100), S(900), S(500), A.wnd, nullptr, nullptr, nullptr);
+                                 gr.left, gr.top, gr.right - gr.left, gr.bottom - gr.top, A.wnd, nullptr, nullptr, nullptr);
     if (!A.graphWnd) return;
     A.graphList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_MULTIPLESEL,
                                   0, 0, 0, 0, A.graphWnd, nullptr, nullptr, nullptr);
@@ -1393,12 +1416,13 @@ LRESULT CALLBACK MemProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowMemory() {
-    if (A.memWnd) { SetForegroundWindow(A.memWnd); return; }
+    if (A.memWnd) { KeepOnScreen(A.memWnd); SetForegroundWindow(A.memWnd); return; }
     RECT pr;
     GetWindowRect(A.wnd, &pr);
+    RECT r = OnScreen(pr.right - S(440), pr.top + S(60), S(420), S(700));
     A.memWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmMem", L"Game memory",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
-                               pr.right - S(440), pr.top + S(60), S(420), S(700), A.wnd, nullptr, nullptr, nullptr);
+                               r.left, r.top, r.right - r.left, r.bottom - r.top, A.wnd, nullptr, nullptr, nullptr);
     if (!A.memWnd) return;
     HWND hchk = CreateWindowExW(0, L"BUTTON", L"Record history", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                 S(8), S(6), S(130), S(22), A.memWnd, (HMENU)(INT_PTR)IDC_MEM_HIST, nullptr, nullptr);
@@ -1565,12 +1589,13 @@ LRESULT CALLBACK RngProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowRngLog() {
-    if (A.rngWnd) { SetForegroundWindow(A.rngWnd); return; }
+    if (A.rngWnd) { KeepOnScreen(A.rngWnd); SetForegroundWindow(A.rngWnd); return; }
     RECT pr;
     GetWindowRect(A.wnd, &pr);
+    RECT rr = OnScreen(pr.left + S(60), pr.top + S(120), S(760), S(480));
     A.rngWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmRng", L"RNG log",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
-                               pr.left + S(60), pr.top + S(120), S(760), S(480), A.wnd, nullptr, nullptr, nullptr);
+                               rr.left, rr.top, rr.right - rr.left, rr.bottom - rr.top, A.wnd, nullptr, nullptr, nullptr);
     if (!A.rngWnd) return;
     HWND chk = CreateWindowExW(0, L"BUTTON", L"Log the game's random draws", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                S(8), S(6), S(210), S(22), A.rngWnd, (HMENU)(INT_PTR)IDC_RNG_CHK, nullptr, nullptr);
@@ -1737,9 +1762,10 @@ void ShowHelp(int topic) {
     if (!helpWnd) {
         RECT pr;
         GetWindowRect(A.wnd, &pr);
+        RECT hr = OnScreen(pr.left + S(50), pr.top + S(60), S(860), S(560));
         helpWnd = CreateWindowExW(0, L"BscotmHelp", L"bscotm-tas Help",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                                  pr.left + S(50), pr.top + S(60), S(860), S(560), A.wnd, nullptr, nullptr, nullptr);
+                                  hr.left, hr.top, hr.right - hr.left, hr.bottom - hr.top, A.wnd, nullptr, nullptr, nullptr);
         if (!helpWnd) return;
         helpList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | WS_VSCROLL,
                                    0, 0, 0, 0, helpWnd, (HMENU)(INT_PTR)IDC_HELP_TOPICS, nullptr, nullptr);
