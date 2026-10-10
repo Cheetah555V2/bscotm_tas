@@ -128,7 +128,8 @@ otherwise use **File > Set game path**.
 |---|---|
 | **Record new** (F8) | Relaunch the game and record from its first frame |
 | **Play** (F5) | Relaunch the game and play the whole movie in real time |
-| **Rewind to cursor** (F6, or double-click a frame number) | Relaunch, fast-forward to the cursor row, then **freeze** the game there |
+| **Rewind to cursor** (F6) | Relaunch, fast-forward to the cursor row, then **freeze** the game there |
+| **Double-click a frame number** | Go to that frame: if the frozen game has not reached it yet, run forward from where it is (no restart); if it is past it, or a frame before the game's position was edited, rewind (from the nearest valid savestate, else from frame 1) |
 | **Frame advance** (`.`) | Run exactly one frame of the frozen game using the next grid row's inputs (hold `.` to auto-repeat) |
 | **Run to cursor** (F4, or right-click a row > *Run game to frame N*) | Advance the frozen game through many frames at once, up to the cursor row, using the grid's inputs (past the end of the movie it appends blank frames). Runs at the fast-forward speed and gives the same result as stepping one by one (500 frames in about 1 s instead of 15 s). **Stop** (F9) cancels and freezes at the next frame. If the game is already at or past the cursor, use Rewind |
 | **Record here** (F12) | Unfreeze the game and record your live keyboard from the frozen frame (click the game window and play). **Stop** (F9) freezes the game again right after the last recorded frame, so you can keep stepping or record again |

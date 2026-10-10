@@ -822,7 +822,8 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDBLCLK:
             if (!A.busy && ColAt((short)LOWORD(lp)) < 0 && (short)HIWORD(lp) >= HdrH()) {
                 SetCursorRow(RowAt((short)HIWORD(lp)), false);
-                PostMessageW(A.wnd, WM_COMMAND, IDM_REWIND, 0);
+                PostMessageW(A.wnd, WM_COMMAND, IDM_JUMPCUR, 0);      // run forward if the frozen game has not got there yet, else rewind
+
             }
             return 0;
         case WM_MOUSEWHEEL:
@@ -1623,7 +1624,8 @@ const HelpTopic HELP_TOPICS[] = {
     {L"Recording and playing",
      L"Record new (F8): relaunch the game and record your keyboard from its first frame.\r\n"
      L"Play (F5): relaunch the game and play the whole movie in real time.\r\n"
-     L"Rewind to cursor (F6, or double-click a frame number): relaunch, fast-forward to the cursor row and freeze the game there.\r\n"
+     L"Rewind to cursor (F6): relaunch, fast-forward to the cursor row and freeze the game there.\r\n"
+     L"Double-click a frame number: go to that frame. If the frozen game has not reached it yet it just runs forward from where it is; if the game is past it, or a frame before the game's position was edited, it rewinds.\r\n"
      L"Record from cursor (F7): play to the cursor row, then record live from the next frame.\r\n"
      L"Record here (F12): unfreeze the game and record your keyboard from the frozen frame. Stop (F9) freezes it again.\r\n"
      L"Resume live (F11): unfreeze the game and take over with the keyboard (not recorded).\r\n"
