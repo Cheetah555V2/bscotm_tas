@@ -187,6 +187,21 @@ static size_t Compare(const std::vector<HistEntry>& ref, const std::vector<HistE
                     }
                 }
                 identical = false;
+                {   // every stretch of frames that differ (a difference that heals by itself is a reading artifact, e.g. a freed object during a load)
+                    uint32_t start = 0, prev = 0, nranges = 0, last = 0;
+                    printf("    differing frames:");
+                    for (const auto& g2 : got) {
+                        auto r1 = byframe.find(g2.frame);
+                        if (r1 == byframe.end()) continue;
+                        last = g2.frame;
+                        bool diff = false;
+                        for (int q = 0; q < HIST_FIELDS; q++) if (r1->second.v[q] != g2.v[q]) diff = true;
+                        if (diff && !(start && g2.frame == prev + 1)) { if (start) { if (nranges++ < 20) printf(" %u-%u", start, prev); } start = g2.frame; }
+                        if (diff) prev = g2.frame;
+                    }
+                    if (start && nranges++ < 20) printf(" %u-%u", start, prev);
+                    printf(" (%u stretches; last compared frame %u)\n", nranges, last);
+                }
                 return ok;
             }
         }

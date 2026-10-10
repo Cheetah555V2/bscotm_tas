@@ -461,25 +461,30 @@ template <int... I> static const void* const* StubTable(std::integer_sequence<in
     static const void* const t[] = {(const void*)&CmdStub<I>...};
     return t;
 }
+static uint32_t  CmdRun[CMD_COUNT];                  // what each entry holds when not skipped: the original, or a wrapper (CMD_RELEASE)
+static bool CmdInit() {
+    if (CmdReady) return true;
+    BYTE* base = (BYTE*)GetModuleHandleW(NULL);
+    auto nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    uint32_t lo = (uint32_t)(uintptr_t)base, hi = lo + nt->OptionalHeader.SizeOfImage;
+    uint32_t* t = (uint32_t*)(base + CMD_TABLE_RVA);
+    for (uint32_t i = 0; i < CMD_COUNT; i++)         // every entry must be a function inside the exe
+        if (t[i] < lo || t[i] >= hi) { S->status |= ST_NORENDER_BAD; return false; }
+    memcpy(CmdOrig, t, sizeof CmdOrig);
+    memcpy(CmdRun, t, sizeof CmdRun);
+    CmdTab = t;
+    CmdReady = true;
+    return true;
+}
 static void SetCmdSkip(bool on) {
     if (on == CmdOff) return;
-    if (!CmdReady) {
-        BYTE* base = (BYTE*)GetModuleHandleW(NULL);
-        auto nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
-        uint32_t lo = (uint32_t)(uintptr_t)base, hi = lo + nt->OptionalHeader.SizeOfImage;
-        uint32_t* t = (uint32_t*)(base + CMD_TABLE_RVA);
-        for (uint32_t i = 0; i < CMD_COUNT; i++)         // every entry must be a function inside the exe
-            if (t[i] < lo || t[i] >= hi) { CmdReady = CmdOff = false; S->status |= ST_NORENDER_BAD; return; }
-        memcpy(CmdOrig, t, sizeof CmdOrig);
-        CmdTab = t;
-        CmdReady = true;
-    }
+    if (!CmdInit()) { CmdOff = false; return; }
     DWORD old;
     if (!VirtualProtect(CmdTab, sizeof CmdOrig, PAGE_READWRITE, &old)) return;
     static const void* const* stubs = StubTable(std::make_integer_sequence<int, CMD_COUNT>());
     uint64_t m = ((uint64_t)S->cmd_skip_hi << 32) | S->cmd_skip_lo;
     if (!m) m = CMD_SKIP_DEFAULT;
-    for (uint32_t i = 0; i < CMD_COUNT; i++) CmdTab[i] = (on && (m >> i & 1)) ? (uint32_t)(uintptr_t)stubs[i] : CmdOrig[i];
+    for (uint32_t i = 0; i < CMD_COUNT; i++) CmdTab[i] = (on && (m >> i & 1)) ? (uint32_t)(uintptr_t)stubs[i] : CmdRun[i];
     VirtualProtect(CmdTab, sizeof CmdOrig, old, &old);
     CmdOff = on;
 }
@@ -539,6 +544,38 @@ static void ZPatch(void* obj) {
     NZC++;
     vt[2] = (void*)H_ZRelease;
     VirtualProtect(&vt[1], 8, old, &old);
+}
+// Render command 29 (handler exe+0x29F6F0) releases two objects: cmd+0xC -> +0x14 -> objects at +4 and +8, each through
+// its vtable slot 2 (Release). They are not made by a device method the hook covers above, so on the title screen (about
+// frame 165) the game really freed one; a state saved before that brought back the game's pointer, the replay released the
+// freed object again, and on the second load the memory had been reused: the game crashed (access violation at
+// exe+0x29F707, then ExitProcess(1)). With savestates on, the command goes through this wrapper, which makes the classes of
+// both objects immortal before the game's handler releases them.
+static const uint32_t CMD_RELEASE = 29;
+static bool InModuleImage(const void* p) {
+    HMODULE m;
+    return p && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)p, &m);
+}
+static void __attribute__((thiscall)) CmdRelease(void* self, uint8_t* cmd) {
+    auto rd = [](uintptr_t a) { uintptr_t v = 0; SIZE_T g = 0; return a && ReadProcessMemory(GetCurrentProcess(), (void*)a, &v, 4, &g) && g == 4 ? v : 0; };
+    uintptr_t res = rd(rd((uintptr_t)cmd + 0xC) + 0x14);
+    for (uintptr_t off : {4u, 8u}) {
+        uintptr_t obj = rd(res + off);
+        if (obj && InModuleImage((void*)rd(obj))) ZPatch((void*)obj);      // a COM object: its vtable lives in a module
+    }
+    ((void (__attribute__((thiscall)) *)(void*, uint8_t*))(uintptr_t)CmdOrig[CMD_RELEASE])(self, cmd);
+}
+// At the first frame marker, with savestates on: route command 29 through CmdRelease.
+static void InstallCmdRelease() {
+    static bool done;
+    if (done || !(S->features & FEAT_SAVESTATE)) return;
+    done = true;
+    if (!CmdInit()) return;
+    CmdRun[CMD_RELEASE] = (uint32_t)(uintptr_t)&CmdRelease;
+    DWORD old;
+    if (CmdOff || !VirtualProtect(&CmdTab[CMD_RELEASE], 4, PAGE_READWRITE, &old)) return;     // while skipping, SetCmdSkip puts CmdRun back later
+    CmdTab[CMD_RELEASE] = CmdRun[CMD_RELEASE];
+    VirtualProtect(&CmdTab[CMD_RELEASE], 4, old, &old);
 }
 static void* DevOrig[128];                           // original device methods by vtable slot
 #define ZPOST(out) do { void** pp = (void**)(out); if (hr == 0 && pp && *pp) ZPatch(*pp); } while (0)
@@ -1557,6 +1594,7 @@ static void FcMarker(uint32_t f) {
 // ---- input -----------------------------------------------------------------
 static void Marker(Shm* s) {
     JoinThreads();
+    InstallCmdRelease();
     uint32_t f = s->frame + 1;
     s->frame = f;
     if (FcMode()) FcMarker(f);

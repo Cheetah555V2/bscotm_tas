@@ -813,3 +813,26 @@ where the main thread spends its time.
 - Where a frame's time goes at Max (main thread, drawing skipped): the game's own logic ~43%, `ntdll` ~39% (mostly the game's
   heap allocations, `exe+0x316DEB`), D3DX math ~12%, XAudio2 calls ~2%, the hook ~2%. Going faster would mean doing less of
   the game's own per-frame work.
+
+## Saves on the title screen (render command 29)
+
+A state saved before about frame 165 of the boot / title sequence (no input yet; the game has not loaded its save file)
+restored correctly once, but the game crashed after the *second* load, at marker 170: an access violation at `exe+0x29F707`
+(reading `0xBF800008`), then the game's own handler called `ExitProcess(1)`. Saves at frame 170 and later never failed.
+`sstest --at 100 --gap 300 --reps 3` reproduced it in 11 of 12 launches, also with v0.9.3 and the old clock, so it was not
+caused by the frame clock.
+
+Cause: render command type 29 (handler `exe+0x29F6F0`, not in the skip set) releases two COM objects:
+`cmd+0xC -> +0x14 -> [+4]` and `[+8]`, each through vtable slot 2. Around frame 165 it releases objects that are not made by
+any of the device methods the hook makes immortal, so they were really freed. A load from before that point brings back the
+game's pointers and the replay releases them again; the first time the freed memory still looked like the object, by the
+second replay it had been reused, and `Release` jumped through garbage (`0xBF800000` is the float -1.0).
+
+Fix: with savestates on, the hook routes command 29 through a wrapper (a data write in the command table, like the render
+skip) that makes the class of both objects immortal (the same `ZPatch` as for textures and buffers) and then calls the
+game's handler. Result: saves at frames 50, 100, 120 and 160, 3 launches each, all 3/3 identical; 8 loads in a row from
+frame 100 identical; then different inputs survive.
+
+Note for `sstest`: a state replayed across a stage load can report "differing frames" only while no player exists (the
+history sampler follows the pointer chain into memory the load has not initialised yet); every frame after the load matches.
+`sstest` now prints every differing stretch, so such a self-healing difference is easy to tell from a real divergence.
