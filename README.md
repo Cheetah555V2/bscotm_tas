@@ -22,17 +22,23 @@ back. The whole tool is two small native files (no Python, no Frida):
 - **Frame 1 is the game's own first frame marker.** Playback and recording both
   start there, never after a wall-clock "boot finished" wait, so a slow (cold)
   first launch cannot shift the inputs.
-- **Fast-forward.** While replaying to the cursor the hook scales the game's clocks
-  (`QueryPerformanceCounter`, `timeGetTime`, `GetSystemTimeAsFileTime`, `Sleep`,
-  `WaitForSingleObject`, again through the game's own import slots) and drops
-  vsync when the D3D9 device is created. Both are needed: the game paces itself on
-  QPC *and* vsync. Frames stay deterministic (same end state at 1x and 24x; the clocks the game reads are snapped to a 1/60 s grid, see the docs), and
-  the hook returns to real time exactly on the frame the replay ends. While
-  fast-forwarding it also skips drawing (D3D `Present`/`Clear`/`Draw*` return at once,
-  except for the last 2 frames so the frozen picture is real) and answers the game's
-  key polls without asking Windows: about 1000 frames per second instead of 340. It also
-  stops the game's own render-command queue from running the drawing commands that are
-  safe to skip (about 1.3x faster again; see the docs).
+- **Frame clock.** Every clock the game reads (`QueryPerformanceCounter`, `timeGetTime`,
+  `GetSystemTimeAsFileTime`, through the game's own import slots) is a function of the
+  frame number: time advances only at a frame marker, by exactly one 1/60 s frame. The
+  game's frame limiter then starts each frame at once, and nothing the game measures
+  depends on how fast the PC is or how Windows schedules its threads. The game's music
+  sequencer runs on its own thread and advances the song by the time it measures; the hook
+  wakes that thread twice per frame from the frame marker, each wake at a fixed time inside
+  the frame, so music-timed events (such as the stage-clear sequence) land on the same frame
+  every time. Speed is set by waiting at the frame marker: 1x waits for real time, Max does
+  not wait at all. The same movie gives the same result frame by frame at 1x, at Max, run
+  in chunks, stepped, or after a savestate load (see the docs).
+- **Fast-forward.** The hook drops vsync when the D3D9 device is created and, while
+  fast-forwarding, skips drawing (D3D `Present`/`Clear`/`Draw*` return at once, except for
+  the last 2 frames so the frozen picture is real), answers the game's key polls without
+  asking Windows, and stops the game's own render-command queue from running the drawing
+  commands that are safe to skip. At Max the game then runs as fast as it can compute its
+  frames: about 1700-2000 frames per second (28-34x real time) on the dev machine.
 - **Frame advance.** The hook blocks the game thread inside the input poll at a
   frame marker (before the frame's input is read) and releases it one frame per step.
   The virtual clock is frozen during the hold so the limiter does not see the pause
@@ -122,7 +128,8 @@ otherwise use **File > Set game path**.
 |---|---|
 | **Record new** (F8) | Relaunch the game and record from its first frame |
 | **Play** (F5) | Relaunch the game and play the whole movie in real time |
-| **Rewind to cursor** (F6, or double-click a frame number) | Relaunch, fast-forward to the cursor row, then **freeze** the game there |
+| **Rewind to cursor** (F6) | Relaunch, fast-forward to the cursor row, then **freeze** the game there |
+| **Double-click a frame number** | Go to that frame: if the frozen game has not reached it yet, run forward from where it is (no restart); if it is past it, or a frame before the game's position was edited, rewind (from the nearest valid savestate, else from frame 1) |
 | **Frame advance** (`.`) | Run exactly one frame of the frozen game using the next grid row's inputs (hold `.` to auto-repeat) |
 | **Run to cursor** (F4, or right-click a row > *Run game to frame N*) | Advance the frozen game through many frames at once, up to the cursor row, using the grid's inputs (past the end of the movie it appends blank frames). Runs at the fast-forward speed and gives the same result as stepping one by one (500 frames in about 1 s instead of 15 s). **Stop** (F9) cancels and freezes at the next frame. If the game is already at or past the cursor, use Rewind |
 | **Record here** (F12) | Unfreeze the game and record your live keyboard from the frozen frame (click the game window and play). **Stop** (F9) freezes the game again right after the last recorded frame, so you can keep stepping or record again |
@@ -137,8 +144,9 @@ next advance first replays to the greenzone edge, then steps. Stepping forward o
 to go back, move the cursor and Rewind (it replays from frame 1 at speed).
 
 Rewind and Record from cursor fast-forward at the speed chosen in
-**Run > Fast-forward speed** (default Max, 24x: a 1461-frame prelude takes about
-5 s instead of 26 s). Audio is garbled while fast-forwarding.
+**Run > Fast-forward speed** (default Max: as fast as the game can run, about 30x; a
+1461-frame prelude takes under a second instead of 24 s). Every speed gives exactly the
+same result. Audio is garbled while fast-forwarding.
 
 **Baseline** is a snapshot of the game's save files restored before every
 launch (so runs start from the same state). Create one with
@@ -228,6 +236,10 @@ captured against a different start point.
 - Green frame numbers are the "greenzone": frames the live game has been advanced
   through. Editing a frame invalidates the greenzone after it.
 
+Set the environment variable `BSCOTM_DEBUG` to make the hook also write diagnostic files to `%TEMP%`
+(`bscotm_probe.txt`, `bscotm_threads.txt`, `bscotm_exit.txt`); the crash log `bscotm_crash.txt` is always
+written when the game crashes.
+
 Settings are stored in `bscotm_tas.ini` next to the exe. Save backups, baselines
 and preludes live in `save_backups\` and `preludes\` next to the game folder.
 Your saves are copied to `save_backups\last_user_state` before a baseline is
@@ -235,8 +247,14 @@ restored.
 
 ## Known limitations
 
-- Rewind = restart the game and fast-forward (still replays from frame 1). No true
-  savestates: the game's anti-tamper makes snapshot/restore unreliable.
+- Savestates are experimental (*Run > Use savestates*, on by default). Rewind and Jump load the nearest
+  state and fast-forward from there; with savestates off, or when none is usable, they restart the game and
+  replay from frame 1. Known gaps: about 1 in 24 saves made very early (around frame 100) restores badly,
+  sound and picture are not restored, D3D9 video memory is not given back while states exist, and nothing
+  survives closing the game. Details: `docs/REVERSE_ENGINEERING.md`.
+- Movies recorded with the 1/60 s clock grid (pull requests #21 and #22, Oct 9-10) ran the game's music clock at double
+  speed per frame, so music-timed events (the stage-clear sequence) land later now and such movies may need
+  re-syncing after those points. Older movies and real-time recordings match the new timing.
 - Keyboard only. No controller (DirectInput) support yet.
 - The RNG seed fixes the random numbers at launch only; changed inputs can still change later random results (see "How the game's RNG works").
 

@@ -84,6 +84,7 @@ struct App {
     bool useStates = true;        // Run > Use savestates (on by default): launch the game with the private heap so states can be saved
     int  ssEvery = 2000;          // automatic state every this many frames while the game is advanced (0 = never)
     bool ssManual[8] = {};        // slots saved by hand (never evicted automatically)
+    bool ssStale[8] = {};         // slots saved before an edit to an earlier row: never loaded again, only overwritten
     int  chunkFrom = 0;           // first row of the batch being run (Run to cursor runs in pieces so states can be saved between them)
     bool stepping = false;        // a batch of frames is running (busy is set too)
     int runFrom = 0, runTarget = 0;   // rows the batch started at / will stop before
@@ -96,6 +97,27 @@ struct App {
 } A;
 
 int S(int v) { return MulDiv(v, A.dpi, 96); }
+
+// A tool window placed next to the editor, moved (and if need be shrunk) into the work area of the editor's monitor,
+// so it never opens off screen when the editor hangs past an edge of the screen.
+RECT OnScreen(int x, int y, int w, int h, HWND on = nullptr) {
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(MonitorFromWindow(on ? on : A.wnd, MONITOR_DEFAULTTONEAREST), &mi);
+    const RECT& wa = mi.rcWork;
+    w = std::min(w, (int)(wa.right - wa.left));
+    h = std::min(h, (int)(wa.bottom - wa.top));
+    x = std::max((int)wa.left, std::min(x, (int)wa.right - w));
+    y = std::max((int)wa.top, std::min(y, (int)wa.bottom - h));
+    return RECT{x, y, x + w, y + h};
+}
+// The same for a tool window that is already open (it may have been left off screen), on the monitor it is on.
+void KeepOnScreen(HWND h) {
+    RECT r;
+    if (!GetWindowRect(h, &r)) return;
+    RECT n = OnScreen(r.left, r.top, r.right - r.left, r.bottom - r.top, h);
+    if (n.left != r.left || n.top != r.top || n.right != r.right || n.bottom != r.bottom)
+        SetWindowPos(h, nullptr, n.left, n.top, n.right - n.left, n.bottom - n.top, SWP_NOZORDER | SWP_NOACTIVATE);
+}
 int RowH()   { return S(18); }
 int HdrH()   { return S(24); }
 int FrameW() { return S(64); }
@@ -163,10 +185,18 @@ void SetCursorRow(int row, bool extend) {
     UpdateStatus();
 }
 
+// A state restores the game frozen before its row, so it depends on every row before that one. An edit at
+// `pos` (-1: the seed, prelude, baseline or movie changed) makes the states after it stale for good: the
+// greenzone grows back past them as the game runs on, so "row <= reached" alone would let them be loaded.
+void StaleStatesAfter(int pos) {
+    for (int i = 0; i < 8; i++) if (A.sess.StateRow(i) > pos) A.ssStale[i] = true;
+}
+
 // ---- editing (every change goes through DoSplice so it is undoable) -------
 void Touch(size_t pos) {
     A.dirty = true;
     if ((int)pos < A.reached) A.reached = (int)pos;
+    StaleStatesAfter((int)pos);
 }
 
 void RefreshNotesList();
@@ -634,7 +664,7 @@ void EditSeed() {
     A.movie.has_seed = has;
     A.movie.seed = (uint32_t)v;
     A.dirty = true;
-    A.reached = 0;
+    A.reached = 0; StaleStatesAfter(-1);
     InvalidateRect(A.grid, nullptr, FALSE);
     UpdateTitle(); UpdateStatus();
     SetMsg(has ? L"RNG seed " + std::to_wstring(A.movie.seed) + L". Rewind (F6) to restart the game with it."
@@ -813,7 +843,8 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDBLCLK:
             if (!A.busy && ColAt((short)LOWORD(lp)) < 0 && (short)HIWORD(lp) >= HdrH()) {
                 SetCursorRow(RowAt((short)HIWORD(lp)), false);
-                PostMessageW(A.wnd, WM_COMMAND, IDM_REWIND, 0);
+                PostMessageW(A.wnd, WM_COMMAND, IDM_JUMPCUR, 0);      // run forward if the frozen game has not got there yet, else rewind
+
             }
             return 0;
         case WM_MOUSEWHEEL:
@@ -921,9 +952,10 @@ void ShowNotesList(bool bookmarks = false) {
     A.listBm = bookmarks;
     RECT pr;
     GetWindowRect(A.wnd, &pr);
+    RECT nr = OnScreen(pr.right - S(460), pr.top + S(90), S(440), S(360));
     A.notesWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmNotes", bookmarks ? L"Bookmarks" : L"Frame notes",
                                  WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
-                                 pr.right - S(460), pr.top + S(90), S(440), S(360), A.wnd, nullptr, nullptr, nullptr);
+                                 nr.left, nr.top, nr.right - nr.left, nr.bottom - nr.top, A.wnd, nullptr, nullptr, nullptr);
     if (!A.notesWnd) return;
     A.notesList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
@@ -1323,11 +1355,12 @@ LRESULT CALLBACK GraphProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowGraph() {
-    if (A.graphWnd) { SetForegroundWindow(A.graphWnd); return; }
+    if (A.graphWnd) { KeepOnScreen(A.graphWnd); SetForegroundWindow(A.graphWnd); return; }
     RECT pr;
     GetWindowRect(A.wnd, &pr);
+    RECT gr = OnScreen(pr.left + S(80), pr.top + S(100), S(900), S(500));
     A.graphWnd = CreateWindowExW(0, L"BscotmGraph", L"Value graph", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                                 pr.left + S(80), pr.top + S(100), S(900), S(500), A.wnd, nullptr, nullptr, nullptr);
+                                 gr.left, gr.top, gr.right - gr.left, gr.bottom - gr.top, A.wnd, nullptr, nullptr, nullptr);
     if (!A.graphWnd) return;
     A.graphList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_MULTIPLESEL,
                                   0, 0, 0, 0, A.graphWnd, nullptr, nullptr, nullptr);
@@ -1383,12 +1416,13 @@ LRESULT CALLBACK MemProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowMemory() {
-    if (A.memWnd) { SetForegroundWindow(A.memWnd); return; }
+    if (A.memWnd) { KeepOnScreen(A.memWnd); SetForegroundWindow(A.memWnd); return; }
     RECT pr;
     GetWindowRect(A.wnd, &pr);
+    RECT r = OnScreen(pr.right - S(440), pr.top + S(60), S(420), S(700));
     A.memWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmMem", L"Game memory",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
-                               pr.right - S(440), pr.top + S(60), S(420), S(700), A.wnd, nullptr, nullptr, nullptr);
+                               r.left, r.top, r.right - r.left, r.bottom - r.top, A.wnd, nullptr, nullptr, nullptr);
     if (!A.memWnd) return;
     HWND hchk = CreateWindowExW(0, L"BUTTON", L"Record history", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                 S(8), S(6), S(130), S(22), A.memWnd, (HMENU)(INT_PTR)IDC_MEM_HIST, nullptr, nullptr);
@@ -1555,12 +1589,13 @@ LRESULT CALLBACK RngProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowRngLog() {
-    if (A.rngWnd) { SetForegroundWindow(A.rngWnd); return; }
+    if (A.rngWnd) { KeepOnScreen(A.rngWnd); SetForegroundWindow(A.rngWnd); return; }
     RECT pr;
     GetWindowRect(A.wnd, &pr);
+    RECT rr = OnScreen(pr.left + S(60), pr.top + S(120), S(760), S(480));
     A.rngWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmRng", L"RNG log",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
-                               pr.left + S(60), pr.top + S(120), S(760), S(480), A.wnd, nullptr, nullptr, nullptr);
+                               rr.left, rr.top, rr.right - rr.left, rr.bottom - rr.top, A.wnd, nullptr, nullptr, nullptr);
     if (!A.rngWnd) return;
     HWND chk = CreateWindowExW(0, L"BUTTON", L"Log the game's random draws", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                S(8), S(6), S(210), S(22), A.rngWnd, (HMENU)(INT_PTR)IDC_RNG_CHK, nullptr, nullptr);
@@ -1614,13 +1649,14 @@ const HelpTopic HELP_TOPICS[] = {
     {L"Recording and playing",
      L"Record new (F8): relaunch the game and record your keyboard from its first frame.\r\n"
      L"Play (F5): relaunch the game and play the whole movie in real time.\r\n"
-     L"Rewind to cursor (F6, or double-click a frame number): relaunch, fast-forward to the cursor row and freeze the game there.\r\n"
+     L"Rewind to cursor (F6): relaunch, fast-forward to the cursor row and freeze the game there.\r\n"
+     L"Double-click a frame number: go to that frame. If the frozen game has not reached it yet it just runs forward from where it is; if the game is past it, or a frame before the game's position was edited, it rewinds.\r\n"
      L"Record from cursor (F7): play to the cursor row, then record live from the next frame.\r\n"
      L"Record here (F12): unfreeze the game and record your keyboard from the frozen frame. Stop (F9) freezes it again.\r\n"
      L"Resume live (F11): unfreeze the game and take over with the keyboard (not recorded).\r\n"
      L"Stop (F9): end the current run.\r\n\r\n"
      L"Fast-forward\r\n"
-     L"Rewind and the jumps run the game faster than real time. The speed is in Run > Fast-forward speed (default: Max, 24x). The game window may look frozen or garbled while it fast-forwards; audio is garbled too. Only the last frames before the stopping point are drawn.\r\n\r\n"
+     L"Rewind and the jumps run the game faster than real time. The speed is in Run > Fast-forward speed (default: Max, as fast as the game can run, about 25-30x). The game window may look frozen or garbled while it fast-forwards; audio is garbled too. Only the last frames before the stopping point are drawn.\r\n\r\n"
      L"The game window\r\n"
      L"The game accepts the tool's input even when the editor has focus. To type into the game yourself (Record here, Resume live), click the game window first."},
     {L"Frame advance and run",
@@ -1629,7 +1665,7 @@ const HelpTopic HELP_TOPICS[] = {
      L"Greenzone\r\n"
      L"Green frame numbers are frames the live game has been advanced through. Editing a frame before the game's position makes the later green frames invalid: the next advance first replays from the start to the edge of the green area, then steps.\r\n\r\n"
      L"Going back\r\n"
-     L"The game cannot step backwards. To go back, move the cursor and Rewind (F6): it relaunches the game and fast-forwards to the cursor. A launch takes about 1.5 s; the replay runs at roughly 1800 frames per second."},
+     L"The game cannot step backwards. To go back, move the cursor and Rewind (F6): it relaunches the game and fast-forwards to the cursor. A launch takes about 1.5 s; the replay runs at roughly 1700-2000 frames per second at Max, and gives exactly the same result at every speed."},
     {L"Editing frames",
      L"Painting: click or drag on a key cell to toggle it. Rows past the end extend the movie.\r\n"
      L"Selecting rows: click a frame number; Shift+click or drag to extend.\r\n"
@@ -1726,9 +1762,10 @@ void ShowHelp(int topic) {
     if (!helpWnd) {
         RECT pr;
         GetWindowRect(A.wnd, &pr);
+        RECT hr = OnScreen(pr.left + S(50), pr.top + S(60), S(860), S(560));
         helpWnd = CreateWindowExW(0, L"BscotmHelp", L"bscotm-tas Help",
                                   WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                                  pr.left + S(50), pr.top + S(60), S(860), S(560), A.wnd, nullptr, nullptr, nullptr);
+                                  hr.left, hr.top, hr.right - hr.left, hr.bottom - hr.top, A.wnd, nullptr, nullptr, nullptr);
         if (!helpWnd) return;
         helpList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | WS_VSCROLL,
                                    0, 0, 0, 0, helpWnd, (HMENU)(INT_PTR)IDC_HELP_TOPICS, nullptr, nullptr);
@@ -1851,7 +1888,7 @@ void LoadPath(const std::wstring& p) {
     A.path = p;
     A.dirty = false;
     A.undo.clear(); A.redo.clear();
-    A.cursor = A.anchor = A.top = A.reached = 0;
+    A.cursor = A.anchor = A.top = A.reached = 0; StaleStatesAfter(-1);
     if (!A.movie.prelude_id.empty()) {
         int i = (int)SendMessageW(A.cbPre, CB_FINDSTRINGEXACT, 0, (LPARAM)W(A.movie.prelude_id).c_str());
         if (i >= 0) SendMessageW(A.cbPre, CB_SETCURSEL, i, 0);
@@ -1908,7 +1945,7 @@ void FileNew() {
     A.movie = Movie();
     A.path.clear(); A.dirty = false;
     A.undo.clear(); A.redo.clear();
-    A.cursor = A.anchor = A.top = A.reached = 0;
+    A.cursor = A.anchor = A.top = A.reached = 0; StaleStatesAfter(-1);
     UpdateTitle(); UpdateScroll(); UpdateStatus(); RefreshNotesList();
 }
 
@@ -1961,7 +1998,10 @@ DWORD WINAPI JobThread(LPVOID a) {
     return 0;
 }
 
-const uint32_t SPEEDS[4] = {1000, 2000, 8000, 24000};     // 24x is the fastest speed at which the game plays out exactly as in real time (32x: about 1 run in 4 is off by a frame, 50x: 1 in 2; see docs)
+// Max: no real-time pacing at all; the game runs as fast as its frames can be computed (about 25-30x). With the frame clock
+// (RunParams::quant_lock 3) every speed plays out exactly as in real time, see docs.
+const uint32_t SPEED_MAX = 1000000;
+const uint32_t SPEEDS[4] = {1000, 2000, 8000, SPEED_MAX};
 
 // The parts of a run that do not depend on what it is for: game, hook, saves, prelude and RNG seed.
 bool FillParams(RunParams& p) {
@@ -2063,7 +2103,7 @@ static bool OpenGameProc(GameProc& g, int tries) {            // like AttachGame
 
 static bool VerifyPass(const VerifyArgs& va, uint32_t mask, const wchar_t* label, VerifyRun& out) {
     RunParams p = va.p;
-    p.speed_milli = 24000;
+    p.speed_milli = SPEED_MAX;
     p.speed_mask = mask;
     p.hold = true;
     p.record = false;
@@ -2080,7 +2120,7 @@ static bool VerifyPass(const VerifyArgs& va, uint32_t mask, const wchar_t* label
     int pos = 1;
     for (int cp : va.cps) {
         if (cp > pos) {
-            if (!ss.BeginSteps(p.movie.data() + pos, (uint32_t)(cp - pos), 24000)) { out.error = "could not run the game"; break; }
+            if (!ss.BeginSteps(p.movie.data() + pos, (uint32_t)(cp - pos), SPEED_MAX)) { out.error = "could not run the game"; break; }
             int r;
             while (!(r = ss.PollSteps())) {
                 if (A.stop) ss.AbortSteps();
@@ -2162,7 +2202,7 @@ void VerifyFastForward() {
     va->p.movie = A.movie.frames;
     for (int c = gap; c < n; c += gap) va->cps.push_back(c);
     va->cps.push_back(n);
-    A.reached = 0;
+    A.reached = 0; StaleStatesAfter(-1);
     A.busy = true;
     A.stop = 0;
     EnableUi();
@@ -2208,9 +2248,14 @@ bool StatesOn() {
     return A.useStates && A.sess.Active() && A.sess.Alive() && A.sess.s && (A.sess.s->features & FEAT_ARENA_OK);
 }
 
+bool StateValid(int slot) {
+    int r = A.sess.StateRow(slot);
+    return r >= 0 && r <= A.reached && !A.ssStale[slot];
+}
+
 int NumStates() {
     int n = 0;
-    if (A.sess.Active() && A.sess.s) for (int i = 0; i < 8; i++) { int r = A.sess.StateRow(i); if (r >= 0 && r <= A.reached) n++; }
+    if (A.sess.Active() && A.sess.s) for (int i = 0; i < 8; i++) if (StateValid(i)) n++;
     return n;
 }
 
@@ -2219,7 +2264,7 @@ int BestState(int next) {
     int best = -1, bestRow = -1;
     for (int i = 0; i < 8; i++) {
         int r = A.sess.StateRow(i);
-        if (r >= 0 && r <= A.reached && r <= next && r > bestRow) { best = i; bestRow = r; }
+        if (StateValid(i) && r <= next && r > bestRow) { best = i; bestRow = r; }
     }
     return best;
 }
@@ -2232,7 +2277,7 @@ int PickSlot(int row) {
         int r = A.sess.StateRow(i);
         if (r == row) return i;
         if (r < 0) { if (empty < 0) empty = i; }
-        else if (r > A.reached) { if (stale < 0) stale = i; }
+        else if (!StateValid(i)) { if (stale < 0) stale = i; }
     }
     if (empty >= 0) return empty;
     if (stale >= 0) return stale;
@@ -2257,9 +2302,10 @@ bool SaveStateAt(bool manual) {
     int row = (int)A.sess.Row();
     if (row < 0 || row > A.reached) return false;
     int slot = PickSlot(row);
-    bool keep = A.sess.StateRow(slot) == row && A.ssManual[slot];      // saving over the same row keeps a manual state manual
+    bool keep = A.sess.StateRow(slot) == row && A.ssManual[slot] && !A.ssStale[slot];      // saving over the same row keeps a manual state manual
     if (slot < 0 || !A.sess.SaveState(slot)) return false;
     A.ssManual[slot] = manual || keep;
+    A.ssStale[slot] = false;
     return true;
 }
 
@@ -2317,6 +2363,7 @@ void OnJobDone(RunResult* r) {
             SetMsg(L"Game frozen after frame " + std::to_wstring(r->played) + L". Press . to advance a frame, F11 to resume live.");
             if (A.useStates) {
                 for (bool& m : A.ssManual) m = false;       // a new game has no states yet
+                for (bool& m : A.ssStale) m = false;
                 if (SaveStateAt(false)) SetMsg(L"Game frozen after frame " + std::to_wstring(r->played) + L"; state saved. Press . to advance a frame, F11 to resume live.");
             }
         } else {
@@ -2608,7 +2655,7 @@ void BuildMenu(HWND w) {
     add(A.speedMenu, IDM_SPEED0, L"Real time (1x)");
     add(A.speedMenu, IDM_SPEED1, L"2x");
     add(A.speedMenu, IDM_SPEED2, L"8x");
-    add(A.speedMenu, IDM_SPEED3, L"Max (24x)");
+    add(A.speedMenu, IDM_SPEED3, L"Max (as fast as possible)");
     AppendMenuW(r, MF_POPUP, (UINT_PTR)A.speedMenu, L"Fast-forward &speed (rewind / record from cursor)");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)f, L"&File");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)e, L"&Edit");
@@ -2814,7 +2861,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     if (HIWORD(wp) == CBN_SELCHANGE) {
                         IniSet(L"last", L"baseline", ComboSel(A.cbBase));
                         IniSet(L"last", L"prelude", ComboSel(A.cbPre));
-                        A.reached = 0;
+                        A.reached = 0; StaleStatesAfter(-1);
                         InvalidateRect(A.grid, nullptr, FALSE);
                     }
                     break;

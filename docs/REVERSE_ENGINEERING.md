@@ -754,3 +754,62 @@ Tried and abandoned: a frame-locked clock (time advances only at frame markers).
 
 Tools: `tools/sstest --cmp ROW --variant N` compares whole runs (1 = chunked without saves, 2 = real time, 3 = a second
 continuous run) and prints the frame where health goes 9 to 12; `--rngscan`, `--dump` plus `tools/dumpdiff` compare game memory.
+
+## Frame clock: exact replays at any speed (replaces the 1/60 s grid and the clamp)
+
+Method: the decrypted code was dumped from the running game with `ReadProcessMemory` (no code touched) and disassembled
+with `objdump -b binary -mi386`; a sampling profiler (another process: suspend a thread, read its context, resume) showed
+where the main thread spends its time.
+
+### What the game does with time
+
+- **The limiter** (`exe+0x2A48A0..0x2A496F`, timer object of 0x20 bytes: +0 "has QPC", +8 last QPC, +0x18 frequency): each
+  spin computes `elapsed = float(now - last) / float(freq)` and compares it with `*(manager+0x10) / 60.0f` (manager =
+  `*(exe+0x483680)`, the value is 1.0). If `elapsed >` that, it sets `last = QPC()` and runs one frame (`exe+0x293070`);
+  otherwise `Sleep(0)`.
+- **Why the grid ran the game at "30 fps":** a grid step of `Freq / 60` ticks (integer division) is a hair *shorter* than
+  1/60 s, so one step never passes the strict `>` test and every frame took two steps (33.3 ms of game time). The game's
+  frames did not change, but everything measured in time ran twice as fast per frame.
+- **Other readers of the clock:** the frame function times its own work (`exe+0x2930F2`/`0x293211`, summed at manager+8,
+  reset every 60 frames: a frame-rate meter) and the renderer times itself (`exe+0x29E110`/`0x29E2A0`). Neither feeds game
+  logic. Game logic itself never reads a clock.
+- **The music sequencer** is the one that matters. A background thread loops on `exe+0x2BDC60`: it measures
+  `dt = QPC() - last` (as a float, seconds), sets `last = QPC()`, then for every playing sequence calls `exe+0x2BCA10(seq, dt)`,
+  which is a MIDI-style sequencer (variable-length delta times, status bytes 0x80-0xF0 dispatched through a table, song
+  position += dt scaled by the tempo at +0x25C), and finally `Sleep(8)` (return address `exe+0x2BDDAC`). This is the
+  "background thread that loops on Sleep(8)" from the notes above. Events that wait for the music (the stage-clear
+  jingle before the health refill) therefore land on a frame that depends on when this thread happened to wake and what
+  time it read: that was the remaining ±1 frame scatter at 24x and above.
+
+### The frame clock (`quant_lock = 3`, the default)
+
+- From the first frame marker on, every clock the game reads (QPC, `timeGetTime`, file time) returns
+  `G(k) = G0 + k * A`, k = frame number, A = the shortest tick count that passes the limiter's float test plus 10 us
+  (166767 ticks at 10 MHz). Time advances only at a marker. The limiter sees exactly one frame each time and starts the
+  next frame at once, so a frame costs only its own work and nothing in it depends on real time.
+- The music thread runs in lockstep: its `Sleep(8)` parks it, and the marker wakes it twice per frame, one wake at a time,
+  serving it `G(k-1) + A/2` and then `G(k)`. Handing the wakes over by spinning (both sides, falling back to a semaphore
+  after ~1-2 ms without a frame) costs nothing measurable; two kernel round trips per frame had cost about 15%.
+- Speed comes from waiting at the marker until frame k is due at the chosen speed (1x = 60 frames per second of real time);
+  Max does not wait.
+- Savestates store the frame clock's offset and the time of the held frame; the marker that a load re-runs does not wake the
+  music thread again (its wakes for that frame happened before the save).
+- Safety valves (each counted in `Shm::fc_diag`, never needed on test3): if the main thread keeps reading the clock 20,000
+  times without reaching a marker (a wait loop), time runs on by one grid step per 64 reads; another thread gets real time
+  after 100 ms without a marker; the music thread is woken anyway after 2 s without a marker (deadlock guard).
+- The earlier "frame-locked clock" (`quant_lock = 1`, exit code 143) advanced one grid step per frame, which the limiter never
+  accepts as a frame, so the game crawled on the fallback path. Exit code 143 was never seen with the frame clock.
+
+### Results (test3.bscotm, 11,400 frames)
+
+- Identical frame by frame (health, weapon points, score, speeds, position, invisibility) between: two runs at Max; Max and
+  1x real time (the 1x run took 190 s = 59.9 frames per second); continuous and stepped in 3-frame pieces; continuous and
+  chunked with a savestate every 2000 frames; and runs that load a state at row 2000, 4000 or 8000 and run on. The stage-clear
+  refill lands on frame 10674 in every run (the 1/60 s grid gave 10492; v0.9.1 at 4x, before the grid, gave 10673).
+  Zero fallbacks and zero timed-out music wakes in all of them.
+- Speed at Max: 1700-1770 frames per second (28-29x real time) without savestates, 1940-2060 (32-34x) with savestates (the
+  private heap is faster than the process heap). The old clamp mode at "24x" managed 717 frames per second (12x), because
+  of the two-steps-per-frame effect above.
+- Where a frame's time goes at Max (main thread, drawing skipped): the game's own logic ~43%, `ntdll` ~39% (mostly the game's
+  heap allocations, `exe+0x316DEB`), D3DX math ~12%, XAudio2 calls ~2%, the hook ~2%. Going faster would mean doing less of
+  the game's own per-frame work.

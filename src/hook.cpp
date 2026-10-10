@@ -13,7 +13,7 @@
 #include "common.h"
 #include "savestate.h"
 static Shm*      S;
-static uintptr_t PollRet;
+static uintptr_t PollRet, ExeBase;
 static uint8_t   BitOf[256];
 static uint32_t  Cur;               // keys held during the current frame
 
@@ -55,11 +55,62 @@ static int64_t VNow(int64_t real) {
 static volatile LONG LockOn;
 static int64_t LockBase, LockServed, LockMarkReal;
 static uint32_t LockF0;
+
+// Frame clock (Shm::quant_lock = 3). Every clock the game reads is a function of the frame number: from the first frame
+// marker on, time advances only at a marker, by exactly one frame (FcA ticks: the shortest time the game's limiter accepts
+// as a whole 1/60 s frame). The limiter then starts each frame at once, so a frame costs only its own work, and nothing the
+// game measures depends on how the threads were scheduled, at any speed. The game's music sequencer runs on its own thread
+// (a Sleep(8) loop at exe+0x2BDC60 that advances the song by the time measured since its last wake); that thread is run in
+// lockstep: the marker wakes it FC_WAKES times per frame, one wake at a time, and each wake sees its own fixed time inside the
+// frame. Real-time speed is kept by waiting at the marker (FcPace), not by scaling clocks.
+static const int FC_WAKES = 2;                       // music-thread wakes per frame: Sleep(8) in a 1/60 s frame
+static const uint32_t MUSIC_SLEEP_RET = 0x2BDDAC;   // return address of the music thread's Sleep(8) (exe RVA)
+static volatile LONG FcOn;
+static int64_t FcA, FcG0, FcAdj, FcRealNext;
+static volatile int64_t FcNow, FcLastServed;        // time of the current frame; the latest time any thread was given
+static uint32_t FcK0;
+static volatile LONG FcFellBack;                     // time had to run on by itself since the last marker
+static bool FcSkipRelease;                           // the marker is the one a savestate load re-runs: its music wakes already happened
+static volatile LONG LsTid, BgServing;               // the music thread; while BgServing, it reads BgVal
+static volatile int64_t BgVal;
+static volatile uint32_t FcCaller;                  // diagnosis: return address of the clock read being served
+static volatile LONG MarkerTid;                      // the thread that runs the frame markers
+static inline bool FcMode() { return S->quant_hz && S->quant_lock == 3; }
+static volatile LONG FcMarkerReads;                 // clock reads by the marker thread since the last marker
+static int64_t FcServe() {
+    LONG me = (LONG)GetCurrentThreadId();
+    if (BgServing && me == LsTid) return BgVal;
+    int64_t t = FcNow;
+    if (!S->paused) {
+        int64_t step = Freq / S->quant_hz, extra = 0;
+        if (me == MarkerTid) {      // the frame's own thread: a long frame (loading) is work, not a wait; only a loop that keeps reading the clock is waiting for it
+            LONG n = InterlockedIncrement(&FcMarkerReads);
+            if (n > 20000) extra = (int64_t)(n - 20000) / 64 * step;        // then time runs on by one grid step per 64 reads: still a function of what the game did
+        } else if (me != LsTid) {   // another thread (not the music thread: it only ever needs frame time): no frame for 100 ms of real time (a long load), let time run at real speed so no wait loop hangs
+            LARGE_INTEGER n;
+            R_Qpc(&n);
+            int64_t since = n.QuadPart - LockMarkReal, grace = Freq / 10;
+            if (since > grace) extra = (since - grace) / step * step;
+        }
+        if (extra > 0) {
+            t += extra;
+            FcFellBack = 1;
+            uint32_t i = S->fc_fb_n++;
+            if (i < 32) { S->fc_fb_log[i][0] = S->frame; S->fc_fb_log[i][1] = FcCaller - (uint32_t)ExeBase; S->fc_fb_log[i][2] = (LONG)GetCurrentThreadId() == MarkerTid; }
+        }
+    }
+    EnterCriticalSection(&Cs);
+    if (t > FcLastServed) FcLastServed = t;
+    LeaveCriticalSection(&Cs);
+    return t;
+}
+
 static int64_t Quant(int64_t v) {
     uint32_t hz = S->quant_hz;
     if (!hz) return v;
+    if (S->quant_lock == 3 && FcOn) return FcServe();
     int64_t step = Freq / hz;
-    if (S->quant_lock >= 2) {           // clamp: the clock may run at most quant_lock grid steps ahead of what the last frame marker was served (stalls cannot lengthen a measured frame)
+    if (S->quant_lock == 2) {           // clamp: the clock may run at most quant_lock grid steps ahead of what the last frame marker was served (stalls cannot lengthen a measured frame)
         if (v < V0) return v;
         int64_t g = V0 + (v - V0) / step * step;
         if (!LockOn) return g;
@@ -114,12 +165,14 @@ static void LockAtMarker(uint32_t f, int64_t vnow) {
     LockMarkReal = n.QuadPart;
 }
 static BOOL WINAPI H_Qpc(LARGE_INTEGER* o) {
+    FcCaller = (uint32_t)(uintptr_t)__builtin_return_address(0);
     BOOL r = R_Qpc(o);
     if (r && (S->speed_mask & SPEED_QPC)) o->QuadPart = Quant(VNow(o->QuadPart));
     return r;
 }
 
 static DWORD WINAPI H_Tgt() {
+    FcCaller = (uint32_t)(uintptr_t)__builtin_return_address(0);
     DWORD r = R_Tgt();
     if (!(S->speed_mask & SPEED_MMTIME)) return r;
     LARGE_INTEGER q;
@@ -265,7 +318,6 @@ static DWORD GameTidList(DWORD* out, DWORD max) {
     return n;
 }
 
-static volatile LONG MarkerTid;                        // diagnosis: the thread that runs the frame markers, and how often each side sleeps / waits
 static volatile LONG ThrCnt[4];                      // other-thread Sleep, other-thread Wait, marker-thread Sleep, marker-thread Wait
 static inline void NoteThr(int wait) { ThrCnt[((LONG)GetCurrentThreadId() == MarkerTid ? 2 : 0) + wait]++; }
 struct SleepSite { uint32_t ret, ms, n; };
@@ -280,12 +332,59 @@ static void NoteSleepSite(uint32_t ret, uint32_t ms) {
 // per frame and one wake at a time, so its work happens at fixed points of the frame instead of whenever the scheduler runs it.
 static HANDLE LsSem;
 static volatile LONG LsEpoch, LsParked;
+// Frame clock handoff: the marker hands out wake tickets (LsGo); the music thread takes them in order (LsTaken). While frames
+// come quickly both sides spin (a frame at full speed is well under a millisecond, and two kernel round trips a frame cost
+// ~15% of the game's speed); the music thread blocks on LsSem only after a while without a ticket (real-time play, a hold).
+static volatile LONG LsGo, LsTaken, LsBlocked;
 static void LockstepWait() {
     InterlockedIncrement(&LsEpoch);
     LsParked = 1;
     MemoryBarrier();
-    R_Wait(LsSem, 100);
+    if (!FcMode()) { R_Wait(LsSem, 100); LsParked = 0; return; }
+    for (int i = 0; i < 20000 && LsGo == LsTaken; i++) YieldProcessor();     // ~1-2 ms
+    while (LsGo == LsTaken) {
+        LsBlocked = 1;
+        MemoryBarrier();
+        if (LsGo != LsTaken) break;
+        R_Wait(LsSem, 20);
+        LARGE_INTEGER n;
+        R_Qpc(&n);
+        if (LsGo == LsTaken && !S->paused && n.QuadPart - LockMarkReal > Freq * 2) {      // no frame for 2 s: only a guard against a deadlock (a long loading frame takes ~0.3 s)
+            S->fc_diag[2]++;
+            LsBlocked = 0;
+            LsParked = 0;
+            return;
+        }
+    }
+    LsBlocked = 0;
+    LsTaken++;
     LsParked = 0;
+}
+// Spins until `done`, giving the time slice away only after a while; false after 2 s of real time.
+template <class F> static bool SpinUntil(F done) {
+    for (int i = 0; i < 20000; i++) { if (done()) return true; YieldProcessor(); }
+    LARGE_INTEGER a, b;
+    R_Qpc(&a);
+    while (!done()) { R_Qpc(&b); if (b.QuadPart - a.QuadPart > Freq * 2) return false; SwitchToThread(); }
+    return true;
+}
+// Frame clock: the music thread's wakes for the frame that runs from time `from` to `to`, one at a time.
+static void FcRelease(int64_t from, int64_t to) {
+    if (!LsTid) return;
+    for (int i = 0; i < FC_WAKES; i++) {
+        if (!SpinUntil([] { return LsParked != 0; })) return;      // it may still be running a wake of its own (a timed-out one): let it finish
+        BgVal = from + (to - from) * (i + 1) / FC_WAKES;
+        BgServing = 1;
+        LONG e0 = LsEpoch;
+        MemoryBarrier();
+        LsGo++;
+        MemoryBarrier();
+        if (LsBlocked) ReleaseSemaphore(LsSem, 1, nullptr);
+        SpinUntil([e0] { return LsEpoch != e0; });                 // the wake is over when it is back in its Sleep
+        BgServing = 0;
+        MemoryBarrier();
+        S->fc_diag[1]++;
+    }
 }
 static void LockstepRelease(uint32_t n) {
     for (uint32_t k = 0; k < n && LsParked; k++) {
@@ -301,7 +400,11 @@ static void  WINAPI H_Sleep(DWORD ms) {
     GThread* g = GateMe();
     if (g) NoteSleepSite((uint32_t)(uintptr_t)__builtin_return_address(0), ms);
     GateEnter(g, true);
-    if (S->lockstep && LsSem && ms && ms <= 16 && (LONG)GetCurrentThreadId() != MarkerTid && IsSleeper(GetCurrentThreadId())) LockstepWait();
+    if (FcMode() && FcOn && LsSem && ms == 8 && (uintptr_t)__builtin_return_address(0) == ExeBase + MUSIC_SLEEP_RET &&
+        (!LsTid || LsTid == (LONG)GetCurrentThreadId())) {
+        LsTid = (LONG)GetCurrentThreadId();
+        LockstepWait();
+    } else if (!FcMode() && S->lockstep && LsSem && ms && ms <= 16 && (LONG)GetCurrentThreadId() != MarkerTid && IsSleeper(GetCurrentThreadId())) LockstepWait();
     else PreciseWait(ms, [&](DWORD t) { R_Sleep(t); return (DWORD)WAIT_TIMEOUT; });
     GateLeave(g, true);
 }
@@ -1038,6 +1141,13 @@ static void XaFindInternal(HANDLE f, uintptr_t obj) {        // which tracked vo
     wsprintfA(b, "  %d tracked voices point at the crashing XAudio2 object\r\n", hits);
     WriteFile(f, b, lstrlenA(b), &w, nullptr);
 }
+// Diagnostic files in %TEMP% (probe, thread dump, exit log) are written only when BSCOTM_DEBUG is set in the environment.
+// The crash log is not gated: it is written only when the game crashes.
+static bool DebugLog() {
+    static int on = -1;
+    if (on < 0) on = GetEnvironmentVariableA("BSCOTM_DEBUG", nullptr, 0) ? 1 : 0;
+    return on == 1;
+}
 // Layout probe (diagnosis): where does XAudio2 keep the callback pointer it was given? Searches the returned
 // voice object and the objects it points to (two levels) for the shim and for the game's callback.
 static char ProbeLog[8192];
@@ -1147,7 +1257,7 @@ static HRESULT __stdcall H_CreateSource(void* self, void** pp, const void* fmt, 
     v->flags = fl; v->maxfreq = freq;
     XaEv(1, v, real, cb);
     NoteFirstCreate(real, &v->shim, cb);
-    if (cb) ProbeVoice(real, &v->shim, cb);
+    if (cb && DebugLog()) ProbeVoice(real, &v->shim, cb);
     const WAVEFORMATEX* wf = (const WAVEFORMATEX*)fmt;
     uint32_t n = wf ? sizeof(WAVEFORMATEX) + wf->cbSize : 0;
     v->recreatable = wf && n <= sizeof v->fmt && !chain;
@@ -1167,7 +1277,7 @@ static HRESULT WINAPI H_CoCreate(const GUID& clsid, LPUNKNOWN outer, DWORD ctx, 
     HRESULT hr = R_CoCreate(clsid, outer, ctx, iid, out);
     static const GUID xa27 = {0x5a508685, 0xa254, 0x4fba, {0x9b, 0x82, 0x9a, 0x24, 0xb0, 0x03, 0x06, 0xaf}};
     static const GUID xa27d = {0xdb05ea35, 0x0329, 0x4d4b, {0xa5, 0x3a, 0x6d, 0xea, 0xd0, 0x3d, 0x3d, 0x38}};
-    if (out && *out && (clsid.Data1 == 0x5a508685 || clsid.Data1 == 0xdb05ea35)) {      // XAudio2 object created: note it
+    if (DebugLog() && out && *out && (clsid.Data1 == 0x5a508685 || clsid.Data1 == 0xdb05ea35)) {      // XAudio2 object created: note it
         char path[MAX_PATH + 32], b[200];
         GetTempPathA(MAX_PATH, path);
         strcat(path, "bscotm_probe.txt");
@@ -1255,7 +1365,10 @@ static void SnapAfterCopy(const snap::Slot& sn) {
     QueryPerformanceCounter(&q);
     VirtBase = sn.virt;
     RestoreVirt = sn.virt; RestoreVirtOn = true;     // the freeze that follows must not let time run on (it would shift the 1/60 s grid)
-    LockBase = sn.aux[0]; LockServed = sn.aux[1];     // the frame-locked clock continues from the saved moment
+    if (FcMode()) {                         // frame clock: back to the saved frame's time; the re-run marker must not wake the music thread again
+        FcAdj = sn.aux[0]; FcNow = FcLastServed = sn.aux[1];
+        FcFellBack = 0; FcSkipRelease = true; FcRealNext = 0;
+    } else { LockBase = sn.aux[0]; LockServed = sn.aux[1]; }     // the frame-locked clock continues from the saved moment
     { LARGE_INTEGER lq; R_Qpc(&lq); LockMarkReal = lq.QuadPart; }
     RealBase = q.QuadPart;
     CurSpeed = 1000;
@@ -1316,10 +1429,11 @@ static void HandleSnap(Shm* s, uint32_t f, int64_t frozen) {
         DWORD hp0 = GetTickCount();
         XaPause();
         DWORD hp1 = GetTickCount();
-        snap::Aux[0] = LockBase; snap::Aux[1] = LockServed;
+        if (FcMode()) { snap::Aux[0] = FcAdj; snap::Aux[1] = FcNow; }      // frame clock: the time of the frame it is held at
+        else { snap::Aux[0] = LockBase; snap::Aux[1] = LockServed; }
         bool ok = snap::Save((int)slot, frozen, f - 1);
         DWORD hp2 = GetTickCount();
-        if (ok) WriteThreadInfo();
+        if (ok && DebugLog()) WriteThreadInfo();
         XaResume();
         s->snap_time[0] = hp1 - hp0; s->snap_time[6] = hp2 - hp1; s->snap_time[7] = GetTickCount() - hp2;
         if (ok) XaOnSave((int)slot);
@@ -1372,12 +1486,81 @@ static void Hold(Shm* s, uint32_t f) {
     s->paused = 0;
 }
 
+// ---- frame clock (quant_lock 3) --------------------------------------------------
+// Ticks per frame: the shortest time the game's limiter (exe+0x2A4921: elapsed > *(manager+0x10) / 60, in floats) takes for a
+// whole frame, plus 10 us so a rounding difference can never make it wait for the next one.
+static int64_t FcFrameTicks() {
+    float m = 1.0f;
+    uint32_t mgr = 0;
+    if (SelfRead((uint32_t)ExeBase + 0x483680, &mgr, 4) && mgr) {
+        float v;
+        if (SelfRead(mgr + 0x10, &v, 4) && v > 0.1f && v < 10.0f) m = v;
+    }
+    volatile float thr = m / 60.0f, ff = (float)(double)Freq;
+    int64_t a = Freq / 60;
+    for (;; a++) {
+        volatile float fa = (float)(double)a;
+        volatile float e = fa / ff;
+        if (e > thr) break;
+    }
+    return a + Freq / 100000;
+}
+// Real-time speed: frame k may not start before its time at the chosen speed. Far behind (a hold, a load): start counting again.
+static void FcPace(int64_t now) {
+    int64_t per = FcA * 1000 / Speed();
+    if (FcRealNext > now) {
+        S->fc_diag[5]++;
+        for (;;) {
+            LARGE_INTEGER n;
+            R_Qpc(&n);
+            int64_t rem = FcRealNext - n.QuadPart;
+            if (rem <= 0) break;
+            if (rem > Freq / 500) R_Sleep((DWORD)(rem * 1000 / Freq) - 1);       // more than 2 ms left: sleep most of it
+            else SwitchToThread();
+        }
+    } else if (now - FcRealNext > Freq / 10) FcRealNext = now;
+    FcRealNext += per;
+}
+static void FcMarker(uint32_t f) {
+    LARGE_INTEGER n;
+    R_Qpc(&n);
+    if (!FcOn) {        // the first frame: time so far ran on the 1/60 s grid; from here it is FcG0 + frames * FcA
+        FcA = FcFrameTicks();
+        S->fc_diag[3] = (uint32_t)FcA; S->fc_diag[4] = (uint32_t)Freq;
+        FcG0 = Quant(VNow(n.QuadPart)) + FcA;        // a whole frame after anything served so far, so the limiter starts the next frame at once
+        FcK0 = f;
+        FcAdj = 0;
+        FcNow = FcLastServed = FcG0;
+        FcRealNext = n.QuadPart + FcA * 1000 / Speed();
+        LockMarkReal = n.QuadPart;
+        MemoryBarrier();
+        FcOn = 1;
+        return;
+    }
+    FcPace(n.QuadPart);
+    int64_t prev = FcNow;
+    if (FcFellBack) {   // time ran on by itself during a long load: continue from there, never backwards
+        S->fc_diag[0]++;
+        FcFellBack = 0;
+        if (FcLastServed > prev) { FcAdj += FcLastServed - prev; prev = FcLastServed; }
+    }
+    int64_t g = FcG0 + (int64_t)(int32_t)(f - FcK0) * FcA + FcAdj;
+    FcMarkerReads = 0;
+    FcNow = g;
+    if (g > FcLastServed) FcLastServed = g;
+    { LARGE_INTEGER m; R_Qpc(&m); LockMarkReal = m.QuadPart; }
+    MemoryBarrier();
+    if (FcSkipRelease) FcSkipRelease = false;
+    else FcRelease(prev, g);
+}
+
 // ---- input -----------------------------------------------------------------
 static void Marker(Shm* s) {
     JoinThreads();
     uint32_t f = s->frame + 1;
     s->frame = f;
-    { LARGE_INTEGER qq; R_Qpc(&qq); LockAtMarker(f, VNow(qq.QuadPart)); }     // frame-locked clock: starts at the first marker
+    if (FcMode()) FcMarker(f);
+    else { LARGE_INTEGER qq; R_Qpc(&qq); LockAtMarker(f, VNow(qq.QuadPart)); }     // frame-locked clock: starts at the first marker
     RngCheck();
     MarkerTid = (LONG)GetCurrentThreadId();
     if (f < 12288) for (int i = 0; i < 4; i++) s->thr_log[i][f] = (uint16_t)ThrCnt[i];
@@ -1428,7 +1611,7 @@ static __attribute__((noinline, used)) SHORT WINAPI H_Gaks(int vk) {
     Shm* s = S;
     s->polls++;
     if (vk == 0) {                              // table index 0 = frame boundary
-        Focused = !GameWnd || GetForegroundWindow() == GameWnd;
+        if (s->mode != M_PLAY) Focused = !GameWnd || GetForegroundWindow() == GameWnd;     // only live keys need it (a system call a frame)
         Marker(s);
         return 0;
     }
@@ -1449,6 +1632,7 @@ static __attribute__((noinline, used)) SHORT WINAPI H_Gaks(int vk) {
 static VOID (WINAPI *R_ExitProcess)(UINT);
 static BOOL (WINAPI *R_TermProcess)(HANDLE, UINT);
 static void LogExit(const char* what, UINT code, HANDLE target) {
+    if (!DebugLog()) return;
     char path[MAX_PATH + 32], b[300];
     GetTempPathA(MAX_PATH, path);
     strcat(path, "bscotm_exit.txt");
@@ -1500,6 +1684,7 @@ static void Init() {
     for (int i = 0; i < NUM_KEYS; i++) BitOf[KEYS[i].vk] = (uint8_t)i;
     HMODULE exe = GetModuleHandleW(NULL);
     PollRet = (uintptr_t)exe + POLL_RET_RVA;
+    ExeBase = (uintptr_t)exe;
 
     snap::PollSite = PollRet;
     bool ok = PatchIat(exe, "user32.dll", "GetAsyncKeyState", (void*)snap::PollStub, &R_Gaks);
