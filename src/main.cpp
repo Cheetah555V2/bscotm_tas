@@ -25,7 +25,7 @@ enum {
     IDC_MEM_HIST, IDC_MEM_GRAPH, IDC_MEM_CSV, IDC_MEM_CLR,
     IDM_HELP_START, IDM_HELP_KEYS, IDM_HELP_TROUBLE, IDM_HELP_ABOUT, IDM_HELP_GUIDE, IDC_HELP_TOPICS,
     IDM_RNGLOG, IDM_VERIFY, IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
-    IDM_SAVESTATES, IDM_SAVESTATE_NOW, IDM_SSINTERVAL, IDM_CONTROLLER, IDM_COLUMNS,
+    IDM_SAVESTATES, IDM_SAVESTATE_NOW, IDM_SSINTERVAL, IDM_CONTROLLER, IDM_COLUMNS, IDM_BRANCHES,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
     IDC_BASE = 300, IDC_PRE, IDC_RNG_CHK, IDC_RNG_CLR, IDC_RNG_CSV,
@@ -226,6 +226,7 @@ void Touch(size_t pos) {
 }
 
 void RefreshNotesList();
+void RefreshBranchList(int select = -2);     // -2: keep the selection
 void JumpTo(int row);
 
 const std::string& NoteAt(int row) {
@@ -967,6 +968,7 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 // Every note with its frame number; double-click or Enter jumps the cursor there,
 // Delete removes the note.
 void RefreshNotesList() {
+    RefreshBranchList();                    // "differs at" follows every change of the movie
     HWND lv = A.notesList;
     if (!lv) return;
     SendMessageW(lv, WM_SETREDRAW, FALSE, 0);
@@ -1054,6 +1056,234 @@ void ShowNotesList(bool bookmarks = false) {
     GetClientRect(A.notesWnd, &cr);
     MoveWindow(A.notesList, 0, 0, cr.right, cr.bottom, TRUE);
     RefreshNotesList();
+}
+
+// ---- branches (like TAStudio) -----------------------------------------------------------------------------------------
+// A branch is a saved version of the movie (inputs, notes, RNG seed, controller) plus the frame the game was at. Branches
+// are saved in the movie file. Loading one replaces the movie with it as one undo step, rewriting the inputs only from the
+// first frame where they differ, so savestates before that frame stay valid and the game gets there quickly.
+const int IDC_BR_LIST = 7000, IDC_BR_SAVE = 7001, IDC_BR_UPDATE = 7002, IDC_BR_LOAD = 7003, IDC_BR_RENAME = 7004, IDC_BR_DEL = 7005;
+static HWND BrWnd, BrList;
+
+// The first row where two versions differ (inputs or length); -1 if the inputs are the same.
+static int FirstDiff(const Frames& a, const Frames& b) {
+    size_t n = std::min(a.size(), b.size()), d = 0;
+    while (d < n && a[d] == b[d]) d++;
+    return d == a.size() && d == b.size() ? -1 : (int)d;
+}
+
+// The frame a new branch is saved at: where the frozen game is, else the cursor row (as if rewound to it).
+static uint32_t BranchFrame() {
+    if (A.sess.Active() && A.sess.Alive()) { int r = (int)A.sess.Row(); if (r >= 0) return (uint32_t)r; }
+    return (uint32_t)std::min(A.cursor + 1, Size());
+}
+
+static std::string NowText() {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char b[32];
+    sprintf(b, "%04u-%02u-%02u %02u:%02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    return b;
+}
+
+static int BrSelected() { return BrList ? ListView_GetNextItem(BrList, -1, LVNI_SELECTED) : -1; }
+
+void RefreshBranchList(int select) {
+    if (!BrList) return;
+    int sel = select == -2 ? BrSelected() : select;
+    SendMessageW(BrList, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(BrList);
+    for (size_t i = 0; i < A.movie.branches.size(); i++) {
+        const Branch& b = A.movie.branches[i];
+        std::wstring name = W(b.name);
+        LVITEMW it{};
+        it.mask = LVIF_TEXT;
+        it.iItem = (int)i;
+        it.pszText = (LPWSTR)name.c_str();
+        SendMessageW(BrList, LVM_INSERTITEMW, 0, (LPARAM)&it);
+        int d = FirstDiff(A.movie.frames, b.frames);
+        std::wstring cols[] = {
+            std::to_wstring(b.frame), std::to_wstring(b.frames.size()),
+            d < 0 ? std::wstring(L"same inputs") : L"frame " + std::to_wstring(d + 1),
+            b.has_seed ? std::to_wstring(b.seed) : std::wstring(L"-"), b.controller ? L"on" : L"-", W(b.saved),
+        };
+        for (int c = 0; c < 6; c++) ListView_SetItemText(BrList, (int)i, c + 1, (LPWSTR)cols[c].c_str());
+    }
+    if (sel >= 0 && sel < (int)A.movie.branches.size()) {
+        ListView_SetItemState(BrList, sel, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(BrList, sel, FALSE);
+    }
+    SendMessageW(BrList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(BrList, nullptr, TRUE);
+}
+
+// Saves the current movie as a new branch (idx < 0) or over branch idx (keeping its name).
+void SaveBranch(int idx) {
+    if (A.busy) return;
+    Branch b;
+    b.saved = NowText();
+    b.frame = BranchFrame();
+    b.frames = A.movie.frames;
+    b.notes = A.movie.notes;
+    b.notes.resize(b.frames.size());
+    b.has_seed = A.movie.has_seed;
+    b.seed = A.movie.seed;
+    b.controller = A.movie.controller;
+    if (idx < 0) {
+        int n = (int)A.movie.branches.size() + 1;
+        for (;; n++) {          // the first free "Branch N"
+            std::string nm = "Branch " + std::to_string(n);
+            bool used = false;
+            for (const Branch& o : A.movie.branches) if (o.name == nm) used = true;
+            if (!used) { b.name = nm; break; }
+        }
+        A.movie.branches.push_back(std::move(b));
+        idx = (int)A.movie.branches.size() - 1;
+    } else {
+        if (idx >= (int)A.movie.branches.size()) return;
+        std::wstring q = L"Overwrite \"" + W(A.movie.branches[idx].name) + L"\" with the current movie (frame " + std::to_wstring(b.frame) + L")?";
+        if (MessageBoxW(BrWnd ? BrWnd : A.wnd, q.c_str(), L"Update branch", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        b.name = A.movie.branches[idx].name;
+        A.movie.branches[idx] = std::move(b);
+    }
+    A.dirty = true;
+    UpdateTitle();
+    RefreshBranchList(idx);
+    SetMsg(L"Saved branch \"" + W(A.movie.branches[idx].name) + L"\" at frame " + std::to_wstring(A.movie.branches[idx].frame) + L" (it is saved with the movie).");
+}
+
+void LoadBranch(int idx) {
+    if (A.busy || idx < 0 || idx >= (int)A.movie.branches.size()) return;
+    const Branch b = A.movie.branches[idx];         // a copy: the edit below must not see the list change
+    Frames& cur = A.movie.frames;
+    size_t n = cur.size(), m = b.frames.size(), d = 0;
+    while (d < n && d < m && cur[d] == b.frames[d]) d++;
+    A.movie.notes.resize(n);
+    Notes bn = b.notes;
+    bn.resize(m);
+    Step st;
+    st.cur_before = A.cursor;
+    if (!std::equal(A.movie.notes.begin(), A.movie.notes.begin() + d, bn.begin())) {     // notes before the first input change: a note-only edit
+        Notes nn(bn.begin(), bn.begin() + d);
+        DoSplice(st, 0, d, Frames(cur.begin(), cur.begin() + d), &nn);
+    }
+    if (d < n || d < m) {
+        Notes nn(bn.begin() + d, bn.end());
+        DoSplice(st, d, n - d, Frames(b.frames.begin() + d, b.frames.end()), &nn);
+    }
+    bool settings = b.has_seed != A.movie.has_seed || (b.has_seed && b.seed != A.movie.seed) || b.controller != A.movie.controller;
+    if (settings) {             // the RNG seed and the controller act at the game's start: it has to be relaunched
+        A.movie.has_seed = b.has_seed;
+        A.movie.seed = b.seed;
+        A.movie.controller = b.controller;
+        A.dirty = true;
+        A.reached = 0; StaleStatesAfter(-1);
+    }
+    A.cursor = A.anchor = (int)std::min<size_t>(b.frame ? b.frame - 1 : 0, (size_t)std::max(0, Size() - 1));
+    Commit(st);
+    UpdateScroll(); UpdateTitle(); UpdateStatus();
+    InvalidateRect(A.grid, nullptr, TRUE);
+    RefreshBranchList(idx);
+    std::wstring what = L"Loaded branch \"" + W(b.name) + L"\"" + (d < n || d < m ? L" (inputs differ from frame " + std::to_wstring(d + 1) + L")" : L" (same inputs)") +
+                        (settings ? L"; its RNG seed / controller setting differ, so the game restarts" : L"") + L". Undo (Ctrl+Z) goes back.";
+    bool frozen = A.sess.Active() && A.sess.Alive();
+    if (b.frame > 0 && frozen) { SetMsg(what); JumpTo((int)b.frame - 1); return; }      // the game goes there (savestates make it quick)
+    SetCursorRow(A.cursor, false);
+    SetMsg(what + (b.frame > 0 ? L" Rewind (F6) to take the game to frame " + std::to_wstring(b.frame) + L"." : L""));
+}
+
+void RenameBranch(int idx) {
+    if (idx < 0 || idx >= (int)A.movie.branches.size()) return;
+    std::wstring t = W(A.movie.branches[idx].name);
+    if (!AskText(L"Rename branch", L"Name:", t) || t.empty()) return;
+    A.movie.branches[idx].name = U8(t);
+    A.dirty = true;
+    UpdateTitle();
+    RefreshBranchList(idx);
+}
+
+void DeleteBranch(int idx) {
+    if (idx < 0 || idx >= (int)A.movie.branches.size()) return;
+    std::wstring q = L"Delete branch \"" + W(A.movie.branches[idx].name) + L"\"? This cannot be undone.";
+    if (MessageBoxW(BrWnd ? BrWnd : A.wnd, q.c_str(), L"Delete branch", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    A.movie.branches.erase(A.movie.branches.begin() + idx);
+    A.dirty = true;
+    UpdateTitle();
+    RefreshBranchList(std::min(idx, (int)A.movie.branches.size() - 1));
+}
+
+LRESULT CALLBACK BranchProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE: {
+            int w = LOWORD(lp), hh = HIWORD(lp), bh = S(30);
+            if (BrList) MoveWindow(BrList, 0, bh + S(4), w, std::max(0, hh - bh - S(4)), TRUE);
+            return 0;
+        }
+        case WM_COMMAND:
+            switch (LOWORD(wp)) {
+                case IDC_BR_SAVE: SaveBranch(-1); break;
+                case IDC_BR_UPDATE: if (BrSelected() >= 0) SaveBranch(BrSelected()); else SetMsg(L"Select the branch to update first."); break;
+                case IDC_BR_LOAD: LoadBranch(BrSelected()); break;
+                case IDC_BR_RENAME: RenameBranch(BrSelected()); break;
+                case IDC_BR_DEL: DeleteBranch(BrSelected()); break;
+            }
+            return 0;
+        case WM_NOTIFY: {
+            NMHDR* nh = (NMHDR*)lp;
+            if (nh->hwndFrom != BrList) break;
+            if (nh->code == NM_DBLCLK) LoadBranch(BrSelected());
+            else if (nh->code == LVN_KEYDOWN) {
+                WORD k = ((NMLVKEYDOWN*)lp)->wVKey;
+                if (k == VK_RETURN) LoadBranch(BrSelected());
+                else if (k == VK_DELETE) DeleteBranch(BrSelected());
+                else if (k == VK_F2) RenameBranch(BrSelected());
+            }
+            return 0;
+        }
+        case WM_CLOSE: DestroyWindow(h); return 0;
+        case WM_DESTROY: BrWnd = BrList = nullptr; return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowBranches() {
+    if (BrWnd) { KeepOnScreen(BrWnd); RefreshBranchList(); SetForegroundWindow(BrWnd); return; }
+    RECT pr;
+    GetWindowRect(A.wnd, &pr);
+    RECT r = OnScreen(pr.left + S(120), pr.top + S(110), S(760), S(340));
+    BrWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmBranches", L"Branches",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
+                            r.left, r.top, r.right - r.left, r.bottom - r.top, A.wnd, nullptr, nullptr, nullptr);
+    if (!BrWnd) return;
+    struct { int id; const wchar_t* t; int w; } bt[] = {
+        {IDC_BR_SAVE, L"Save new branch", 130}, {IDC_BR_UPDATE, L"Update selected", 120}, {IDC_BR_LOAD, L"Load selected", 110},
+        {IDC_BR_RENAME, L"Rename...", 90}, {IDC_BR_DEL, L"Delete", 70},
+    };
+    int x = S(4);
+    for (auto& e : bt) {
+        HWND b = CreateWindowExW(0, L"BUTTON", e.t, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                 x, S(2), S(e.w), S(26), BrWnd, (HMENU)(INT_PTR)e.id, nullptr, nullptr);
+        SendMessageW(b, WM_SETFONT, (WPARAM)A.font, TRUE);
+        x += S(e.w) + S(4);
+    }
+    BrList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                             0, 0, 0, 0, BrWnd, (HMENU)(INT_PTR)IDC_BR_LIST, nullptr, nullptr);
+    SendMessageW(BrList, WM_SETFONT, (WPARAM)A.font, TRUE);
+    ListView_SetExtendedListViewStyle(BrList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    struct { const wchar_t* t; int w; } cols[] = {
+        {L"Name", 170}, {L"Frame", 60}, {L"Length", 60}, {L"Differs from the movie at", 160}, {L"RNG seed", 85}, {L"Pad", 40}, {L"Saved", 140},
+    };
+    for (int c = 0; c < 7; c++) {
+        LVCOLUMNW lc{};
+        lc.mask = LVCF_TEXT | LVCF_WIDTH;
+        lc.pszText = (LPWSTR)cols[c].t;
+        lc.cx = S(cols[c].w);
+        SendMessageW(BrList, LVM_INSERTCOLUMNW, c, (LPARAM)&lc);
+    }
+    RECT cr;
+    GetClientRect(BrWnd, &cr);
+    SendMessageW(BrWnd, WM_SIZE, 0, MAKELPARAM(cr.right, cr.bottom));
+    RefreshBranchList(A.movie.branches.empty() ? -1 : 0);
 }
 
 // ---- game memory window -------------------------------------------------------
@@ -1764,6 +1994,12 @@ const HelpTopic HELP_TOPICS[] = {
      L"What a jump does\r\n"
      L"Forward (the frozen game has not reached the frame yet): the game just runs ahead at the fast-forward speed, no restart. Backward, or no game running: the game restarts and fast-forwards to the frame.\r\n\r\n"
      L"Bookmarks are frame notes with a flag, so they move with their frames, are covered by undo and are saved in the movie file."},
+    {L"Branches",
+     L"The Branches button in the menu bar opens a list of saved versions of the movie, for trying ideas side by side (like TAStudio's branches).\r\n\r\n"
+     L"Save new branch: keeps the current inputs, notes, RNG seed and controller setting, and the frame the frozen game is at (or the cursor row).\r\n"
+     L"Load selected (or double-click, or Enter): puts that version back as one undo step (Ctrl+Z goes back) and takes the frozen game to the branch's frame. Only the inputs from the first frame where they differ are rewritten, so savestates before it stay valid and the jump is quick. A different RNG seed or controller setting restarts the game.\r\n"
+     L"Update selected: overwrites the branch with the current movie. Rename (F2), Delete.\r\n\r\n"
+     L"The list shows each branch's frame, length, the frame where it first differs from the current movie, its seed and controller setting, and when it was saved. Branches are saved in the movie file; savestates are not, so a branch has none of its own."},
     {L"Choosing the input columns",
      L"Right-click the column headings (or View > Columns) for a check list of every input column. Untick a column to hide it, tick it to show it again.\r\n\r\n"
      L"Presets at the top: show all columns, keyboard columns only, controller columns only (with the controller on), or only the columns this movie uses. In the list, every key the movie presses somewhere is marked (used).\r\n\r\n"
@@ -2618,7 +2854,8 @@ void FinishRun(int result, bool aborted) {
 }
 
 // Go to a frame: if the frozen game has not reached it yet, just run it forward at the fast-forward
-// speed (no restart); if it is behind us (or there is no frozen game), rewind (restart + fast-forward).
+// speed (no restart); if it is behind us, an earlier frame was edited, or there is no frozen game, rewind (the nearest
+// valid savestate, else restart + fast-forward).
 void JumpTo(int row) {
     if (A.busy) { SetMsg(L"Wait for the running job to finish (Stop = F9) before jumping."); return; }
     if (!Size()) return;
@@ -2626,8 +2863,8 @@ void JumpTo(int row) {
     SetCursorRow(row, false);
     bool frozen = A.sess.Active() && A.sess.Alive();
     int next = frozen ? (int)A.sess.Row() : -1;         // the row the frozen game runs next
-    if (frozen && next >= 0 && next <= row) { RunToCursor(); return; }
-    if (frozen && next == row + 1) { SetMsg(L"The game is already at frame " + std::to_wstring(row + 1) + L"."); return; }
+    if (frozen && next >= 0 && next <= row && next <= A.reached) { RunToCursor(); return; }     // ahead, and the game's inputs are still the movie's
+    if (frozen && next == row + 1 && next <= A.reached) { SetMsg(L"The game is already at frame " + std::to_wstring(row + 1) + L"."); return; }
     if (RewindWithState(row)) return;
     StartJob(false, (uint32_t)(row + 1), false, false, true);
 }
@@ -2797,6 +3034,7 @@ void BuildMenu(HWND w) {
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)vw, L"&View");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)r, L"&Run");
     AppendMenuW(bar, MF_STRING, IDM_MEMORY, L"&Memory");
+    AppendMenuW(bar, MF_STRING, IDM_BRANCHES, L"&Branches");
     AppendMenuW(bar, MF_STRING, IDM_RNGLOG, L"RNG &log");     // a plain menu-bar button: opens the window
     HMENU hp = CreatePopupMenu();
     add(hp, IDM_HELP_GUIDE, L"&Guide...\tF1");
@@ -2936,6 +3174,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_JUMPCUR: JumpTo(A.cursor); break;
                 case IDM_RNGSEED: EditSeed(); break;
                 case IDM_CONTROLLER: ToggleController(); break;
+                case IDM_BRANCHES: ShowBranches(); break;
                 case IDM_COLUMNS: { POINT pt; GetCursorPos(&pt); ColumnsMenu(A.wnd, pt); break; }
                 case IDM_VERIFY: VerifyFastForward(); break;
                 case IDM_MEMORY: ShowMemory(); break;
@@ -3056,6 +3295,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
     RegisterClassExW(&nd);
     nd.lpfnWndProc = NotesProc;
     nd.lpszClassName = L"BscotmNotes";
+    RegisterClassExW(&nd);
+    nd.lpfnWndProc = BranchProc;
+    nd.lpszClassName = L"BscotmBranches";
     RegisterClassExW(&nd);
     nd.lpfnWndProc = MemProc;
     nd.lpszClassName = L"BscotmMem";

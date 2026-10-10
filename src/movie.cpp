@@ -166,6 +166,35 @@ void WriteFrames(FILE* f, const Frames& fr) {
     fputc(']', f);
 }
 
+// Notes: sparse [{"frame": 12, "text": "...", "bookmark": true}], frame is 1-based; a bookmark's text may be empty.
+void ReadNotes(const J* nt, size_t n, std::vector<std::string>& notes) {
+    notes.assign(n, std::string());
+    if (!nt || nt->t != J::Arr) return;
+    for (const J& e : nt->v) {
+        const J* fn = e.get("frame");
+        const J* tx = e.get("text");
+        if (!fn || !tx || fn->t != J::Num || tx->t != J::Str) continue;
+        long idx = (long)fn->n - 1;
+        const J* bm = e.get("bookmark");
+        if (idx >= 0 && (size_t)idx < notes.size()) notes[idx] = (bm && Truthy(*bm) ? std::string(1, kBookmarkFlag) : std::string()) + tx->s;
+    }
+}
+
+void WriteNotes(FILE* f, const std::vector<std::string>& notes, size_t n) {
+    fputc('[', f);
+    bool first = true;
+    for (size_t i = 0; i < notes.size() && i < n; i++) {
+        if (notes[i].empty()) continue;
+        bool bm = notes[i][0] == kBookmarkFlag;
+        fprintf(f, "%s{\"frame\":%u,\"text\":", first ? "" : ",", (unsigned)i + 1);
+        Esc(f, bm ? notes[i].substr(1) : notes[i]);
+        if (bm) fputs(",\"bookmark\":true", f);
+        fputc('}', f);
+        first = false;
+    }
+    fputc(']', f);
+}
+
 }  // namespace
 
 bool Movie::Load(const std::wstring& path, std::string& err) {
@@ -199,20 +228,27 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
     const J* ct = root.get("controller");     // the game sees a (virtual) controller: see Movie::controller
     controller = ct && Truthy(*ct);
     Expand(*fr, frames);
-    notes.assign(frames.size(), std::string());
-    const J* nt = root.get("notes");        // sparse: [{"frame": 12, "text": "..."}], frame is 1-based
-    if (nt && nt->t == J::Arr)
-        for (const J& e : nt->v) {
-            const J* fn = e.get("frame");
-            const J* tx = e.get("text");
-            if (!fn || !tx || fn->t != J::Num || tx->t != J::Str) continue;
-            long idx = (long)fn->n - 1;
-            const J* bm = e.get("bookmark");     // optional: this note is a bookmark (note text may be empty)
-            if (idx >= 0 && (size_t)idx < notes.size()) notes[idx] = (bm && Truthy(*bm) ? std::string(1, kBookmarkFlag) : std::string()) + tx->s;
-        }
+    ReadNotes(root.get("notes"), frames.size(), notes);
     prelude.clear();
     const J* pf = root.get("prelude_frames");
     if (pf && pf->t == J::Arr) Expand(*pf, prelude);
+    branches.clear();
+    const J* br = root.get("branches");      // optional: [{"name", "saved", "frame", "rng_seed", "controller", "frames", "notes"}]
+    if (br && br->t == J::Arr)
+        for (const J& e : br->v) {
+            const J* bf = e.get("frames");
+            if (e.t != J::Obj || !bf || bf->t != J::Arr) continue;
+            Branch b;
+            const J* s;
+            if ((s = e.get("name")) && s->t == J::Str) b.name = s->s;
+            if ((s = e.get("saved")) && s->t == J::Str) b.saved = s->s;
+            if ((s = e.get("frame")) && s->t == J::Num && s->n >= 0) b.frame = (uint32_t)s->n;
+            if ((s = e.get("rng_seed")) && s->t == J::Num && s->n >= 0 && s->n <= 4294967295.0) { b.has_seed = true; b.seed = (uint32_t)s->n; }
+            b.controller = (s = e.get("controller")) && Truthy(*s);
+            Expand(*bf, b.frames);
+            ReadNotes(e.get("notes"), b.frames.size(), b.notes);
+            branches.push_back(std::move(b));
+        }
     return true;
 }
 
@@ -242,18 +278,28 @@ bool Movie::Save(const std::wstring& path, std::string& err) const {
         if (used >> b & 1) { fprintf(f, "%s%d", first ? "" : ",", KEYS[b].vk); first = false; }
     fprintf(f, "],\"total_frames\":%u,\"frames\":", (unsigned)frames.size());
     WriteFrames(f, frames);
-    fputs(",\"notes\":[", f);
-    first = true;
-    for (size_t i = 0; i < notes.size() && i < frames.size(); i++) {
-        if (notes[i].empty()) continue;
-        bool bm = notes[i][0] == kBookmarkFlag;
-        fprintf(f, "%s{\"frame\":%u,\"text\":", first ? "" : ",", (unsigned)i + 1);
-        Esc(f, bm ? notes[i].substr(1) : notes[i]);
-        if (bm) fputs(",\"bookmark\":true", f);
-        fputc('}', f);
-        first = false;
+    fputs(",\"notes\":", f);
+    WriteNotes(f, notes, frames.size());
+    if (!branches.empty()) {
+        fputs(",\"branches\":[", f);
+        for (size_t i = 0; i < branches.size(); i++) {
+            const Branch& b = branches[i];
+            fputs(i ? ",{\"name\":" : "{\"name\":", f);
+            Esc(f, b.name);
+            fputs(",\"saved\":", f);
+            Esc(f, b.saved);
+            fprintf(f, ",\"frame\":%u", (unsigned)b.frame);
+            if (b.has_seed) fprintf(f, ",\"rng_seed\":%u", (unsigned)b.seed); else fputs(",\"rng_seed\":null", f);
+            if (b.controller) fputs(",\"controller\":true", f);
+            fputs(",\"frames\":", f);
+            WriteFrames(f, b.frames);
+            fputs(",\"notes\":", f);
+            WriteNotes(f, b.notes, b.frames.size());
+            fputc('}', f);
+        }
+        fputc(']', f);
     }
-    fputs("]}", f);
+    fputc('}', f);
     if (fclose(f) != 0) { err = "write failed"; return false; }
     return true;
 }
