@@ -22,3 +22,7 @@ Thumbs.db
 build/
 *.o
 bscotm_tas.ini
+
+# Game save files (never commit)
+GameData*.bin
+SystemData.bin

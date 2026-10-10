@@ -228,6 +228,10 @@ captured against a different start point.
 - Green frame numbers are the "greenzone": frames the live game has been advanced
   through. Editing a frame invalidates the greenzone after it.
 
+Set the environment variable `BSCOTM_DEBUG` to make the hook also write diagnostic files to `%TEMP%`
+(`bscotm_probe.txt`, `bscotm_threads.txt`, `bscotm_exit.txt`); the crash log `bscotm_crash.txt` is always
+written when the game crashes.
+
 Settings are stored in `bscotm_tas.ini` next to the exe. Save backups, baselines
 and preludes live in `save_backups\` and `preludes\` next to the game folder.
 Your saves are copied to `save_backups\last_user_state` before a baseline is
@@ -235,8 +239,13 @@ restored.
 
 ## Known limitations
 
-- Rewind = restart the game and fast-forward (still replays from frame 1). No true
-  savestates: the game's anti-tamper makes snapshot/restore unreliable.
+- Savestates are experimental (*Run > Use savestates*, on by default). Rewind and Jump load the nearest
+  state and fast-forward from there; with savestates off, or when none is usable, they restart the game and
+  replay from frame 1. Known gaps: about 1 in 24 saves made very early (around frame 100) restores badly,
+  sound and picture are not restored, D3D9 video memory is not given back while states exist, and nothing
+  survives closing the game. Details: `docs/REVERSE_ENGINEERING.md`.
+- Replays are exact up to 24x on an idle machine; at higher speeds scheduling noise can shift timer-driven
+  events by a frame.
 - Keyboard only. No controller (DirectInput) support yet.
 - The RNG seed fixes the random numbers at launch only; changed inputs can still change later random results (see "How the game's RNG works").
 

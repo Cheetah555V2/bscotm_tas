@@ -1038,6 +1038,13 @@ static void XaFindInternal(HANDLE f, uintptr_t obj) {        // which tracked vo
     wsprintfA(b, "  %d tracked voices point at the crashing XAudio2 object\r\n", hits);
     WriteFile(f, b, lstrlenA(b), &w, nullptr);
 }
+// Diagnostic files in %TEMP% (probe, thread dump, exit log) are written only when BSCOTM_DEBUG is set in the environment.
+// The crash log is not gated: it is written only when the game crashes.
+static bool DebugLog() {
+    static int on = -1;
+    if (on < 0) on = GetEnvironmentVariableA("BSCOTM_DEBUG", nullptr, 0) ? 1 : 0;
+    return on == 1;
+}
 // Layout probe (diagnosis): where does XAudio2 keep the callback pointer it was given? Searches the returned
 // voice object and the objects it points to (two levels) for the shim and for the game's callback.
 static char ProbeLog[8192];
@@ -1147,7 +1154,7 @@ static HRESULT __stdcall H_CreateSource(void* self, void** pp, const void* fmt, 
     v->flags = fl; v->maxfreq = freq;
     XaEv(1, v, real, cb);
     NoteFirstCreate(real, &v->shim, cb);
-    if (cb) ProbeVoice(real, &v->shim, cb);
+    if (cb && DebugLog()) ProbeVoice(real, &v->shim, cb);
     const WAVEFORMATEX* wf = (const WAVEFORMATEX*)fmt;
     uint32_t n = wf ? sizeof(WAVEFORMATEX) + wf->cbSize : 0;
     v->recreatable = wf && n <= sizeof v->fmt && !chain;
@@ -1167,7 +1174,7 @@ static HRESULT WINAPI H_CoCreate(const GUID& clsid, LPUNKNOWN outer, DWORD ctx, 
     HRESULT hr = R_CoCreate(clsid, outer, ctx, iid, out);
     static const GUID xa27 = {0x5a508685, 0xa254, 0x4fba, {0x9b, 0x82, 0x9a, 0x24, 0xb0, 0x03, 0x06, 0xaf}};
     static const GUID xa27d = {0xdb05ea35, 0x0329, 0x4d4b, {0xa5, 0x3a, 0x6d, 0xea, 0xd0, 0x3d, 0x3d, 0x38}};
-    if (out && *out && (clsid.Data1 == 0x5a508685 || clsid.Data1 == 0xdb05ea35)) {      // XAudio2 object created: note it
+    if (DebugLog() && out && *out && (clsid.Data1 == 0x5a508685 || clsid.Data1 == 0xdb05ea35)) {      // XAudio2 object created: note it
         char path[MAX_PATH + 32], b[200];
         GetTempPathA(MAX_PATH, path);
         strcat(path, "bscotm_probe.txt");
@@ -1319,7 +1326,7 @@ static void HandleSnap(Shm* s, uint32_t f, int64_t frozen) {
         snap::Aux[0] = LockBase; snap::Aux[1] = LockServed;
         bool ok = snap::Save((int)slot, frozen, f - 1);
         DWORD hp2 = GetTickCount();
-        if (ok) WriteThreadInfo();
+        if (ok && DebugLog()) WriteThreadInfo();
         XaResume();
         s->snap_time[0] = hp1 - hp0; s->snap_time[6] = hp2 - hp1; s->snap_time[7] = GetTickCount() - hp2;
         if (ok) XaOnSave((int)slot);
@@ -1449,6 +1456,7 @@ static __attribute__((noinline, used)) SHORT WINAPI H_Gaks(int vk) {
 static VOID (WINAPI *R_ExitProcess)(UINT);
 static BOOL (WINAPI *R_TermProcess)(HANDLE, UINT);
 static void LogExit(const char* what, UINT code, HANDLE target) {
+    if (!DebugLog()) return;
     char path[MAX_PATH + 32], b[300];
     GetTempPathA(MAX_PATH, path);
     strcat(path, "bscotm_exit.txt");
