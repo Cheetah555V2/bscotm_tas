@@ -1,0 +1,60 @@
+name: replay-check
+
+# Replays a movie with the real game and fails if any replay differs (tools/verify.ps1). GitHub's own runners do not
+# have the game, so this runs on a self-hosted runner: the PC with the game installed. It is off until set up:
+#   1. On that PC: Settings > Actions > Runners > New self-hosted runner (Windows), add the label `cotm`, and start it
+#      with run.cmd in your logged-in session (not as a service: the game needs a desktop), with Steam running.
+#   2. Settings > Secrets and variables > Actions > Variables:
+#        REPLAY_CHECK = true                  (switches this workflow on)
+#        COTM_EXE     = full path of COTM.exe on that PC
+#        REPLAY_MOVIE = full path of the movie to replay (for example ...\test3.bscotm)
+#        REPLAY_BASELINE (optional) = full path of a baseline folder (save_backups\baselines\<id>)
+#        MINGW32      = the 32-bit MinGW bin folder, if build.bat cannot find it by itself
+# Pull requests from forks never run here: that would run someone else's code on your PC.
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      movie:
+        description: 'Movie to replay (full path on the runner; empty = the REPLAY_MOVIE variable)'
+        required: false
+        default: ''
+      full:
+        description: 'Also compare with a real-time (1x) run (takes as long as the movie)'
+        type: boolean
+        default: false
+
+jobs:
+  replay:
+    if: vars.REPLAY_CHECK == 'true' && (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, windows, cotm]
+    timeout-minutes: 45
+    concurrency:
+      group: replay-check          # one game at a time on the PC
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Replay checks
+        shell: powershell
+        env:
+          MINGW32: ${{ vars.MINGW32 }}
+          MOVIE: ${{ inputs.movie || vars.REPLAY_MOVIE }}
+          COTM_EXE: ${{ vars.COTM_EXE }}
+          BASELINE: ${{ vars.REPLAY_BASELINE }}
+          FULL: ${{ inputs.full }}
+        run: |
+          $a = @('-Movie', $env:MOVIE, '-Game', $env:COTM_EXE)
+          if ($env:BASELINE) { $a += @('-Baseline', $env:BASELINE) }
+          if ($env:FULL -eq 'true') { $a += '-Full' }
+          & .\tools\verify.ps1 @a
+          exit $LASTEXITCODE
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-check-logs
+          path: build/verify/*.log
+          if-no-files-found: ignore
