@@ -152,6 +152,14 @@ static int RunTo(Session& ss, const Frames& mv, uint32_t row, uint32_t speed) {
 }
 
 static bool Same(uint32_t a, uint32_t b) { return a == b; }
+// The reference run has no player on this frame (menus, a stage load, a death): its values are not the game's state but
+// whatever the pointer chain lands on, and in the other run that can be memory a load has not initialised yet. Not compared;
+// a real divergence does not stay inside such a stretch, it carries on into the next frames with a player.
+static bool NoPlayer(const HistEntry& e) {
+    float x, y;
+    memcpy(&x, &e.v[5], 4); memcpy(&y, &e.v[6], 4);
+    return e.v[0] == 0 || e.v[0] > 255 || e.v[1] == 0xFFFFFFFFu || x != x || y != y || (x == 0 && y == 0);
+}
 
 // Compares two runs of the same frames; prints the first difference. Returns the number of equal frames
 // before it (or the total if identical).
@@ -163,7 +171,7 @@ static size_t Compare(const std::vector<HistEntry>& ref, const std::vector<HistE
     for (const auto& e : got) {
         auto it = byframe.find(e.frame);
         if (it == byframe.end()) continue;
-        if (it->second.v[0] == 0xFFFFFFFFu || e.v[0] == 0xFFFFFFFFu || it->second.v[1] == 0xFFFFFFFFu || e.v[1] == 0xFFFFFFFFu) { ok++; continue; }       // no stage yet (menus, loading): nothing meaningful to compare
+        if (NoPlayer(it->second)) { ok++; continue; }       // no player in the reference run (menus, loading): nothing meaningful to compare
         for (int k = 0; k < HIST_FIELDS; k++) {
             auto tinyf = [&](uint32_t u) { float f; memcpy(&f, &u, 4); return k >= 3 && ((f > -1e-20f && f < 1e-20f) || f != f); };     // uninitialised game memory (menus) reads as denormal junk
             if (!Same(it->second.v[k], e.v[k]) && !(tinyf(it->second.v[k]) && tinyf(e.v[k]))) {
@@ -192,7 +200,7 @@ static size_t Compare(const std::vector<HistEntry>& ref, const std::vector<HistE
                     printf("    differing frames:");
                     for (const auto& g2 : got) {
                         auto r1 = byframe.find(g2.frame);
-                        if (r1 == byframe.end()) continue;
+                        if (r1 == byframe.end() || NoPlayer(r1->second)) continue;
                         last = g2.frame;
                         bool diff = false;
                         for (int q = 0; q < HIST_FIELDS; q++) if (r1->second.v[q] != g2.v[q]) diff = true;
@@ -271,9 +279,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!soak && !cmpupto && !peekat && !cntto && !rngscan && !dumprow && at + gap + 1 >= p.movie.size()) { puts("movie too short for --at + --gap"); return 2; }
 
     if (cmpupto) {      // determinism of the editor's way of running: continuous vs in chunks with states vs with a load in the middle
-        struct Run { std::vector<HistEntry> h; bool ok = false; std::vector<uint16_t> t[4]; };
+        struct Run { std::string name; std::vector<HistEntry> h; bool ok = false; std::vector<uint16_t> t[4]; };
         auto once = [&](const char* name, uint32_t chunk, uint32_t loadAt, uint32_t spd = 0, bool nosave = false, uint32_t launchTo = 0) {
             Run r;
+            r.name = name;
             Session s2;
             RunCallbacks cb2;
             RunParams q = p;
@@ -332,10 +341,12 @@ int wmain(int argc, wchar_t** argv) {
         Run a = once("continuous", 0, 0);
         Run b = a.ok ? (cmpvariant == 1 ? once("chunked, NO saves", cmpchunk, 0, 0, true) : cmpvariant == 3 ? once("continuous fast, second run", 0, 0) : cmpvariant == 2 ? once("continuous REAL TIME 1x", 0, 0, 1000) : cmpvariant == 4 ? once("editor rewind (armed at launch)", 0, 0, 0, false, cmpupto) : once("chunked+saves", cmpchunk, 0)) : Run();
         Run c = (b.ok && cmpvariant == 0) ? once("chunked+load", cmpchunk, loadatarg ? loadatarg : cmpupto / 2) : Run();
-        auto diff = [&](const char* what, const Run& x, const Run& y) {
+        int verdict = 0;      // exit code: 0 = every comparison identical, 1 = a difference, 2 = a run did not complete
+        auto diff = [&](const Run& x, const Run& y) {
             bool same;
             size_t ok = Compare(x.h, y.h, same);
-            printf("%s: %zu matching frames before %s\n", what, ok, same ? "the end (IDENTICAL)" : "the first difference (above)");
+            printf("%s vs %s: %zu matching frames before %s\n", x.name.c_str(), y.name.c_str(), ok, same ? "the end (IDENTICAL)" : "the first difference (above)");
+            if (!same && verdict == 0) verdict = 1;
         };
         if (a.ok && b.ok && cmpvariant == 3) {      // thread experiment: how often did each side sleep / wait per marker, in the two runs?
             static const char* TN[4] = {"other threads' Sleep", "other threads' Wait", "marker thread's Sleep", "marker thread's Wait"};
@@ -352,9 +363,11 @@ int wmain(int argc, wchar_t** argv) {
                 printf("\n  totals up to 10492: %u vs %u\n", (uint16_t)(a.t[k][10492] - a.t[k][4000]), (uint16_t)(b.t[k][10492] - b.t[k][4000]));
             }
         }
-        if (a.ok && b.ok) diff("continuous vs chunked+saves", a, b);
-        if (a.ok && c.ok) diff("continuous vs chunked+load ", a, c);
-        return 0;
+        if (a.ok && b.ok) diff(a, b);
+        if (a.ok && c.ok) diff(a, c);
+        if (!a.ok || !b.ok || (cmpvariant == 0 && !c.ok)) verdict = 2;
+        printf("VERDICT: %s\n", verdict == 0 ? "PASS" : verdict == 1 ? "FAIL (runs differ)" : "FAIL (a run did not complete)");
+        return verdict;
     }
 
     printf("launching (savestates on)...\n");
@@ -510,5 +523,6 @@ int wmain(int argc, wchar_t** argv) {
 
     ss.Close();
     KillGame();
+    printf("VERDICT: %s\n", code ? "FAIL" : "PASS");
     return code;
 }

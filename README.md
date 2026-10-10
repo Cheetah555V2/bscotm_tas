@@ -109,6 +109,22 @@ build.bat
 elsewhere, `set MINGW32=<path>\mingw32\bin` first. From an MSYS2 MINGW32 shell,
 plain `make` works too. Output goes to `build\`.
 
+### Checking replays before a release (maintainers)
+
+`tools\verify.ps1` builds everything (`build.bat all tools`) and replays a movie with the real game in several ways:
+twice at full speed, with savestates saved and loaded, the editor's Rewind, a savestate on the title screen, and a
+late savestate followed by different inputs (`-Full` adds a real-time run). Each check passes only if every frame's
+values are identical. It needs the game on this PC and takes about a minute and a half for a 13,000-frame movie; do
+not play while it runs. Exit code 0 means everything passed; logs are in `build\verify\`.
+
+```bat
+powershell -ExecutionPolicy Bypass -File tools\verify.ps1 -Movie ..\test3.bscotm
+```
+
+The game path and baseline come from the editor's settings (`build\bscotm_tas.ini`) unless given with `-Game` and
+`-Baseline`. The same check can run on every pull request through `.github/workflows/replay-check.yml` on a
+self-hosted runner (the PC with the game); the file says how to set it up. It is off until you do.
+
 ### Publishing a release (maintainers)
 
 Pushing a tag builds on GitHub Actions and attaches the zip to a new release:
