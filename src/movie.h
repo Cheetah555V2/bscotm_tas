@@ -21,6 +21,10 @@ struct Branch {
     bool has_seed = false;
     uint32_t seed = 0;
     bool controller = false;
+    std::string thumb;                // the game's picture when it was saved: a small PNG, base64 (optional "thumb"; "" = none)
+    // Not saved: the savestate slot holding the game at `frame` while this game runs (see LoadBranch in main.cpp).
+    int slot = -1;
+    uint32_t slotGen = 0;
 };
 
 struct Movie {
