@@ -1629,7 +1629,7 @@ const HelpTopic HELP_TOPICS[] = {
      L"Resume live (F11): unfreeze the game and take over with the keyboard (not recorded).\r\n"
      L"Stop (F9): end the current run.\r\n\r\n"
      L"Fast-forward\r\n"
-     L"Rewind and the jumps run the game faster than real time. The speed is in Run > Fast-forward speed (default: Max, 24x). The game window may look frozen or garbled while it fast-forwards; audio is garbled too. Only the last frames before the stopping point are drawn.\r\n\r\n"
+     L"Rewind and the jumps run the game faster than real time. The speed is in Run > Fast-forward speed (default: Max, as fast as the game can run, about 25-30x). The game window may look frozen or garbled while it fast-forwards; audio is garbled too. Only the last frames before the stopping point are drawn.\r\n\r\n"
      L"The game window\r\n"
      L"The game accepts the tool's input even when the editor has focus. To type into the game yourself (Record here, Resume live), click the game window first."},
     {L"Frame advance and run",
@@ -1638,7 +1638,7 @@ const HelpTopic HELP_TOPICS[] = {
      L"Greenzone\r\n"
      L"Green frame numbers are frames the live game has been advanced through. Editing a frame before the game's position makes the later green frames invalid: the next advance first replays from the start to the edge of the green area, then steps.\r\n\r\n"
      L"Going back\r\n"
-     L"The game cannot step backwards. To go back, move the cursor and Rewind (F6): it relaunches the game and fast-forwards to the cursor. A launch takes about 1.5 s; the replay runs at roughly 1800 frames per second."},
+     L"The game cannot step backwards. To go back, move the cursor and Rewind (F6): it relaunches the game and fast-forwards to the cursor. A launch takes about 1.5 s; the replay runs at roughly 1700-2000 frames per second at Max, and gives exactly the same result at every speed."},
     {L"Editing frames",
      L"Painting: click or drag on a key cell to toggle it. Rows past the end extend the movie.\r\n"
      L"Selecting rows: click a frame number; Shift+click or drag to extend.\r\n"
@@ -1970,7 +1970,10 @@ DWORD WINAPI JobThread(LPVOID a) {
     return 0;
 }
 
-const uint32_t SPEEDS[4] = {1000, 2000, 8000, 24000};     // 24x is the fastest speed at which the game plays out exactly as in real time (32x: about 1 run in 4 is off by a frame, 50x: 1 in 2; see docs)
+// Max: no real-time pacing at all; the game runs as fast as its frames can be computed (about 25-30x). With the frame clock
+// (RunParams::quant_lock 3) every speed plays out exactly as in real time, see docs.
+const uint32_t SPEED_MAX = 1000000;
+const uint32_t SPEEDS[4] = {1000, 2000, 8000, SPEED_MAX};
 
 // The parts of a run that do not depend on what it is for: game, hook, saves, prelude and RNG seed.
 bool FillParams(RunParams& p) {
@@ -2072,7 +2075,7 @@ static bool OpenGameProc(GameProc& g, int tries) {            // like AttachGame
 
 static bool VerifyPass(const VerifyArgs& va, uint32_t mask, const wchar_t* label, VerifyRun& out) {
     RunParams p = va.p;
-    p.speed_milli = 24000;
+    p.speed_milli = SPEED_MAX;
     p.speed_mask = mask;
     p.hold = true;
     p.record = false;
@@ -2089,7 +2092,7 @@ static bool VerifyPass(const VerifyArgs& va, uint32_t mask, const wchar_t* label
     int pos = 1;
     for (int cp : va.cps) {
         if (cp > pos) {
-            if (!ss.BeginSteps(p.movie.data() + pos, (uint32_t)(cp - pos), 24000)) { out.error = "could not run the game"; break; }
+            if (!ss.BeginSteps(p.movie.data() + pos, (uint32_t)(cp - pos), SPEED_MAX)) { out.error = "could not run the game"; break; }
             int r;
             while (!(r = ss.PollSteps())) {
                 if (A.stop) ss.AbortSteps();
@@ -2624,7 +2627,7 @@ void BuildMenu(HWND w) {
     add(A.speedMenu, IDM_SPEED0, L"Real time (1x)");
     add(A.speedMenu, IDM_SPEED1, L"2x");
     add(A.speedMenu, IDM_SPEED2, L"8x");
-    add(A.speedMenu, IDM_SPEED3, L"Max (24x)");
+    add(A.speedMenu, IDM_SPEED3, L"Max (as fast as possible)");
     AppendMenuW(r, MF_POPUP, (UINT_PTR)A.speedMenu, L"Fast-forward &speed (rewind / record from cursor)");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)f, L"&File");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)e, L"&Edit");

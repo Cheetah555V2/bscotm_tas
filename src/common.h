@@ -95,7 +95,7 @@ struct Shm {
     volatile uint32_t snap_stats[4];    // hook -> host, per save: [0] pages in the pool, [1] pages that had to be copied, [2] pages in the state, [3] pool pages free
     volatile uint32_t snap_time[8];     // hook -> host, ms per phase of the last save: [0] engine pause, [1] park threads, [2] compare pages, [3] reserve pool, [4] open+freeze, [5] copy, [6] total in Save, [7] engine resume
     volatile uint32_t quant_hz;         // host -> hook: snap the clocks the game reads to a grid of 1/quant_hz s (0 = off)
-    volatile uint32_t quant_lock;       // host -> hook: with quant_hz: 2 = clamp the clock to at most 2 steps ahead of the last frame marker; 1 = lock to the markers (experimental: the game exits with code 143)
+    volatile uint32_t quant_lock;       // host -> hook: with quant_hz: 3 = frame clock (time is a function of the frame number, see hook.cpp); 2 = clamp the clock to at most 2 steps ahead of the last frame marker; 1 = lock to the markers (experimental: the game exits with code 143)
     volatile uint32_t px_cnt[32];       // diagnosis: calls the game made on its XAudio2 source voices, by vtable slot
     volatile uint32_t sh_cnt[8];        // diagnosis: callbacks XAudio2 delivered, by IXAudio2VoiceCallback method
     volatile uint32_t lockstep;         // host -> hook, experiment: release the game's Sleep-loop thread N times per frame marker (0 = off)
@@ -103,5 +103,9 @@ struct Shm {
     volatile uint32_t gap_n;            // diagnosis: markers (from the 3000th on) whose gap was not exactly 1 step, ...
     volatile uint32_t gap_log[64];      // ... as (marker << 4 | steps), first 64
     uint16_t thr_log[4][12288];         // diagnosis: at each marker (index = marker): cumulative Sleep / Wait calls of the other threads, then of the marker thread
+    volatile uint32_t fc_diag[8];       // frame clock (quant_lock 3), hook -> host: [0] frames during which time had to run on by itself (no frame for 100 ms of real time),
+                                        // [1] music-thread wakes released, [2] wakes that timed out instead, [3] ticks per frame, [4] QPC frequency, [5] markers that waited for real time
+    volatile uint32_t fc_fb_n;          // frame clock diagnosis: reads that got time running on by itself (as above), ...
+    volatile uint32_t fc_fb_log[32][3]; // ... the first 32: marker, caller (exe RVA), 1 if the marker thread
     uint16_t keys[MAX_FRAMES];
 };

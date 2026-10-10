@@ -199,7 +199,7 @@ int wmain(int argc, wchar_t** argv) {
     if (argc < 2) { puts("usage: sstest movie.bscotm --exe X --dll X --baseline X --prelude X [--at N] [--gap N] [--reps N] [--speed N]"); return 2; }
     RunParams p;
     std::wstring moviePath = argv[1], preludePath;
-    uint32_t at = 2000, gap = 300, reps = 3, speed = 24000, altoff = 0, alts = 3, soak = 0, cmpupto = 0, cmpchunk = 2000, cmpvariant = 0, nostates = 0, peekat = 0, cntfrom = 0, cntto = 0, dropcb = 0, rngscan = 0, maskarg = 0, dumprow = 0, quant = 60, lockarg = 2, lockstep = 0, loadatarg = 0; std::string dumppath = "dump.bin";
+    uint32_t at = 2000, gap = 300, reps = 3, speed = 24000, altoff = 0, alts = 3, soak = 0, cmpupto = 0, cmpchunk = 2000, cmpvariant = 0, nostates = 0, peekat = 0, cntfrom = 0, cntto = 0, dropcb = 0, rngscan = 0, maskarg = 0, dumprow = 0, quant = 60, lockarg = 3, lockstep = 0, loadatarg = 0, histarg = 1; std::string dumppath = "dump.bin";
     for (int i = 2; i + 1 < argc; i += 2) {
         std::wstring k = argv[i], v = argv[i + 1];
         if (k == L"--exe") p.exe = v;
@@ -227,6 +227,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (k == L"--lock") lockarg = _wtoi(v.c_str());
         else if (k == L"--lockstep") lockstep = _wtoi(v.c_str());
         else if (k == L"--loadat") loadatarg = _wtoi(v.c_str());
+        else if (k == L"--hist") histarg = _wtoi(v.c_str());
         else if (k == L"--dump") dumprow = _wtoi(v.c_str());
         else if (k == L"--dumpfile") { char b[512]; WideCharToMultiByte(CP_ACP, 0, v.c_str(), -1, b, 512, nullptr, nullptr); dumppath = b; }
     }
@@ -249,7 +250,7 @@ int wmain(int argc, wchar_t** argv) {
     p.quant_hz = quant;
     p.quant_lock = lockarg;
     p.lockstep = lockstep;
-    p.hist = true;
+    p.hist = histarg != 0;      // --hist 0: no per-frame sampling (for timing; runs cannot be compared then)
     p.speed_milli = speed;
     p.speed_mask = maskarg ? (uint32_t)maskarg : SPEED_ALL;
     if (!soak && !cmpupto && !peekat && !cntto && !rngscan && !dumprow && at + gap + 1 >= p.movie.size()) { puts("movie too short for --at + --gap"); return 2; }
@@ -294,6 +295,14 @@ int wmain(int argc, wchar_t** argv) {
             printf("%s: markers by grid steps since the previous (0,1,2,3,4+): %u %u %u %u %u; irregular after 3000:", name, s2.s->gap_hist[0], s2.s->gap_hist[1], s2.s->gap_hist[2], s2.s->gap_hist[3], s2.s->gap_hist[4]);
             for (uint32_t i = 0; i < s2.s->gap_n && i < 64; i++) printf(" %u:%u", s2.s->gap_log[i] >> 4, s2.s->gap_log[i] & 15);
             printf("\n");
+            if (q.quant_lock == 3)
+                printf("%s: frame clock: %u ticks/frame (freq %u), music wakes released %u, timed out %u, frames where time ran on by itself %u, markers that waited for real time %u\n",
+                       name, s2.s->fc_diag[3], s2.s->fc_diag[4], s2.s->fc_diag[1], s2.s->fc_diag[2], s2.s->fc_diag[0], s2.s->fc_diag[5]);
+            if (q.quant_lock == 3 && s2.s->fc_fb_n) {
+                printf("%s: %u clock reads ran on by themselves; first ones (marker, caller, marker thread):", name, s2.s->fc_fb_n);
+                for (uint32_t i = 0; i < s2.s->fc_fb_n && i < 32; i++) printf(" (%u exe+%X %u)", s2.s->fc_fb_log[i][0], s2.s->fc_fb_log[i][1], s2.s->fc_fb_log[i][2]);
+                printf("\n");
+            }
             s2.Close();
             KillGame();
             r.ok = true;
