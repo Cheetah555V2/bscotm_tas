@@ -194,6 +194,11 @@ captured against a different start point.
   [offset]`, e.g. `Jmp 12 2` presses jump for 2 frames out of every 12, `R 1 1` holds right on
   every frame. The key is released on the other selected frames; `offset` frames are skipped first.
   Both are one undo step.
+- **Choosing the input columns.** Right-click the column headings (or *View > Columns...*) for a
+  check list of every input column, like TAStudio: untick the ones you do not need. Presets: all
+  columns, keyboard only, controller only, or only the columns this movie uses (each key the movie
+  presses is marked "used"). Hiding a column only hides it from the grid: its inputs stay in the
+  movie and are still played. The choice is saved in `bscotm_tas.ini`.
 - **Controller.** *Run > Controller (virtual Xbox 360 pad)* makes the game see one Xbox 360
   controller, saved in the movie (`"controller":true`). The grid gets 24 more columns (blue
   headings; scroll sideways): `pA pB pX pY`, `LB RB`, `Bk St` (Back, Start), `LS RS` (stick
