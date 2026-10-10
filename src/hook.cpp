@@ -15,7 +15,7 @@
 static Shm*      S;
 static uintptr_t PollRet, ExeBase;
 static uint8_t   BitOf[256];
-static uint32_t  Cur;               // keys held during the current frame
+static KeyMask   Cur;               // keys held during the current frame
 
 static SHORT (WINAPI *R_Gaks)(int);
 static BOOL  (WINAPI *R_Qpc)(LARGE_INTEGER*);
@@ -1618,7 +1618,7 @@ static void Marker(Shm* s) {
     memcpy((void*)s->sh_cnt, (const void*)ShC, sizeof ShC);
     if (s->hist_on) HistSample(f);
     if (s->mode == M_RECORD) {
-        if (s->armed && s->rec_count < MAX_FRAMES) s->keys[s->rec_count++] = (uint16_t)Cur;
+        if (s->armed && s->rec_count < MAX_FRAMES) s->keys[s->rec_count++] = Cur;
         s->armed = 1;
         Cur = 0;
     } else if (s->mode == M_PLAY && f > s->stop_at) {
@@ -1661,8 +1661,187 @@ static __attribute__((noinline, used)) SHORT WINAPI H_Gaks(int vk) {
     }
     SHORT r = R_Gaks(vk);
     if (!Focused) return 0;                     // live keys only count in the focused game
-    if (b != 0xFF && s->mode == M_RECORD && (r & 0x8000)) Cur |= 1u << b;
+    if (b != 0xFF && s->mode == M_RECORD && (r & 0x8000)) Cur |= KeyBit(b);
     return r;
+}
+
+// ---- controller (DirectInput) ---------------------------------------------------------------------------------------
+// The game reads gamepads only through DirectInput (IDirectInput8A). Its IceSDirectInput (exe+0x2C34A0) calls
+// DirectInput8Create and EnumDevices(DI8DEVCLASS_GAMECTRL); for each pad (exe+0x2C3620) CreateDevice, SetDataFormat
+// (c_dfDIJoystick), SetProperty(DIPROP_RANGE -127..127) on X Y Z Rx Ry Rz and Acquire, and it hands the product name to
+// its input manager, which picks the default Xbox button mapping when the name is "XBOX 360 For Windows (Controller)"
+// (exe+0x269FE0, table exe+0x37AF04: left = hat left or X-, right = hat right or X+, ..., then buttons 0 2 3 1 7 6 ...).
+// Every frame, right after the keyboard poll (exe+0x2A5982), exe+0x2C3840 calls Poll and GetDeviceState (a DIJOYSTATE)
+// and turns it into on/off "pad keys": buttons 0-31, X Y Rx Ry past +-64, Z past +-120, Rz at +-127, the hat's 8
+// directions; it also keeps lX lY lRx lRy as floats.
+// With Shm::pad_mode 2 the game gets one virtual Xbox 360 pad (FakePad) whose state each frame is built from that frame's
+// PAD_* bits: from the movie when playing, from the real pad (made on/off exactly as the game does) when recording or
+// playing live. Recording and replay therefore give the game the same input, and a replay needs no pad. With pad_mode 1
+// the game is shown no controller, so a pad left plugged in cannot disturb a keyboard movie.
+struct JoyState { LONG lX, lY, lZ, lRx, lRy, lRz, slider[2]; DWORD pov[4]; BYTE btn[32]; };     // DIJOYSTATE, 80 bytes
+static const GUID FAKE_PAD_GUID = {0x6273636f, 0x746d, 0x7061, {0x64, 0x76, 0x69, 0x72, 0x74, 0x75, 0x61, 0x6c}};
+static const char FAKE_PAD_NAME[] = "XBOX 360 For Windows (Controller)";
+template <class R, class... A> static R ComCall(void* o, int slot, A... a) { return ((R (__stdcall*)(void*, A...))(*(void***)o)[slot])(o, a...); }
+
+static KeyMask PadKeys(const JoyState& j) {           // the pad's state -> PAD_* bits, with the game's own thresholds
+    uint32_t b = 0;
+    auto set = [&](int k, bool on) { if (on) b |= 1u << k; };
+    for (int i = 0; i < 10; i++) set(PAD_A + i, j.btn[i] & 0x80);
+    DWORD p = j.pov[0];
+    set(PAD_DUP, p == 0 || p == 4500 || p == 31500);
+    set(PAD_DRIGHT, p == 4500 || p == 9000 || p == 13500);
+    set(PAD_DDOWN, p == 13500 || p == 18000 || p == 22500);
+    set(PAD_DLEFT, p == 22500 || p == 27000 || p == 31500);
+    set(PAD_LLEFT, j.lX < -64);  set(PAD_LRIGHT, j.lX > 64);  set(PAD_LUP, j.lY < -64);  set(PAD_LDOWN, j.lY > 64);
+    set(PAD_RLEFT, j.lRx < -64); set(PAD_RRIGHT, j.lRx > 64); set(PAD_RUP, j.lRy < -64); set(PAD_RDOWN, j.lRy > 64);
+    set(PAD_LT, j.lZ >= 120);    set(PAD_RT, j.lZ <= -120);
+    return (KeyMask)b << NUM_KB_KEYS;
+}
+static void PadState(KeyMask k, JoyState& j) {        // PAD_* bits -> the state the game is given (full deflection)
+    uint32_t b = (uint32_t)(k >> NUM_KB_KEYS);
+    auto on = [&](int i) { return (LONG)((b >> i) & 1); };
+    memset(&j, 0, sizeof j);
+    j.lX = (on(PAD_LRIGHT) - on(PAD_LLEFT)) * 127;   j.lY = (on(PAD_LDOWN) - on(PAD_LUP)) * 127;
+    j.lRx = (on(PAD_RRIGHT) - on(PAD_RLEFT)) * 127;  j.lRy = (on(PAD_RDOWN) - on(PAD_RUP)) * 127;
+    j.lZ = (on(PAD_LT) - on(PAD_RT)) * 127;
+    static const DWORD ang[3][3] = {{31500, 0, 4500}, {27000, 0xFFFFFFFFu, 9000}, {22500, 18000, 13500}};   // [down-up+1][right-left+1]
+    j.pov[0] = ang[on(PAD_DDOWN) - on(PAD_DUP) + 1][on(PAD_DRIGHT) - on(PAD_DLEFT) + 1];
+    j.pov[1] = j.pov[2] = j.pov[3] = 0xFFFFFFFFu;
+    for (int i = 0; i < 10; i++) if (on(PAD_A + i)) j.btn[i] = 0x80;
+}
+
+static void* RealPad;                                 // IDirectInputDevice8A of the first real pad, made with the game's own DirectInput
+static GUID  RealPadGuid;
+static bool  RealPadSeen;
+static volatile LONG FakePadRefs;
+static void FillFakeInstance(void* p) {               // DIDEVICEINSTANCEA (580 bytes)
+    uint8_t* d = (uint8_t*)p;
+    DWORD size = *(DWORD*)d;
+    memset(d, 0, size >= 580 ? 580 : size);
+    *(DWORD*)d = size;
+    memcpy(d + 4, &FAKE_PAD_GUID, 16);
+    static const GUID prod = {0x028E045E, 0, 0, {0, 0, 'P', 'I', 'D', 'V', 'I', 'D'}};     // VID 045E PID 028E: Xbox 360 pad
+    memcpy(d + 20, &prod, 16);
+    *(DWORD*)(d + 36) = 0x00010215;                   // DI8DEVTYPE_GAMEPAD | DI8DEVTYPEGAMEPAD_STANDARD << 8 | DIDEVTYPE_HID
+    if (size >= 580) { lstrcpynA((char*)d + 40, FAKE_PAD_NAME, 260); lstrcpynA((char*)d + 300, FAKE_PAD_NAME, 260); }
+}
+// The virtual pad: an IDirectInputDevice8A. Set-up calls are passed on to the real pad (if any); GetDeviceState answers.
+namespace fp {
+static HRESULT __stdcall QueryInterface(void* self, const GUID&, void** out) { if (out) *out = self; InterlockedIncrement(&FakePadRefs); return S_OK; }
+static ULONG __stdcall AddRef(void*) { return InterlockedIncrement(&FakePadRefs); }
+static ULONG __stdcall Release(void*) { LONG n = InterlockedDecrement(&FakePadRefs); return n > 0 ? n : 0; }     // a static object: never freed
+static HRESULT __stdcall GetCapabilities(void*, DWORD* caps) {          // DIDEVCAPS
+    if (caps && caps[0] >= 24) { caps[1] = 1 /*DIDC_ATTACHED*/; caps[2] = 0x00010215; caps[3] = 5; caps[4] = 10; caps[5] = 1; }
+    return S_OK;
+}
+static HRESULT __stdcall EnumObjects(void*, void*, void*, DWORD) { return S_OK; }
+static HRESULT __stdcall GetProperty(void*, const GUID&, void*) { return E_NOTIMPL; }
+static HRESULT __stdcall SetProperty(void*, const GUID& g, void* ph) { if (RealPad) ComCall<HRESULT>(RealPad, 6, &g, ph); return S_OK; }
+static HRESULT __stdcall Acquire(void*) { if (RealPad) ComCall<HRESULT>(RealPad, 7); return S_OK; }
+static HRESULT __stdcall Unacquire(void*) { if (RealPad) ComCall<HRESULT>(RealPad, 8); return S_OK; }
+static HRESULT __stdcall GetDeviceState(void*, DWORD cb, void* data) {
+    Shm* s = S;
+    s->pad_diag[1]++;
+    KeyMask k = 0;
+    if (s->mode == M_PLAY) {
+        uint32_t f = s->frame;
+        k = s->keys[f ? f - 1 : 0] & PAD_KEYS_MASK;
+    } else if (RealPad && Focused) {                  // live keys only count in the focused game, like the keyboard
+        JoyState j;
+        ComCall<HRESULT>(RealPad, 25);                // Poll
+        HRESULT hr = ComCall<HRESULT>(RealPad, 9, (DWORD)sizeof j, (void*)&j);
+        if (FAILED(hr)) { ComCall<HRESULT>(RealPad, 7); hr = ComCall<HRESULT>(RealPad, 9, (DWORD)sizeof j, (void*)&j); }
+        if (SUCCEEDED(hr)) {
+            k = PadKeys(j);
+            s->pad_diag[2]++;
+            if (s->mode == M_RECORD) Cur |= k;
+        }
+    }
+    JoyState out;
+    PadState(k, out);
+    if (data) { memset(data, 0, cb); memcpy(data, &out, cb < sizeof out ? cb : sizeof out); }
+    return S_OK;
+}
+static HRESULT __stdcall GetDeviceData(void*, DWORD, void*, DWORD* n, DWORD) { if (n) *n = 0; return S_OK; }
+static HRESULT __stdcall SetDataFormat(void*, void* fmt) { if (RealPad) ComCall<HRESULT>(RealPad, 11, fmt); return S_OK; }
+static HRESULT __stdcall SetEventNotification(void*, HANDLE) { return S_OK; }
+static HRESULT __stdcall SetCooperativeLevel(void*, HWND w, DWORD fl) { if (RealPad) ComCall<HRESULT>(RealPad, 13, w, fl); return S_OK; }
+static HRESULT __stdcall GetObjectInfo(void*, void*, DWORD, DWORD) { return E_NOTIMPL; }
+static HRESULT __stdcall GetDeviceInfo(void*, void* inst) { if (inst) FillFakeInstance(inst); return S_OK; }
+static HRESULT __stdcall RunControlPanel(void*, HWND, DWORD) { return S_OK; }
+static HRESULT __stdcall Initialize(void*, HINSTANCE, DWORD, const GUID&) { return S_OK; }
+static HRESULT __stdcall CreateEffect(void*, const GUID&, const void*, void**, void*) { return E_NOTIMPL; }
+static HRESULT __stdcall EnumEffects(void*, void*, void*, DWORD) { return S_OK; }
+static HRESULT __stdcall GetEffectInfo(void*, void*, const GUID&) { return E_NOTIMPL; }
+static HRESULT __stdcall GetForceFeedbackState(void*, DWORD*) { return E_NOTIMPL; }
+static HRESULT __stdcall SendForceFeedbackCommand(void*, DWORD) { return E_NOTIMPL; }
+static HRESULT __stdcall EnumCreatedEffectObjects(void*, void*, void*, DWORD) { return S_OK; }
+static HRESULT __stdcall Escape(void*, void*) { return E_NOTIMPL; }
+static HRESULT __stdcall Poll(void*) { return S_OK; }          // the real pad is polled in GetDeviceState
+static HRESULT __stdcall SendDeviceData(void*, DWORD, const void*, DWORD* n, DWORD) { if (n) *n = 0; return S_OK; }
+static HRESULT __stdcall EnumEffectsInFile(void*, const char*, void*, void*, DWORD) { return S_OK; }
+static HRESULT __stdcall WriteEffectToFile(void*, const char*, DWORD, void*, DWORD) { return E_NOTIMPL; }
+static HRESULT __stdcall BuildActionMap(void*, void*, const char*, DWORD) { return E_NOTIMPL; }
+static HRESULT __stdcall SetActionMap(void*, void*, const char*, DWORD) { return E_NOTIMPL; }
+static HRESULT __stdcall GetImageInfo(void*, void*) { return E_NOTIMPL; }
+static void* const Vtbl[32] = {
+    (void*)QueryInterface, (void*)AddRef, (void*)Release, (void*)GetCapabilities, (void*)EnumObjects, (void*)GetProperty,
+    (void*)SetProperty, (void*)Acquire, (void*)Unacquire, (void*)GetDeviceState, (void*)GetDeviceData, (void*)SetDataFormat,
+    (void*)SetEventNotification, (void*)SetCooperativeLevel, (void*)GetObjectInfo, (void*)GetDeviceInfo, (void*)RunControlPanel,
+    (void*)Initialize, (void*)CreateEffect, (void*)EnumEffects, (void*)GetEffectInfo, (void*)GetForceFeedbackState,
+    (void*)SendForceFeedbackCommand, (void*)EnumCreatedEffectObjects, (void*)Escape, (void*)Poll, (void*)SendDeviceData,
+    (void*)EnumEffectsInFile, (void*)WriteEffectToFile, (void*)BuildActionMap, (void*)SetActionMap, (void*)GetImageInfo,
+};
+static struct { void* const* vtbl; } Obj = {Vtbl};
+}  // namespace fp
+
+typedef BOOL (CALLBACK *DiEnumCb)(const void* inst, void* ref);
+static HRESULT (__stdcall *R_DiEnumDevices)(void*, DWORD, DiEnumCb, void*, DWORD);
+static HRESULT (__stdcall *R_DiCreateDevice)(void*, const GUID&, void**, void*);
+static BOOL CALLBACK FirstPadCb(const void* inst, void* ref) {           // remembers the first real pad
+    memcpy(ref, (const uint8_t*)inst + 4, 16);
+    RealPadSeen = true;
+    return FALSE;                                     // DIENUM_STOP
+}
+// The game asks for DI8DEVCLASS_GAMECTRL (4); a joystick / gamepad / driving device type is a request for pads too.
+static bool IsGameCtrlEnum(DWORD type) { return type == 4 || (type & 0xFF) == 0x14 || (type & 0xFF) == 0x15 || (type & 0xFF) == 0x16; }
+static HRESULT __stdcall H_DiEnumDevices(void* self, DWORD type, DiEnumCb cb, void* ref, DWORD flags) {
+    uint32_t mode = S->pad_mode;
+    if (!mode || !IsGameCtrlEnum(type)) return R_DiEnumDevices(self, type, cb, ref, flags);
+    S->pad_diag[3]++;
+    if (mode != 2 || !cb) return S_OK;                // 1: no controller at all
+    if (!RealPadSeen) {
+        R_DiEnumDevices(self, 4, FirstPadCb, &RealPadGuid, 1 /*DIEDFL_ATTACHEDONLY*/);
+        S->pad_diag[0] = RealPadSeen ? 1 : 0;
+    }
+    uint8_t inst[580];
+    *(DWORD*)inst = sizeof inst;
+    FillFakeInstance(inst);
+    cb(inst, ref);
+    return S_OK;
+}
+static HRESULT __stdcall H_DiCreateDevice(void* self, const GUID& g, void** out, void* outer) {
+    if (!out || memcmp(&g, &FAKE_PAD_GUID, sizeof g)) return R_DiCreateDevice(self, g, out, outer);
+    if (!RealPad && RealPadSeen && R_DiCreateDevice(self, RealPadGuid, &RealPad, nullptr) != S_OK) RealPad = nullptr;
+    InterlockedIncrement(&FakePadRefs);
+    *out = &fp::Obj;
+    return S_OK;
+}
+static HRESULT (WINAPI *R_Di8Create)(HINSTANCE, DWORD, const GUID&, void**, void*);
+static HRESULT WINAPI H_Di8Create(HINSTANCE h, DWORD ver, const GUID& iid, void** out, void* outer) {
+    HRESULT hr = R_Di8Create(h, ver, iid, out, outer);
+    if (hr == S_OK && out && *out && !R_DiEnumDevices) {      // IDirectInput8A: 3 CreateDevice, 4 EnumDevices (dinput8.dll's vtable, not game code)
+        void** vt = *(void***)*out;
+        DWORD old;
+        if (VirtualProtect(&vt[3], 8, PAGE_READWRITE, &old)) {
+            R_DiCreateDevice = (decltype(R_DiCreateDevice))vt[3];
+            R_DiEnumDevices = (decltype(R_DiEnumDevices))vt[4];
+            vt[3] = (void*)H_DiCreateDevice;
+            vt[4] = (void*)H_DiEnumDevices;
+            VirtualProtect(&vt[3], 8, old, &old);
+        }
+    }
+    return hr;
 }
 
 // ---- IAT patching ------------------------------------------------------------
@@ -1719,7 +1898,7 @@ static void Init() {
     S = (Shm*)MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
     if (!S || S->magic != SHM_MAGIC) return;
     memset(BitOf, 0xFF, sizeof BitOf);
-    for (int i = 0; i < NUM_KEYS; i++) BitOf[KEYS[i].vk] = (uint8_t)i;
+    for (int i = 0; i < NUM_KB_KEYS; i++) BitOf[KEYS[i].vk] = (uint8_t)i;     // controller keys are not polled through GetAsyncKeyState
     HMODULE exe = GetModuleHandleW(NULL);
     PollRet = (uintptr_t)exe + POLL_RET_RVA;
     ExeBase = (uintptr_t)exe;
@@ -1777,6 +1956,7 @@ static void Init() {
     AddVectoredExceptionHandler(1, RngVeh);
     PatchIat(exe, "user32.dll", "CreateWindowExA", (void*)H_Cwe, &R_Cwe);
     PatchIat(exe, "d3d9.dll", "Direct3DCreate9", (void*)H_D3dCreate, &R_D3dCreate);
+    PatchIat(exe, "DINPUT8.dll", "DirectInput8Create", (void*)H_Di8Create, &R_Di8Create);
     S->status |= ok ? ST_HOOKED : ST_HOOK_FAIL;
 }
 

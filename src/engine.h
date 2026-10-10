@@ -28,6 +28,7 @@ struct RunParams {
     uint32_t seed = 0;
     bool hist = false;              // sample the player's values at every frame (the Memory window's history)
     bool rng_log = false;           // log the game's random draws (see the RNG log window)
+    bool controller = false;        // the game sees one virtual controller fed from the PAD_* keys (else it sees none); see hook.cpp
 };
 
 struct RunResult {
@@ -57,10 +58,10 @@ struct Session {
     bool Alive() const;
     uint32_t Row() const;           // movie row the held game runs next, or UINT_MAX if running
     // Runs one frame with `keys` as its input and holds again. False if it timed out.
-    bool Step(uint16_t keys);
+    bool Step(KeyMask keys);
     // Runs n frames in a row without blocking: keys[i] is the input of frame i. The game
     // runs at speed_milli (1000 = real time) and freezes again after the last one.
-    bool BeginSteps(const uint16_t* keys, uint32_t n, uint32_t speed_milli);
+    bool BeginSteps(const KeyMask* keys, uint32_t n, uint32_t speed_milli);
     // Savestates (need RunParams::savestates, the game frozen). Slots 0..7.
     bool SaveState(int slot);
     bool LoadState(int slot);       // leaves the game frozen at the marker the slot was saved at

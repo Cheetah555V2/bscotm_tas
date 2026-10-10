@@ -2,11 +2,16 @@
 #pragma once
 #include <stdint.h>
 
-enum { NUM_KEYS = 16, MAX_FRAMES = 1 << 20 };
+// A frame's input: bit i <-> KEYS[i]. Bits 0-15 are keyboard keys (the set the Python tool tracked), bits 16-39 the
+// buttons and directions of the virtual controller (see "controller" in hook.cpp), as the game reads them.
+typedef uint64_t KeyMask;
+enum { NUM_KB_KEYS = 16, NUM_PAD_KEYS = 24, NUM_KEYS = NUM_KB_KEYS + NUM_PAD_KEYS, MAX_FRAMES = 1 << 20 };
 
-struct KeyDef { const char* name; const char* label; uint8_t vk; };
+struct KeyDef { const char* name; const char* label; uint8_t vk; };    // vk 0 = a controller key
+static inline bool IsPadKey(int i) { return i >= NUM_KB_KEYS; }
+static inline KeyMask KeyBit(int i) { return (KeyMask)1 << i; }
+static const KeyMask PAD_KEYS_MASK = (((KeyMask)1 << NUM_PAD_KEYS) - 1) << NUM_KB_KEYS;
 
-// Bit i of a frame mask <-> KEYS[i]. Same set the Python tool tracked.
 static const KeyDef KEYS[NUM_KEYS] = {
     {"LEFT",  "L",   0x25}, {"RIGHT", "R",   0x27},
     {"UP",    "U",   0x26}, {"DOWN",  "Dn",  0x28},
@@ -16,6 +21,21 @@ static const KeyDef KEYS[NUM_KEYS] = {
     {"RMB",   "Sub", 0x02}, {"Q",     "Q",   0x51},
     {"E",     "E",   0x45}, {"P",     "P",   0x50},
     {"ENTER", "Ent", 0x0D}, {"ESC",   "Esc", 0x1B},
+    // controller (names are the movie file's keys; bit 16 + n = PAD_* below)
+    {"PAD_A", "pA", 0}, {"PAD_B", "pB", 0}, {"PAD_X", "pX", 0}, {"PAD_Y", "pY", 0},
+    {"PAD_LB", "LB", 0}, {"PAD_RB", "RB", 0}, {"PAD_BACK", "Bk", 0}, {"PAD_START", "St", 0},
+    {"PAD_LS", "LS", 0}, {"PAD_RS", "RS", 0},
+    {"PAD_DUP", "dU", 0}, {"PAD_DRIGHT", "dR", 0}, {"PAD_DDOWN", "dD", 0}, {"PAD_DLEFT", "dL", 0},
+    {"PAD_LLEFT", "LsL", 0}, {"PAD_LRIGHT", "LsR", 0}, {"PAD_LUP", "LsU", 0}, {"PAD_LDOWN", "LsD", 0},
+    {"PAD_RLEFT", "RsL", 0}, {"PAD_RRIGHT", "RsR", 0}, {"PAD_RUP", "RsU", 0}, {"PAD_RDOWN", "RsD", 0},
+    {"PAD_LT", "LT", 0}, {"PAD_RT", "RT", 0},
+};
+// Controller keys, counted from bit 16: buttons 0-9 of the pad (Xbox 360 order), the D-pad (the pad's hat), the left
+// and right sticks pushed past the game's threshold (half way), and the triggers (the shared Z axis, pushed nearly fully).
+enum PadKey {
+    PAD_A, PAD_B, PAD_X, PAD_Y, PAD_LB, PAD_RB, PAD_BACK, PAD_START, PAD_LS, PAD_RS,
+    PAD_DUP, PAD_DRIGHT, PAD_DDOWN, PAD_DLEFT, PAD_LLEFT, PAD_LRIGHT, PAD_LUP, PAD_LDOWN,
+    PAD_RLEFT, PAD_RRIGHT, PAD_RUP, PAD_RDOWN, PAD_LT, PAD_RT,
 };
 
 // Return address of the game's own GetAsyncKeyState poll (COTM.exe RVA).
@@ -107,5 +127,9 @@ struct Shm {
                                         // [1] music-thread wakes released, [2] wakes that timed out instead, [3] ticks per frame, [4] QPC frequency, [5] markers that waited for real time
     volatile uint32_t fc_fb_n;          // frame clock diagnosis: reads that got time running on by itself (as above), ...
     volatile uint32_t fc_fb_log[32][3]; // ... the first 32: marker, caller (exe RVA), 1 if the marker thread
-    uint16_t keys[MAX_FRAMES];
+    volatile uint32_t pad_mode;         // host -> hook, set before the game starts: 0 = DirectInput untouched, 1 = the game sees no
+                                        // controller, 2 = it sees one virtual Xbox 360 pad fed from keys[] (play) or the real pad (record, live)
+    volatile uint32_t pad_diag[4];      // hook -> host: [0] real pads found, [1] virtual pad reads, [2] reads that used the real pad,
+                                        // [3] the game asked for the controllers (EnumDevices calls)
+    KeyMask keys[MAX_FRAMES];
 };

@@ -96,7 +96,7 @@ uint32_t Session::Row() const {
     return s->paused - 1 - pre;
 }
 
-bool Session::Step(uint16_t keys) {
+bool Session::Step(KeyMask keys) {
     if (!s || !s->paused) return false;
     uint32_t f = s->paused;
     s->keys[f - 1] = keys;
@@ -110,7 +110,7 @@ bool Session::Step(uint16_t keys) {
     return false;
 }
 
-bool Session::BeginSteps(const uint16_t* keys, uint32_t n, uint32_t speed_milli) {
+bool Session::BeginSteps(const KeyMask* keys, uint32_t n, uint32_t speed_milli) {
     if (!s || !s->paused || !n || s->paused - 1 + n > MAX_FRAMES) return false;
     uint32_t f = s->paused;
     for (uint32_t i = 0; i < n; i++) s->keys[f - 1 + i] = keys[i];
@@ -268,6 +268,7 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     s->quant_hz = p.quant_hz;
     s->quant_lock = p.quant_lock;
     s->lockstep = p.lockstep;
+    s->pad_mode = p.controller ? 2 : 1;     // before the game starts: it looks for controllers once, at start-up
 
     STARTUPINFOW si{};
     si.cb = sizeof si;
@@ -296,8 +297,8 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     // game runs, so frame 1 of the schedule is the game's own first frame marker.
     // (Starting after a wall-clock "ready" wait made the start frame vary from
     // boot to boot, which desynced the prelude.)
-    memcpy(s->keys, p.prelude.data(), p.prelude.size() * sizeof(uint16_t));
-    memcpy(s->keys + p.prelude.size(), p.movie.data(), p.target * sizeof(uint16_t));
+    memcpy(s->keys, p.prelude.data(), p.prelude.size() * sizeof(KeyMask));
+    memcpy(s->keys + p.prelude.size(), p.movie.data(), p.target * sizeof(KeyMask));
     s->frame = 0;
     s->then_record = p.record ? 1 : 0;
     if (p.hold) {

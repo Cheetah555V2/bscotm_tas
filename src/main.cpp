@@ -25,7 +25,7 @@ enum {
     IDC_MEM_HIST, IDC_MEM_GRAPH, IDC_MEM_CSV, IDC_MEM_CLR,
     IDM_HELP_START, IDM_HELP_KEYS, IDM_HELP_TROUBLE, IDM_HELP_ABOUT, IDM_HELP_GUIDE, IDC_HELP_TOPICS,
     IDM_RNGLOG, IDM_VERIFY, IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
-    IDM_SAVESTATES, IDM_SAVESTATE_NOW, IDM_SSINTERVAL,
+    IDM_SAVESTATES, IDM_SAVESTATE_NOW, IDM_SSINTERVAL, IDM_CONTROLLER, IDM_COLUMNS,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
     IDC_BASE = 300, IDC_PRE, IDC_RNG_CHK, IDC_RNG_CLR, IDC_RNG_CSV,
@@ -65,6 +65,8 @@ struct App {
     int cursor = 0, anchor = 0;   // selection = [anchor, cursor]
     int reached = 0;              // "greenzone": frames the live game has been advanced through
     int top = 0;                  // first visible row
+    int left = 0;                 // first visible key column (the grid scrolls sideways when the columns do not fit)
+    KeyMask hidden = 0;           // input columns the user hid (View > Columns, or right-click the column headings); saved in the ini
     std::vector<Step> undo, redo;
     Frames clip;
     Notes clipNotes;
@@ -97,6 +99,18 @@ struct App {
 } A;
 
 int S(int v) { return MulDiv(v, A.dpi, 96); }
+// Grid columns (= KEYS indices): the keyboard keys, plus the controller keys when the movie uses the controller.
+int NumCols() { return A.movie.controller ? NUM_KEYS : NUM_KB_KEYS; }
+// The input columns on screen, left to right (KEYS indices): the available ones the user did not hide. Never empty: if every
+// one is hidden, all are shown.
+void ColumnsMenu(HWND owner, POINT pt);      // the column chooser (below)
+const std::vector<int>& ShownKeys() {
+    static std::vector<int> v;
+    v.clear();
+    for (int k = 0; k < NumCols(); k++) if (!(A.hidden >> k & 1)) v.push_back(k);
+    if (v.empty()) for (int k = 0; k < NumCols(); k++) v.push_back(k);
+    return v;
+}
 
 // A tool window placed next to the editor, moved (and if need be shrunk) into the work area of the editor's monitor,
 // so it never opens off screen when the editor hangs past an edge of the screen.
@@ -166,11 +180,23 @@ int VisibleRows() {
     return std::max(1, (int)((rc.bottom - HdrH()) / RowH()));
 }
 
+// Key columns that fit beside the frame numbers, leaving some room for the notes.
+int VisibleCols() {
+    RECT rc{};
+    GetClientRect(A.grid, &rc);
+    return std::max(1, (int)(rc.right - FrameW() - S(120)) / KeyW());
+}
+
 void UpdateScroll() {
     int vis = VisibleRows();
     A.top = std::max(0, std::min(A.top, Size()));
     SCROLLINFO si{sizeof si, SIF_RANGE | SIF_PAGE | SIF_POS, 0, Size() + vis - 1, (UINT)vis, A.top, 0};
     SetScrollInfo(A.grid, SB_VERT, &si, TRUE);
+    int cols = VisibleCols();       // sideways: only when the key columns do not all fit (the scroll bar hides itself otherwise)
+    int shown = (int)ShownKeys().size();
+    A.left = std::max(0, std::min(A.left, shown - cols));
+    SCROLLINFO sh{sizeof sh, SIF_RANGE | SIF_PAGE | SIF_POS, 0, shown - 1, (UINT)cols, A.left, 0};
+    SetScrollInfo(A.grid, SB_HORZ, &sh, TRUE);
     InvalidateRect(A.grid, nullptr, FALSE);
 }
 
@@ -298,7 +324,7 @@ void Redo() {
 
 void SetCell(Step& st, int row, int bit, bool on) {
     EnsureRows(st, row + 1);
-    uint16_t m = A.movie.frames[row], n = on ? (uint16_t)(m | (1u << bit)) : (uint16_t)(m & ~(1u << bit));
+    KeyMask m = A.movie.frames[row], n = on ? (m | KeyBit(bit)) : (m & ~KeyBit(bit));
     if (n != m) DoSplice(st, row, 1, Frames{n});
 }
 
@@ -489,7 +515,7 @@ void EditRepeat() {
 static int KeyByName(const std::wstring& w) {
     std::string a = U8(w);
     for (char& c : a) c = (char)tolower((unsigned char)c);
-    for (int i = 0; i < NUM_KEYS; i++) {
+    for (int i = 0; i < NumCols(); i++) {
         std::string n = KEYS[i].name, l = KEYS[i].label;
         for (char& c : n) c = (char)tolower((unsigned char)c);
         for (char& c : l) c = (char)tolower((unsigned char)c);
@@ -504,7 +530,7 @@ void EditPattern() {
     if (hi - lo + 1 < 2) { SetMsg(L"Select the frames to fill first (click a frame number, Shift+click another)."); return; }
     std::wstring t = L"Jmp 12 2";
     std::wstring keys;
-    for (int i = 0; i < NUM_KEYS; i++) { if (i) keys += L" "; keys += W(KEYS[i].label); }
+    for (int i = 0; i < NumCols(); i++) { if (i) keys += L" "; keys += W(KEYS[i].label); }
     if (!AskText(L"Fill pattern", L"KEY period on [offset] for the " + std::to_wstring(hi - lo + 1) + L" selected frames. Keys: " + keys, t)) return;
     std::vector<std::wstring> tok;
     {
@@ -532,7 +558,7 @@ void EditPattern() {
     Frames nv(A.movie.frames.begin() + lo, A.movie.frames.begin() + hi + 1);
     for (int k = 0; k <= hi - lo; k++) {
         bool down = k >= offset && ((k - offset) % period) < on;
-        if (down) nv[k] |= (uint16_t)(1u << key); else nv[k] &= (uint16_t)~(1u << key);
+        if (down) nv[k] |= KeyBit(key); else nv[k] &= ~KeyBit(key);
     }
     DoSplice(st, lo, hi - lo + 1, nv);
     Commit(st);
@@ -547,7 +573,7 @@ static int FindKey = -1;           // -1 = any key
 static int FindMode = 0;           // 0 = pressed, 1 = released, 2 = any change
 
 static bool FindMatch(int row) {
-    uint16_t cur = A.movie.frames[row], prev = row > 0 ? A.movie.frames[row - 1] : 0;
+    KeyMask cur = A.movie.frames[row], prev = row > 0 ? A.movie.frames[row - 1] : 0;
     if (FindMode == 2 || FindKey < 0) return FindKey < 0 ? cur != prev : ((cur ^ prev) >> FindKey & 1) != 0;
     bool now = cur >> FindKey & 1, was = prev >> FindKey & 1;
     return FindMode == 0 ? (now && !was) : (!now && was);
@@ -571,7 +597,7 @@ void FindDialog() {
     std::wstring t = FindKey < 0 ? L"*" : W(KEYS[FindKey].label);
     if (FindKey >= 0 && FindMode == 1) t += L" released";
     std::wstring keys;
-    for (int i = 0; i < NUM_KEYS; i++) { if (i) keys += L" "; keys += W(KEYS[i].label); }
+    for (int i = 0; i < NumCols(); i++) { if (i) keys += L" "; keys += W(KEYS[i].label); }
     if (!AskText(L"Find", L"KEY [pressed|released], or * for any change. Keys: " + keys, t)) return;
     std::vector<std::wstring> tok;
     size_t i = 0;
@@ -672,6 +698,29 @@ void EditSeed() {
     SetFocus(A.grid);
 }
 
+// Run > Controller: the game sees one virtual Xbox 360 pad (the PAD_* columns, fed from the movie when playing and from
+// the real pad when recording), or no controller at all. The game looks for controllers when it starts, so the change
+// takes effect from the next launch (Rewind).
+void ToggleController() {
+    if (A.busy) return;
+    bool on = !A.movie.controller;
+    if (!on) {
+        bool used = false;
+        for (KeyMask k : A.movie.frames) if (k & PAD_KEYS_MASK) { used = true; break; }
+        if (used && MessageBoxW(A.wnd, L"This movie has controller inputs. With the controller off the game sees no controller, so they are ignored "
+                                       L"(they stay in the movie, hidden, and come back when you turn the controller on again).\n\nTurn the controller off?",
+                                L"Controller", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    }
+    A.movie.controller = on;
+    A.dirty = true;
+    A.reached = 0; StaleStatesAfter(-1);
+    InvalidateRect(A.grid, nullptr, TRUE);
+    UpdateScroll(); UpdateTitle(); UpdateStatus();
+    SetMsg(on ? L"Controller on: the game sees one Xbox 360 pad (the pA ... RT columns); recording reads your pad. Rewind (F6) to restart the game with it."
+              : L"Controller off: the game sees no controller. Rewind (F6) to restart it.");
+    SetFocus(A.grid);
+}
+
 void SelectAll() {
     A.anchor = 0; A.cursor = std::max(0, Size() - 1);
     InvalidateRect(A.grid, nullptr, FALSE);
@@ -701,7 +750,8 @@ void PaintGrid(HWND h) {
     SelectObject(m, A.font);
     SetBkMode(m, TRANSPARENT);
 
-    const int rh = RowH(), hh = HdrH(), fw = FrameW(), kw = KeyW(), gw = fw + NUM_KEYS * kw;
+    const std::vector<int>& cols = ShownKeys();     // on screen: cols[k0], cols[k0 + 1], ...
+    const int rh = RowH(), hh = HdrH(), fw = FrameW(), kw = KeyW(), k0 = A.left, nc = (int)cols.size(), gw = fw + (nc - k0) * kw;
     Fill(m, 0, 0, rc.right, rc.bottom, cBg);
 
     // header
@@ -709,10 +759,11 @@ void PaintGrid(HWND h) {
     SelectObject(m, A.fontB);
     Text(m, L"Frame", RECT{0, 0, fw - S(6), hh}, DT_RIGHT, RGB(0, 0, 0));
     Text(m, L"Note", RECT{gw + S(6), 0, rc.right, hh}, DT_LEFT, RGB(0, 0, 0));
-    for (int k = 0; k < NUM_KEYS; k++) {
+    for (int d = k0; d < nc; d++) {
+        int k = cols[d];
         wchar_t lb[8];
         swprintf(lb, 8, L"%hs", KEYS[k].label);
-        Text(m, lb, RECT{fw + k * kw, 0, fw + (k + 1) * kw, hh}, DT_CENTER, RGB(0, 0, 0));
+        Text(m, lb, RECT{fw + (d - k0) * kw, 0, fw + (d - k0 + 1) * kw, hh}, DT_CENTER, IsPadKey(k) ? RGB(30, 70, 150) : RGB(0, 0, 0));     // controller keys in blue
     }
     Fill(m, 0, hh - 1, rc.right, hh, cLine60);
     SelectObject(m, A.font);
@@ -722,7 +773,7 @@ void PaintGrid(HWND h) {
         int r = A.top + i, y = hh + i * rh;
         if (y >= rc.bottom) break;
         bool real = r < n, sel = r >= lo && r <= hi;
-        uint16_t mask = real ? A.movie.frames[r] : 0;
+        KeyMask mask = real ? A.movie.frames[r] : 0;
 
         Fill(m, 0, y, fw, y + rh, r < A.reached ? (r == A.reached - 1 ? cGreenHead : cGreen) : cHdr);
         wchar_t num[16];
@@ -738,15 +789,16 @@ void PaintGrid(HWND h) {
             Text(m, wn.c_str(), RECT{gw + S(6), y, rc.right - S(4), y + rh}, DT_LEFT | DT_END_ELLIPSIS, bm ? cBmText : cNoteText);
         }
 
-        for (int k = 0; k < NUM_KEYS; k++) {
+        for (int d = k0; d < nc; d++) {
+            int k = cols[d];
             if (!(mask >> k & 1)) continue;
-            int x = fw + k * kw;
+            int x = fw + (d - k0) * kw;
             Fill(m, x + 1, y + 1, x + kw, y + rh, cPressed);
             wchar_t lb[8];
             swprintf(lb, 8, L"%hs", KEYS[k].label);
             Text(m, lb, RECT{x, y, x + kw, y + rh}, DT_CENTER, RGB(255, 255, 255));
         }
-        for (int k = 0; k <= NUM_KEYS; k++) Fill(m, fw + k * kw, y, fw + k * kw + 1, y + rh, cLine);
+        for (int k = 0; k <= nc - k0; k++) Fill(m, fw + k * kw, y, fw + k * kw + 1, y + rh, cLine);
         Fill(m, gw, y, gw + 1, y + rh, cLine60);
         Fill(m, 0, y + rh - 1, rc.right, y + rh, (r + 1) % 60 == 0 ? cLine60 : cLine);
         if (r == A.cursor) {
@@ -765,7 +817,13 @@ void PaintGrid(HWND h) {
 }
 
 int RowAt(int y) { return A.top + (y < HdrH() ? -1 : (y - HdrH()) / RowH()); }
-int ColAt(int x) { return x < FrameW() ? -1 : (x - FrameW()) / KeyW(); }   // >= NUM_KEYS: outside
+// The key (KEYS index) of the input column at x; -1 = the frame numbers, NUM_KEYS = right of the input columns (notes).
+int ColAt(int x) {
+    if (x < FrameW()) return -1;
+    const std::vector<int>& cols = ShownKeys();
+    size_t d = A.left + (x - FrameW()) / KeyW();
+    return d < cols.size() ? cols[d] : NUM_KEYS;
+}
 
 void PaintTo(int row) {     // paint dragCol from the last row to `row`
     int a = A.dragRow, b = row, step = a <= b ? 1 : -1;
@@ -817,7 +875,12 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_RBUTTONUP: {
             int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
-            if (y < HdrH()) return 0;
+            if (y < HdrH()) {                   // the column headings: choose the input columns
+                POINT pt{x, y};
+                ClientToScreen(h, &pt);
+                if (!A.busy) ColumnsMenu(h, pt);
+                return 0;
+            }
             int row = RowAt(y);
             if (row < SelLo() || row > SelHi()) SetCursorRow(row, false);   // keep a selection the click is inside
             else { A.cursor = row; UpdateScroll(); UpdateStatus(); }
@@ -864,6 +927,23 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             UpdateScroll();
             return 0;
         }
+        case WM_HSCROLL: {
+            SCROLLINFO si{sizeof si, SIF_ALL};
+            GetScrollInfo(h, SB_HORZ, &si);
+            switch (LOWORD(wp)) {
+                case SB_LINELEFT: A.left--; break;
+                case SB_LINERIGHT: A.left++; break;
+                case SB_PAGELEFT: A.left -= si.nPage; break;
+                case SB_PAGERIGHT: A.left += si.nPage; break;
+                case SB_THUMBTRACK: case SB_THUMBPOSITION: A.left = si.nTrackPos; break;
+            }
+            UpdateScroll();
+            return 0;
+        }
+        case WM_MOUSEHWHEEL:
+            A.left += GET_WHEEL_DELTA_WPARAM(wp) / 120 * 2;
+            UpdateScroll();
+            return 0;
         case WM_KEYDOWN: {
             bool shift = GetKeyState(VK_SHIFT) < 0, ctrl = GetKeyState(VK_CONTROL) < 0;
             int page = std::max(1, VisibleRows() - 1);
@@ -1684,6 +1764,15 @@ const HelpTopic HELP_TOPICS[] = {
      L"What a jump does\r\n"
      L"Forward (the frozen game has not reached the frame yet): the game just runs ahead at the fast-forward speed, no restart. Backward, or no game running: the game restarts and fast-forwards to the frame.\r\n\r\n"
      L"Bookmarks are frame notes with a flag, so they move with their frames, are covered by undo and are saved in the movie file."},
+    {L"Choosing the input columns",
+     L"Right-click the column headings (or View > Columns) for a check list of every input column. Untick a column to hide it, tick it to show it again.\r\n\r\n"
+     L"Presets at the top: show all columns, keyboard columns only, controller columns only (with the controller on), or only the columns this movie uses. In the list, every key the movie presses somewhere is marked (used).\r\n\r\n"
+     L"Hiding a column only hides it from the grid: its inputs stay in the movie and are still played. The choice is remembered (bscotm_tas.ini). The grid scrolls sideways when the columns do not fit."},
+    {L"Controller",
+     L"Run > Controller (virtual Xbox 360 pad) makes the game see one Xbox 360 controller. The grid then gets 24 more columns (blue headings, scroll sideways): pA pB pX pY (face buttons), LB RB, Bk St (Back, Start), LS RS (stick clicks), dU dR dD dL (D-pad), LsL LsR LsU LsD and RsL RsR RsU RsD (left / right stick pushed past half way), LT RT (triggers).\r\n\r\n"
+     L"The game's default Xbox buttons: move = D-pad or left stick, jump = pA, attack = pX, sub-weapon = pY, switch character = LB / RB, pause = St, confirm = pA, cancel = pB.\r\n\r\n"
+     L"Playing a movie feeds the pad from these columns, so a replay needs no controller. Recording (Record new, Record from cursor, Record here) reads your real controller, the first one Windows finds; the game gets exactly what is recorded (sticks and triggers as on / off, the way the game itself reads them), so a replay matches the recording. Keyboard and controller keys can be mixed in one movie.\r\n\r\n"
+     L"With the controller off the game sees no controller at all, even if one is plugged in, so it cannot disturb a keyboard movie. The setting is saved in the movie; changing it restarts the game on the next Rewind. Turning it off keeps any controller inputs in the movie (hidden, ignored)."},
     {L"RNG seed and RNG log",
      L"How the game's randomness works\r\n"
      L"The game uses one random number generator, seeded from the clock (Unix time in seconds) when it starts. Launch the same movie one second later and the random numbers differ, so drops and enemy behaviour can differ.\r\n\r\n"
@@ -1813,6 +1902,48 @@ std::wstring IniGet(const wchar_t* sec, const wchar_t* key) {
 }
 void IniSet(const wchar_t* sec, const wchar_t* key, const std::wstring& v) {
     WritePrivateProfileStringW(sec, key, v.c_str(), A.ini.c_str());
+}
+
+// ---- choosing the input columns (like TAStudio) ----------------------------------------------------------------------
+// Right-click the column headings (or View > Columns): a check list of every input column plus presets. Hiding a column
+// only hides it from the grid: its inputs stay in the movie and are still played.
+const int IDM_COL0 = 6000, IDM_COLS_ALL = 6100, IDM_COLS_KB = 6101, IDM_COLS_PAD = 6102, IDM_COLS_USED = 6103;
+
+void LoadHidden() { A.hidden = (KeyMask)wcstoull(IniGet(L"view", L"hidden").c_str(), nullptr, 16); }
+
+void SetHidden(KeyMask h) {
+    KeyMask avail = NumCols() == NUM_KEYS ? ~(KeyMask)0 : (KeyBit(NUM_KB_KEYS) - 1);
+    if ((h & avail) == avail) { SetMsg(L"At least one input column has to stay visible."); return; }
+    A.hidden = h;
+    wchar_t b[24];
+    swprintf(b, 24, L"%llx", (unsigned long long)h);
+    IniSet(L"view", L"hidden", b);
+    UpdateScroll();
+    InvalidateRect(A.grid, nullptr, TRUE);
+}
+
+void ColumnsMenu(HWND owner, POINT pt) {
+    KeyMask used = 0;
+    for (KeyMask k : A.movie.frames) used |= k;
+    HMENU pm = CreatePopupMenu();
+    AppendMenuW(pm, MF_STRING, IDM_COLS_ALL, L"Show all columns");
+    AppendMenuW(pm, MF_STRING, IDM_COLS_KB, L"Keyboard columns only");
+    if (A.movie.controller) AppendMenuW(pm, MF_STRING, IDM_COLS_PAD, L"Controller columns only");
+    AppendMenuW(pm, MF_STRING | (used ? 0 : MF_GRAYED), IDM_COLS_USED, L"Only the columns this movie uses");
+    AppendMenuW(pm, MF_SEPARATOR, 0, nullptr);
+    for (int k = 0; k < NumCols(); k++) {
+        std::wstring t = W(KEYS[k].label) + L"\t" + W(KEYS[k].name) + ((used >> k & 1) ? L"  (used)" : L"");
+        UINT fl = MF_STRING | ((A.hidden >> k & 1) ? MF_UNCHECKED : MF_CHECKED) | (k == NUM_KB_KEYS ? MF_MENUBARBREAK : 0);    // controller keys: a second column
+        AppendMenuW(pm, fl, IDM_COL0 + k, t.c_str());
+    }
+    int cmd = TrackPopupMenu(pm, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, owner, nullptr);
+    DestroyMenu(pm);
+    KeyMask kb = KeyBit(NUM_KB_KEYS) - 1;
+    if (cmd >= IDM_COL0 && cmd < IDM_COL0 + NUM_KEYS) SetHidden(A.hidden ^ KeyBit(cmd - IDM_COL0));
+    else if (cmd == IDM_COLS_ALL) SetHidden(0);
+    else if (cmd == IDM_COLS_KB) SetHidden(~kb);
+    else if (cmd == IDM_COLS_PAD) SetHidden(kb);
+    else if (cmd == IDM_COLS_USED) SetHidden(~used);
 }
 
 void ResolvePaths() {
@@ -2023,6 +2154,7 @@ bool FillParams(RunParams& p) {
     }
     p.seeded = A.movie.has_seed;
     p.seed = A.movie.seed;
+    p.controller = A.movie.controller;
     return true;
 }
 // realtime: ignore the fast-forward setting (watching a movie, not seeking).
@@ -2646,6 +2778,7 @@ void BuildMenu(HWND w) {
     add(r, IDM_STOP, L"&Stop\tF9");
     AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
     add(r, IDM_RNGSEED, L"RNG see&d...");
+    add(r, IDM_CONTROLLER, L"&Controller (virtual Xbox 360 pad)");
     add(r, IDM_VERIFY, L"&Verify fast-forward...");
     AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
     add(r, IDM_SAVESTATES, L"Use &savestates (applies at the next launch)");
@@ -2659,6 +2792,9 @@ void BuildMenu(HWND w) {
     AppendMenuW(r, MF_POPUP, (UINT_PTR)A.speedMenu, L"Fast-forward &speed (rewind / record from cursor)");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)f, L"&File");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)e, L"&Edit");
+    HMENU vw = CreatePopupMenu();
+    add(vw, IDM_COLUMNS, L"&Columns...\tor right-click the column headings");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)vw, L"&View");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)r, L"&Run");
     AppendMenuW(bar, MF_STRING, IDM_MEMORY, L"&Memory");
     AppendMenuW(bar, MF_STRING, IDM_RNGLOG, L"RNG &log");     // a plain menu-bar button: opens the window
@@ -2719,7 +2855,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             A.cbPre = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
                                       0, 0, 0, 0, w, (HMENU)IDC_PRE, nullptr, nullptr);
             for (HWND c : {A.lblBase, A.lblPre, A.cbBase, A.cbPre, A.status}) SendMessageW(c, WM_SETFONT, (WPARAM)A.font, TRUE);
-            A.grid = CreateWindowExW(WS_EX_CLIENTEDGE, L"TasGrid", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP,
+            A.grid = CreateWindowExW(WS_EX_CLIENTEDGE, L"TasGrid", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP,
                                      0, 0, 0, 0, w, nullptr, nullptr, nullptr);
             ResolvePaths();
             {
@@ -2727,6 +2863,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 A.speed = sp.empty() ? 3 : std::max(0, std::min(3, _wtoi(sp.c_str())));
                 CheckMenuRadioItem(A.speedMenu, IDM_SPEED0, IDM_SPEED3, IDM_SPEED0 + A.speed, MF_BYCOMMAND);
                 A.useStates = IniGet(L"last", L"savestates") != L"0";
+                LoadHidden();
                 std::wstring ev = IniGet(L"last", L"ssevery");
                 if (!ev.empty()) A.ssEvery = std::max(0, _wtoi(ev.c_str()));
             }
@@ -2748,6 +2885,8 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                            IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED, IDM_VERIFY, IDM_BM_EDIT, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_REPEAT, IDM_PATTERN, IDM_FIND, IDM_FINDNEXT, IDM_FINDPREV, IDM_NOTENEXT, IDM_NOTEPREV})
                 en(id, !A.busy);
             CheckMenuItem(m, IDM_SAVESTATES, MF_BYCOMMAND | (A.useStates ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(m, IDM_CONTROLLER, MF_BYCOMMAND | (A.movie.controller ? MF_CHECKED : MF_UNCHECKED));
+            en(IDM_CONTROLLER, !A.busy);
             en(IDM_SAVESTATES, !A.busy);
             en(IDM_SSINTERVAL, !A.busy);
             en(IDM_SAVESTATE_NOW, !A.busy && StatesOn());
@@ -2796,6 +2935,8 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_GOTO: GoToFrame(); break;
                 case IDM_JUMPCUR: JumpTo(A.cursor); break;
                 case IDM_RNGSEED: EditSeed(); break;
+                case IDM_CONTROLLER: ToggleController(); break;
+                case IDM_COLUMNS: { POINT pt; GetCursorPos(&pt); ColumnsMenu(A.wnd, pt); break; }
                 case IDM_VERIFY: VerifyFastForward(); break;
                 case IDM_MEMORY: ShowMemory(); break;
                 case IDM_HELP_GUIDE: case IDM_HELP_START: ShowHelp(0); break;

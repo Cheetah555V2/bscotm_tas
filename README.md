@@ -194,6 +194,24 @@ captured against a different start point.
   [offset]`, e.g. `Jmp 12 2` presses jump for 2 frames out of every 12, `R 1 1` holds right on
   every frame. The key is released on the other selected frames; `offset` frames are skipped first.
   Both are one undo step.
+- **Choosing the input columns.** Right-click the column headings (or *View > Columns...*) for a
+  check list of every input column, like TAStudio: untick the ones you do not need. Presets: all
+  columns, keyboard only, controller only, or only the columns this movie uses (each key the movie
+  presses is marked "used"). Hiding a column only hides it from the grid: its inputs stay in the
+  movie and are still played. The choice is saved in `bscotm_tas.ini`.
+- **Controller.** *Run > Controller (virtual Xbox 360 pad)* makes the game see one Xbox 360
+  controller, saved in the movie (`"controller":true`). The grid gets 24 more columns (blue
+  headings; scroll sideways): `pA pB pX pY`, `LB RB`, `Bk St` (Back, Start), `LS RS` (stick
+  clicks), `dU dR dD dL` (D-pad), `LsL LsR LsU LsD` / `RsL RsR RsU RsD` (left / right stick
+  past half way) and `LT RT`. The game's default Xbox mapping: move = D-pad or left stick,
+  jump = `pA`, attack = `pX`, sub-weapon = `pY`, switch character = `LB`/`RB`, pause = `St`,
+  confirm / cancel = `pA` / `pB`. Playing feeds the virtual pad from the movie, so a replay needs
+  no controller; recording reads your real controller (the first one Windows finds) and gives the
+  game exactly what it records (sticks and triggers as on / off, the way the game reads them), so a
+  replay matches the recording. Keyboard and controller keys can be mixed. With the controller
+  off the game sees no controller at all, even one that is plugged in, so it cannot disturb a
+  keyboard movie. Checked: test3 converted key for key to the pad replays identically to the
+  keyboard original over all 13,140 frames, and passes `tools\verify.ps1`.
 - **RNG seed.** *Run > RNG seed...* sets a number (0 - 4294967295) that is saved in the
   movie (`rng_seed`; empty = none). The game seeds its random generator from the Unix
   time in seconds at launch, which is why a replay could give different drops from run
@@ -270,7 +288,8 @@ restored.
 - Movies recorded with the 1/60 s clock grid (pull requests #21 and #22, Oct 9-10) ran the game's music clock at double
   speed per frame, so music-timed events (the stage-clear sequence) land later now and such movies may need
   re-syncing after those points. Older movies and real-time recordings match the new timing.
-- Keyboard only. No controller (DirectInput) support yet.
+- Controller: one pad, read as on / off (sticks and triggers past the game's own thresholds); recording
+  from a real pad uses the first one Windows finds and its buttons 0-9 (Xbox order on an Xbox pad).
 - The RNG seed fixes the random numbers at launch only; changed inputs can still change later random results (see "How the game's RNG works").
 
 ## History

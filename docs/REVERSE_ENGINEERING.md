@@ -836,3 +836,41 @@ frame 100 identical; then different inputs survive.
 Note for `sstest`: a state replayed across a stage load can report "differing frames" only while no player exists (the
 history sampler follows the pointer chain into memory the load has not initialised yet); every frame after the load matches.
 `sstest` now prints every differing stretch, so such a self-healing difference is easy to tell from a real divergence.
+
+## Controller (DirectInput)
+
+The game reads gamepads only through DirectInput 8 (ANSI interfaces); there is no XInput import. Everything below was
+read from the decrypted code (memory dump + `objdump`), nothing patched.
+
+- **Set-up** (`IceSDirectInput`, singleton at `*(exe+0x490948)`, created in `exe+0x2C34A0`): `DirectInput8Create`, then
+  `IDirectInput8A::EnumDevices(DI8DEVCLASS_GAMECTRL, callback exe+0x2C3620, this, DIEDFL_ATTACHEDONLY)`. The callback does
+  `CreateDevice`, `SetDataFormat(c_dfDIJoystick)` (the format at `exe+0x36B5FC`: 80-byte `DIJOYSTATE`), six
+  `SetProperty(DIPROP_RANGE, -127..127)` on X Y Z Rx Ry Rz by offset, `Acquire`, and registers the device with the input
+  manager (`exe+0x2A5500`) as id `0x10 + n` under its product name (`DIDEVICEINSTANCEA.tszProductName`, offset 0x12C).
+- **Per frame**: the input update `exe+0x2A5870` first polls the 81 keyboard keys through `GetAsyncKeyState` (the first poll is
+  the tool's frame marker), then calls `exe+0x2C3840` (at `exe+0x2A5982`), which for each pad does `Poll` (vtable slot 25) and
+  `GetDeviceState(80, &state)` (slot 9; on failure `Acquire` and retry, then a cleared state). The state becomes 48 on/off
+  "pad keys" (current at +0x84, previous at +0x04 of the pad's record): buttons 0-31 (`rgbButtons[i] >> 7`), then lX < -64,
+  lX > 64, lY < -64, lY > 64, lZ >= 120, lZ <= -120, lRx < -64, lRx > 64, lRy < -64, lRy > 64, lRz == -127, lRz == 127, and the
+  hat: up = 0 / 4500 / 31500, right = 4500 / 9000 / 13500, down = 13500 / 18000 / 22500, left = 22500 / 27000 / 31500. It also
+  stores lX, lY, lRx, lRy as floats (/127) at +0x184.. .
+- **Mapping**: `exe+0x269FE0` compares the device name with `"XBOX 360 For Windows (Controller)"`; on a match it loads the
+  default Xbox mapping, a table of 18 entries `[name pointer][4 pad-key indices]` at `exe+0x37AF00`: Left = hat left / X-,
+  Right = hat right / X+, Up = hat up / Y-, Down = hat down / Y+, Jump = button 0 (A), MAtk = 2 (X), SAtk = 3 (Y), Action = 1 (B),
+  Start = 7, Select = 6, Decide = 0, Cancel = 1, L = 4 (LB), R = 5 (RB), Debug0/1 = 14/15, L2 = Z+ (LT), R2 = Z- (RT).
+  Other names get a generic table (`exe+0x37AF94`).
+
+### The virtual pad
+
+With a movie's controller on (`Shm::pad_mode = 2`) the hook patches `DirectInput8Create` in the exe's imports and, in
+dinput8.dll's `IDirectInput8A` vtable, `EnumDevices` (slot 4) and `CreateDevice` (slot 3). A request for game controllers gets
+exactly one device: a hook-owned `IDirectInputDevice8A` named "XBOX 360 For Windows (Controller)" (so the game uses its Xbox
+mapping). Its `GetDeviceState` builds a `DIJOYSTATE` from the frame's 24 `PAD_*` bits (buttons 0-9, the hat, both sticks and Z
+at full deflection): from the movie when playing; when recording or playing live, from the first real pad (opened with the
+game's own DirectInput object; set-up calls are passed on to it), made on/off with the game's own thresholds, so the game gets
+exactly what is recorded. With the controller off (`pad_mode = 1`) a request for game controllers finds none.
+
+Checked on test3.bscotm: the movie with its movement keys moved to the D-pad, and the movie with every key moved to the pad
+(Space -> A, mouse -> X / Y, Q / E -> LB / RB, P -> Start, Enter -> A, Esc -> B), each replays identically to the keyboard
+original over all 13,140 frames, and the pad version passes `tools\verify.ps1` (5/5). Recording from a real pad was not
+tested (no pad on the dev machine).
