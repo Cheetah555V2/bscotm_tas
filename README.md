@@ -207,7 +207,8 @@ captured against a different start point.
   - **Instant loading.** A branch saved while the game is frozen at its frame (savestates on) also
     keeps a savestate of that moment, for as long as that game runs: loading it puts the game back
     at once (the *Load* column says "instant"). Up to 4 branches hold one at a time; saving a fifth
-    gives the oldest one's slot back to the automatic states. Savestates do not survive closing the
+    gives the oldest one's slot back to the automatic states. Editing the movie does not cost a
+    branch its savestate: the branch has its own inputs. Savestates do not survive closing the
     game, so after a relaunch a branch loads by replaying from the nearest valid state.
   - **Picture.** Saving a branch while the game is frozen also keeps a small picture of the game
     (saved in the file); the pane right of the list shows the selected branch's picture.

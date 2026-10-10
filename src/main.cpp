@@ -1246,6 +1246,13 @@ static bool BranchStateLive(const Branch& b) {
     return b.slot >= 0 && b.slot < 8 && b.slotGen && A.ssGen[b.slot] == b.slotGen && StatesOn() && A.sess.StateRow(b.slot) == (int)b.frame;
 }
 
+// A branch keeps its savestate in this slot. Such a slot is never reused for another state, even when an edit makes it
+// stale for the current movie: the branch has its own inputs, and loading the branch makes the state right again.
+static bool BranchHolds(int slot) {
+    for (const Branch& b : A.movie.branches) if (b.slot == slot && BranchStateLive(b)) return true;
+    return false;
+}
+
 static std::string NowText() {
     SYSTEMTIME t;
     GetLocalTime(&t);
@@ -2916,10 +2923,11 @@ int BestState(int next) {
 }
 
 // The slot to save row `row` in: the same row, an empty or stale slot, or else the automatic state whose
-// neighbours are closest together (so the saved rows stay spread out).
+// neighbours are closest together (so the saved rows stay spread out). Slots that branches hold are left alone.
 int PickSlot(int row) {
     int empty = -1, stale = -1;
     for (int i = 0; i < 8; i++) {
+        if (BranchHolds(i)) continue;
         int r = A.sess.StateRow(i);
         if (r == row) return i;
         if (r < 0) { if (empty < 0) empty = i; }
