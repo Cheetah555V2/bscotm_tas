@@ -256,11 +256,13 @@ int wmain(int argc, wchar_t** argv) {
 
     if (cmpupto) {      // determinism of the editor's way of running: continuous vs in chunks with states vs with a load in the middle
         struct Run { std::vector<HistEntry> h; bool ok = false; std::vector<uint16_t> t[4]; };
-        auto once = [&](const char* name, uint32_t chunk, uint32_t loadAt, uint32_t spd = 0, bool nosave = false) {
+        auto once = [&](const char* name, uint32_t chunk, uint32_t loadAt, uint32_t spd = 0, bool nosave = false, uint32_t launchTo = 0) {
             Run r;
             Session s2;
             RunCallbacks cb2;
             RunParams q = p;
+            if (launchTo) q.target = launchTo;      // the editor's Rewind to cursor: the whole schedule is armed at launch
+            if (spd) q.speed_milli = spd;
             RunResult rr2 = RunJob(q, cb2, &s2);
             if (!rr2.ok || !s2.Active()) { printf("%s: launch failed: %s\n", name, rr2.error.c_str()); return r; }
             uint32_t from = 0;
@@ -287,6 +289,7 @@ int wmain(int argc, wchar_t** argv) {
                     }
                 }
             }
+            grab();
             for (int k = 0; k < 4; k++) r.t[k].assign((const uint16_t*)s2.s->thr_log[k], (const uint16_t*)s2.s->thr_log[k] + 12288);
             printf("%s: markers by grid steps since the previous (0,1,2,3,4+): %u %u %u %u %u; irregular after 3000:", name, s2.s->gap_hist[0], s2.s->gap_hist[1], s2.s->gap_hist[2], s2.s->gap_hist[3], s2.s->gap_hist[4]);
             for (uint32_t i = 0; i < s2.s->gap_n && i < 64; i++) printf(" %u:%u", s2.s->gap_log[i] >> 4, s2.s->gap_log[i] & 15);
@@ -303,7 +306,7 @@ int wmain(int argc, wchar_t** argv) {
             return r;
         };
         Run a = once("continuous", 0, 0);
-        Run b = a.ok ? (cmpvariant == 1 ? once("chunked, NO saves", cmpchunk, 0, 0, true) : cmpvariant == 3 ? once("continuous fast, second run", 0, 0) : cmpvariant == 2 ? once("continuous REAL TIME 1x", 0, 0, 1000) : once("chunked+saves", cmpchunk, 0)) : Run();
+        Run b = a.ok ? (cmpvariant == 1 ? once("chunked, NO saves", cmpchunk, 0, 0, true) : cmpvariant == 3 ? once("continuous fast, second run", 0, 0) : cmpvariant == 2 ? once("continuous REAL TIME 1x", 0, 0, 1000) : cmpvariant == 4 ? once("editor rewind (armed at launch)", 0, 0, 0, false, cmpupto) : once("chunked+saves", cmpchunk, 0)) : Run();
         Run c = (b.ok && cmpvariant == 0) ? once("chunked+load", cmpchunk, loadatarg ? loadatarg : cmpupto / 2) : Run();
         auto diff = [&](const char* what, const Run& x, const Run& y) {
             bool same;

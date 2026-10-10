@@ -84,6 +84,7 @@ struct App {
     bool useStates = true;        // Run > Use savestates (on by default): launch the game with the private heap so states can be saved
     int  ssEvery = 2000;          // automatic state every this many frames while the game is advanced (0 = never)
     bool ssManual[8] = {};        // slots saved by hand (never evicted automatically)
+    bool ssStale[8] = {};         // slots saved before an edit to an earlier row: never loaded again, only overwritten
     int  chunkFrom = 0;           // first row of the batch being run (Run to cursor runs in pieces so states can be saved between them)
     bool stepping = false;        // a batch of frames is running (busy is set too)
     int runFrom = 0, runTarget = 0;   // rows the batch started at / will stop before
@@ -163,10 +164,18 @@ void SetCursorRow(int row, bool extend) {
     UpdateStatus();
 }
 
+// A state restores the game frozen before its row, so it depends on every row before that one. An edit at
+// `pos` (-1: the seed, prelude, baseline or movie changed) makes the states after it stale for good: the
+// greenzone grows back past them as the game runs on, so "row <= reached" alone would let them be loaded.
+void StaleStatesAfter(int pos) {
+    for (int i = 0; i < 8; i++) if (A.sess.StateRow(i) > pos) A.ssStale[i] = true;
+}
+
 // ---- editing (every change goes through DoSplice so it is undoable) -------
 void Touch(size_t pos) {
     A.dirty = true;
     if ((int)pos < A.reached) A.reached = (int)pos;
+    StaleStatesAfter((int)pos);
 }
 
 void RefreshNotesList();
@@ -634,7 +643,7 @@ void EditSeed() {
     A.movie.has_seed = has;
     A.movie.seed = (uint32_t)v;
     A.dirty = true;
-    A.reached = 0;
+    A.reached = 0; StaleStatesAfter(-1);
     InvalidateRect(A.grid, nullptr, FALSE);
     UpdateTitle(); UpdateStatus();
     SetMsg(has ? L"RNG seed " + std::to_wstring(A.movie.seed) + L". Rewind (F6) to restart the game with it."
@@ -1851,7 +1860,7 @@ void LoadPath(const std::wstring& p) {
     A.path = p;
     A.dirty = false;
     A.undo.clear(); A.redo.clear();
-    A.cursor = A.anchor = A.top = A.reached = 0;
+    A.cursor = A.anchor = A.top = A.reached = 0; StaleStatesAfter(-1);
     if (!A.movie.prelude_id.empty()) {
         int i = (int)SendMessageW(A.cbPre, CB_FINDSTRINGEXACT, 0, (LPARAM)W(A.movie.prelude_id).c_str());
         if (i >= 0) SendMessageW(A.cbPre, CB_SETCURSEL, i, 0);
@@ -1908,7 +1917,7 @@ void FileNew() {
     A.movie = Movie();
     A.path.clear(); A.dirty = false;
     A.undo.clear(); A.redo.clear();
-    A.cursor = A.anchor = A.top = A.reached = 0;
+    A.cursor = A.anchor = A.top = A.reached = 0; StaleStatesAfter(-1);
     UpdateTitle(); UpdateScroll(); UpdateStatus(); RefreshNotesList();
 }
 
@@ -2162,7 +2171,7 @@ void VerifyFastForward() {
     va->p.movie = A.movie.frames;
     for (int c = gap; c < n; c += gap) va->cps.push_back(c);
     va->cps.push_back(n);
-    A.reached = 0;
+    A.reached = 0; StaleStatesAfter(-1);
     A.busy = true;
     A.stop = 0;
     EnableUi();
@@ -2208,9 +2217,14 @@ bool StatesOn() {
     return A.useStates && A.sess.Active() && A.sess.Alive() && A.sess.s && (A.sess.s->features & FEAT_ARENA_OK);
 }
 
+bool StateValid(int slot) {
+    int r = A.sess.StateRow(slot);
+    return r >= 0 && r <= A.reached && !A.ssStale[slot];
+}
+
 int NumStates() {
     int n = 0;
-    if (A.sess.Active() && A.sess.s) for (int i = 0; i < 8; i++) { int r = A.sess.StateRow(i); if (r >= 0 && r <= A.reached) n++; }
+    if (A.sess.Active() && A.sess.s) for (int i = 0; i < 8; i++) if (StateValid(i)) n++;
     return n;
 }
 
@@ -2219,7 +2233,7 @@ int BestState(int next) {
     int best = -1, bestRow = -1;
     for (int i = 0; i < 8; i++) {
         int r = A.sess.StateRow(i);
-        if (r >= 0 && r <= A.reached && r <= next && r > bestRow) { best = i; bestRow = r; }
+        if (StateValid(i) && r <= next && r > bestRow) { best = i; bestRow = r; }
     }
     return best;
 }
@@ -2232,7 +2246,7 @@ int PickSlot(int row) {
         int r = A.sess.StateRow(i);
         if (r == row) return i;
         if (r < 0) { if (empty < 0) empty = i; }
-        else if (r > A.reached) { if (stale < 0) stale = i; }
+        else if (!StateValid(i)) { if (stale < 0) stale = i; }
     }
     if (empty >= 0) return empty;
     if (stale >= 0) return stale;
@@ -2257,9 +2271,10 @@ bool SaveStateAt(bool manual) {
     int row = (int)A.sess.Row();
     if (row < 0 || row > A.reached) return false;
     int slot = PickSlot(row);
-    bool keep = A.sess.StateRow(slot) == row && A.ssManual[slot];      // saving over the same row keeps a manual state manual
+    bool keep = A.sess.StateRow(slot) == row && A.ssManual[slot] && !A.ssStale[slot];      // saving over the same row keeps a manual state manual
     if (slot < 0 || !A.sess.SaveState(slot)) return false;
     A.ssManual[slot] = manual || keep;
+    A.ssStale[slot] = false;
     return true;
 }
 
@@ -2317,6 +2332,7 @@ void OnJobDone(RunResult* r) {
             SetMsg(L"Game frozen after frame " + std::to_wstring(r->played) + L". Press . to advance a frame, F11 to resume live.");
             if (A.useStates) {
                 for (bool& m : A.ssManual) m = false;       // a new game has no states yet
+                for (bool& m : A.ssStale) m = false;
                 if (SaveStateAt(false)) SetMsg(L"Game frozen after frame " + std::to_wstring(r->played) + L"; state saved. Press . to advance a frame, F11 to resume live.");
             }
         } else {
@@ -2814,7 +2830,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     if (HIWORD(wp) == CBN_SELCHANGE) {
                         IniSet(L"last", L"baseline", ComboSel(A.cbBase));
                         IniSet(L"last", L"prelude", ComboSel(A.cbPre));
-                        A.reached = 0;
+                        A.reached = 0; StaleStatesAfter(-1);
                         InvalidateRect(A.grid, nullptr, FALSE);
                     }
                     break;
