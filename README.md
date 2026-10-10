@@ -22,17 +22,23 @@ back. The whole tool is two small native files (no Python, no Frida):
 - **Frame 1 is the game's own first frame marker.** Playback and recording both
   start there, never after a wall-clock "boot finished" wait, so a slow (cold)
   first launch cannot shift the inputs.
-- **Fast-forward.** While replaying to the cursor the hook scales the game's clocks
-  (`QueryPerformanceCounter`, `timeGetTime`, `GetSystemTimeAsFileTime`, `Sleep`,
-  `WaitForSingleObject`, again through the game's own import slots) and drops
-  vsync when the D3D9 device is created. Both are needed: the game paces itself on
-  QPC *and* vsync. Frames stay deterministic (same end state at 1x and 50x), and
-  the hook returns to real time exactly on the frame the replay ends. While
-  fast-forwarding it also skips drawing (D3D `Present`/`Clear`/`Draw*` return at once,
-  except for the last 2 frames so the frozen picture is real) and answers the game's
-  key polls without asking Windows: about 1000 frames per second instead of 340. It also
-  stops the game's own render-command queue from running the drawing commands that are
-  safe to skip (about 1.3x faster again; see the docs).
+- **Frame clock.** Every clock the game reads (`QueryPerformanceCounter`, `timeGetTime`,
+  `GetSystemTimeAsFileTime`, through the game's own import slots) is a function of the
+  frame number: time advances only at a frame marker, by exactly one 1/60 s frame. The
+  game's frame limiter then starts each frame at once, and nothing the game measures
+  depends on how fast the PC is or how Windows schedules its threads. The game's music
+  sequencer runs on its own thread and advances the song by the time it measures; the hook
+  wakes that thread twice per frame from the frame marker, each wake at a fixed time inside
+  the frame, so music-timed events (such as the stage-clear sequence) land on the same frame
+  every time. Speed is set by waiting at the frame marker: 1x waits for real time, Max does
+  not wait at all. The same movie gives the same result frame by frame at 1x, at Max, run
+  in chunks, stepped, or after a savestate load (see the docs).
+- **Fast-forward.** The hook drops vsync when the D3D9 device is created and, while
+  fast-forwarding, skips drawing (D3D `Present`/`Clear`/`Draw*` return at once, except for
+  the last 2 frames so the frozen picture is real), answers the game's key polls without
+  asking Windows, and stops the game's own render-command queue from running the drawing
+  commands that are safe to skip. At Max the game then runs as fast as it can compute its
+  frames: about 1700-2000 frames per second (28-34x real time) on the dev machine.
 - **Frame advance.** The hook blocks the game thread inside the input poll at a
   frame marker (before the frame's input is read) and releases it one frame per step.
   The virtual clock is frozen during the hold so the limiter does not see the pause
@@ -103,6 +109,22 @@ build.bat
 elsewhere, `set MINGW32=<path>\mingw32\bin` first. From an MSYS2 MINGW32 shell,
 plain `make` works too. Output goes to `build\`.
 
+### Checking replays before a release (maintainers)
+
+`tools\verify.ps1` builds everything (`build.bat all tools`) and replays a movie with the real game in several ways:
+twice at full speed, with savestates saved and loaded, the editor's Rewind, a savestate on the title screen, and a
+late savestate followed by different inputs (`-Full` adds a real-time run). Each check passes only if every frame's
+values are identical. It needs the game on this PC and takes about a minute and a half for a 13,000-frame movie; do
+not play while it runs. Exit code 0 means everything passed; logs are in `build\verify\`.
+
+```bat
+powershell -ExecutionPolicy Bypass -File tools\verify.ps1 -Movie ..\test3.bscotm
+```
+
+The game path and baseline come from the editor's settings (`build\bscotm_tas.ini`) unless given with `-Game` and
+`-Baseline`. The same check can run on every pull request through `.github/workflows/replay-check.yml` on a
+self-hosted runner (the PC with the game); the file says how to set it up. It is off until you do.
+
 ### Publishing a release (maintainers)
 
 Pushing a tag builds on GitHub Actions and attaches the zip to a new release:
@@ -122,7 +144,8 @@ otherwise use **File > Set game path**.
 |---|---|
 | **Record new** (F8) | Relaunch the game and record from its first frame |
 | **Play** (F5) | Relaunch the game and play the whole movie in real time |
-| **Rewind to cursor** (F6, or double-click a frame number) | Relaunch, fast-forward to the cursor row, then **freeze** the game there |
+| **Rewind to cursor** (F6) | Relaunch, fast-forward to the cursor row, then **freeze** the game there |
+| **Double-click a frame number** | Go to that frame: if the frozen game has not reached it yet, run forward from where it is (no restart); if it is past it, or a frame before the game's position was edited, rewind (from the nearest valid savestate, else from frame 1) |
 | **Frame advance** (`.`) | Run exactly one frame of the frozen game using the next grid row's inputs (hold `.` to auto-repeat) |
 | **Run to cursor** (F4, or right-click a row > *Run game to frame N*) | Advance the frozen game through many frames at once, up to the cursor row, using the grid's inputs (past the end of the movie it appends blank frames). Runs at the fast-forward speed and gives the same result as stepping one by one (500 frames in about 1 s instead of 15 s). **Stop** (F9) cancels and freezes at the next frame. If the game is already at or past the cursor, use Rewind |
 | **Record here** (F12) | Unfreeze the game and record your live keyboard from the frozen frame (click the game window and play). **Stop** (F9) freezes the game again right after the last recorded frame, so you can keep stepping or record again |
@@ -137,8 +160,9 @@ next advance first replays to the greenzone edge, then steps. Stepping forward o
 to go back, move the cursor and Rewind (it replays from frame 1 at speed).
 
 Rewind and Record from cursor fast-forward at the speed chosen in
-**Run > Fast-forward speed** (default Max, 50x: a 1461-frame prelude takes about
-5 s instead of 26 s). Audio is garbled while fast-forwarding.
+**Run > Fast-forward speed** (default Max: as fast as the game can run, about 30x; a
+1461-frame prelude takes under a second instead of 24 s). Every speed gives exactly the
+same result. Audio is garbled while fast-forwarding.
 
 **Baseline** is a snapshot of the game's save files restored before every
 launch (so runs start from the same state). Create one with
@@ -164,12 +188,61 @@ captured against a different start point.
   undo/redo, and are saved in the `.bscotm` file (an optional `notes` field, so older
   files still load). Painting or clearing inputs leaves notes alone; **Record new**
   starts a movie without notes.
+- **Input patterns.** `Ctrl+R` (*Edit > Repeat selection*) copies the selected frames N more
+  times right after the selection, as inserted frames. `Ctrl+Shift+R` (*Edit > Fill selection with
+  a pattern*) fills the selected frames with a repeating press of one key: type `KEY period on
+  [offset]`, e.g. `Jmp 12 2` presses jump for 2 frames out of every 12, `R 1 1` holds right on
+  every frame. The key is released on the other selected frames; `offset` frames are skipped first.
+  Both are one undo step.
+- **Branches.** The **Branches** button in the menu bar opens a list of saved versions of the
+  movie, like TAStudio's branches, for trying ideas side by side. *Save new branch* keeps the
+  current inputs, notes, RNG seed and controller setting, plus the frame the game is at (or the
+  cursor). *Load selected* (or double-click) puts that version back as one undo step and takes the
+  frozen game to its frame: the inputs are rewritten only from the first frame where they differ,
+  so savestates before it stay valid and the jump is quick. *Update selected* overwrites a branch
+  with the current movie; *Rename...* (F2) and *Delete* manage the list. Each row shows the frame
+  where the branch first differs from the current movie. Branches are saved in the `.bscotm` file
+  (an optional `branches` list), so they survive closing the editor. Each branch is a full copy of
+  the inputs (about 40 KB for a 13,000-frame movie).
+  - **Instant loading.** A branch saved while the game is frozen at its frame (savestates on) also
+    keeps a savestate of that moment, for as long as that game runs: loading it puts the game back
+    at once (the *Load* column says "instant"). Up to 4 branches hold one at a time; saving a fifth
+    gives the oldest one's slot back to the automatic states. Editing the movie does not cost a
+    branch its savestate: the branch has its own inputs. Savestates do not survive closing the
+    game, so after a relaunch a branch loads by replaying from the nearest valid state.
+  - **Picture.** Saving a branch while the game is frozen also keeps a small picture of the game
+    (saved in the file); the pane right of the list shows the selected branch's picture.
+  - **Compare.** Tick *Show differences in the grid*: rows whose inputs differ from the selected
+    branch get an orange mark beside the frame number, and keys the branch presses that the movie
+    does not are outlined in orange.
+- **Choosing the input columns.** Right-click the column headings (or *View > Columns...*) for a
+  check list of every input column, like TAStudio: untick the ones you do not need. Presets: all
+  columns, keyboard only, controller only, or only the columns this movie uses (each key the movie
+  presses is marked "used"). Hiding a column only hides it from the grid: its inputs stay in the
+  movie and are still played. The choice is saved in `bscotm_tas.ini`.
+- **Controller.** *Run > Controller (virtual Xbox 360 pad)* makes the game see one Xbox 360
+  controller, saved in the movie (`"controller":true`). The grid gets 24 more columns (blue
+  headings; scroll sideways): `pA pB pX pY`, `LB RB`, `Bk St` (Back, Start), `LS RS` (stick
+  clicks), `dU dR dD dL` (D-pad), `LsL LsR LsU LsD` / `RsL RsR RsU RsD` (left / right stick
+  past half way) and `LT RT`. The game's default Xbox mapping: move = D-pad or left stick,
+  jump = `pA`, attack = `pX`, sub-weapon = `pY`, switch character = `LB`/`RB`, pause = `St`,
+  confirm / cancel = `pA` / `pB`. Playing feeds the virtual pad from the movie, so a replay needs
+  no controller; recording reads your real controller (the first one Windows finds) and gives the
+  game exactly what it records (sticks and triggers as on / off, the way the game reads them), so a
+  replay matches the recording. Keyboard and controller keys can be mixed. With the controller
+  off the game sees no controller at all, even one that is plugged in, so it cannot disturb a
+  keyboard movie. Checked: test3 converted key for key to the pad replays identically to the
+  keyboard original over all 13,140 frames, and passes `tools\verify.ps1`.
 - **RNG seed.** *Run > RNG seed...* sets a number (0 - 4294967295) that is saved in the
   movie (`rng_seed`; empty = none). The game seeds its random generator from the Unix
   time in seconds at launch, which is why a replay could give different drops from run
   to run. With a seed set, the game sees a frozen clock at that time, so every launch
   gets the same random numbers. The status bar shows the seed. Changing it restarts the
   game on the next Rewind / frame advance. Details: `docs/REVERSE_ENGINEERING.md`.
+- **Find.** `Ctrl+F` (*Edit > Find*) moves the cursor to the next frame where a key is pressed:
+  type the key (`Jmp`), add `released` for the next release (`Atk released`), or `*` for any change
+  in any key. `F3` / `Shift+F3` find the next / previous match. `Alt+Down` / `Alt+Up` jump to the
+  next / previous frame that has a note or bookmark.
 - **Bookmarks and jumping.** `Ctrl+B` (or right-click a row > *Add bookmark here...*) names the
   cursor frame as a bookmark (shown with a purple flag and a star). `F2` / `Shift+F2` jump to the
   next / previous bookmark, `Ctrl+G` jumps to any frame number, and *Edit > Bookmarks list...*
@@ -195,6 +268,20 @@ captured against a different start point.
   it. A frame with no rows made no draws. Use it to see which frame decides a drop and which input
   change would move it; *Save CSV...* exports the list. It uses a hardware write breakpoint on the
   RNG state (no game code is changed), so logging slows the frames it covers a little.
+- **Value history.** In the Memory window, tick **Record history**, then step, run or jump as
+  usual: the hook samples health, weapon points, score, X/Y speed, X/Y position and invisibility
+  at every frame (also during fast-forward). **Graph...** draws the selected values over the
+  frames, each scaled to the full height (the legend shows its range; hover to read one frame);
+  **Save CSV...** writes every recorded frame. A new game launch starts a new history.
+- **Boss HP.** While the stage 1 boss exists, the Memory window also shows **Boss HP** and
+  **Boss max HP** (120 for that boss; the TAS in `test3.bscotm` takes 7 per sub-weapon hit). The boss
+  is found by a background search of the game's memory (about a second after it spawns), because it has no
+  fixed pointer. Other bosses are not known yet; how it was found and how to add another is in
+  `docs/REVERSE_ENGINEERING.md`.
+- **Help.** The **Help** menu (or `F1`) opens an in-app guide: getting started, recording and
+  playing, frame advance, editing, bookmarks and jumping, the RNG seed and log, the Memory
+  window, Verify fast-forward, keyboard shortcuts and troubleshooting. It is part of the program,
+  so it always matches the version you run.
 - **Game memory window.** The **Memory** button in the menu bar opens a window that shows
   the running game's health, weapon points (and max), score, X/Y speed, X/Y position
   (physics and render copies), invisibility, difficulty, style, the four characters and
@@ -204,6 +291,10 @@ captured against a different start point.
 - Green frame numbers are the "greenzone": frames the live game has been advanced
   through. Editing a frame invalidates the greenzone after it.
 
+Set the environment variable `BSCOTM_DEBUG` to make the hook also write diagnostic files to `%TEMP%`
+(`bscotm_probe.txt`, `bscotm_threads.txt`, `bscotm_exit.txt`); the crash log `bscotm_crash.txt` is always
+written when the game crashes.
+
 Settings are stored in `bscotm_tas.ini` next to the exe. Save backups, baselines
 and preludes live in `save_backups\` and `preludes\` next to the game folder.
 Your saves are copied to `save_backups\last_user_state` before a baseline is
@@ -211,9 +302,15 @@ restored.
 
 ## Known limitations
 
-- Rewind = restart the game and fast-forward (still replays from frame 1). No true
-  savestates: the game's anti-tamper makes snapshot/restore unreliable.
-- Keyboard only. No controller (DirectInput) support yet.
+- Savestates are experimental (*Run > Use savestates*, on by default). Rewind and Jump load the nearest
+  state and fast-forward from there; with savestates off, or when none is usable, they restart the game and
+  replay from frame 1. Known gaps: sound and picture are not restored, D3D9 video memory is not given back while states exist, and nothing
+  survives closing the game. Details: `docs/REVERSE_ENGINEERING.md`.
+- Movies recorded with the 1/60 s clock grid (pull requests #21 and #22, Oct 9-10) ran the game's music clock at double
+  speed per frame, so music-timed events (the stage-clear sequence) land later now and such movies may need
+  re-syncing after those points. Older movies and real-time recordings match the new timing.
+- Controller: one pad, read as on / off (sticks and triggers past the game's own thresholds); recording
+  from a real pad uses the first one Windows finds and its buttons 0-9 (Xbox order on an Xbox pad).
 - The RNG seed fixes the random numbers at launch only; changed inputs can still change later random results (see "How the game's RNG works").
 
 ## History

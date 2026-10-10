@@ -620,3 +620,254 @@ and *Verify fast-forward* still matches at all 20 checkpoints.
 Note: with the old join, in a later session the same harness (baseline restored, the 40-frame stepping of
 `comp`, or a direct `RunJob` to frame N) often never got out of the menus (health 0 at frame 3000) while the
 new code reached the same states as before every time; the reason for the old flakiness was not found.
+
+---
+
+## Update: savestates that work (branch `savestates`)
+
+The prototype's "running on after a load is unreliable" had a handful of concrete causes, each found with
+`tools/sstest.cpp` (save at frame N, run, load, run the same frames again, compare the per-frame values) and
+the hook's crash log (`%TEMP%\bscotm_crash.txt`: registers, stack with module names, code bytes at the fault).
+
+1. **The XAudio2 voice table overflowed.** The hook tracks every source voice so a restore can bring back the
+   ones the game destroyed after the save. It kept *every* destroyed voice until the next save; a few hundred
+   frames of sound effects filled the 1024 entries, and from then on voices were handed out untracked, with the
+   game's own callback pointer. After a restore the audio thread called those callbacks into rolled-back memory
+   (`XAudio2_7+2CC06`, `OnVoiceProcessingPassStart`). Now only voices that existed at a save are kept.
+2. **XAudio2 calls the game's callbacks on its own thread, at any time.** Each voice is given a hook-owned shim
+   callback object instead (it forwards while the voice is alive and no restore is under way; `DestroyVoice`
+   waits for calls in flight). The restore closes a gate, drains, and only then touches voices.
+3. **The game's worker threads were still running when voices were destroyed** for the restore (a stand-in
+   `Stop` on a dead voice). They are now parked first.
+4. **D3D9 resources were released twice.** The game releases textures/buffers after the save point; the restored
+   memory still points at them, and the game releases them again (the crashing code is a destructor calling
+   `[obj->vtable+8]`). With savestates on, `Release` of every D3D9 class the game creates is patched: the last
+   reference is kept and the game is told the object is gone. The cost is video memory that is not given back.
+5. **The game's long-lived thread** (`COTM.exe+31CC6E`) has its registers and stack recorded at a save and put back
+   at a load, but only if it is stopped at the same eip/esp (otherwise it is counted, not touched).
+   The other threads in the process (Windows thread pool, COM, the AMD driver, `inputhost`) are not game state.
+
+Result on the stage 1 test movie: a save takes about 90 ms, a load 60-80 ms; saves anywhere in the movie
+(frames 100 to 11000), gaps of up to 6000 frames, 15 loads in a row from one session: all identical to the
+reference run frame by frame. Loading and then playing different inputs survives too (8/8, 1500 frames each).
+
+Memory: a state is a table of 4 KB page indices; pages unchanged since the previous state are shared (the first state is
+~81 MB, later ones copy 0.25-7 MB). Over a 74,000-frame movie (the test movie repeated 6 times) with a state every
+2000 frames in 8 rotating slots the game stays at about 350 MB and the pool at under 100 MB; before sharing, the 9th
+state failed (32-bit address space). GPU dedicated memory stayed at 48 MB on that run.
+
+Limits: the packed `COTM.exe` cannot be disassembled from disk (read the code bytes the crash log dumps); XAudio2
+voices' play position and queued buffers are not restored (sound only); D3D memory contents are not restored
+(picture only); nothing survives closing the game.
+
+## The stage 1 boss (Memory window: Boss HP)
+
+Goal: show the boss's health. The player values come from fixed pointer chains; the boss does not have one,
+so it was found by searching the game's memory during the boss fight of `test3.bscotm` (boss stage from
+frame 7601, the TAS drains the weapon points with six sub-weapon casts from frame 8556).
+
+Method (all with `ReadProcessMemory` and one hardware write breakpoint, no game code touched):
+1. *Decreasing-value scan.* Sample every aligned dword of the game's private read/write memory (about 150 MB)
+   every 5-15 frames from 8545 to 8780 and keep the ones that never increase. One candidate series went
+   `120 113 106 99 92 85 78`: six drops of 7 at the six casts; another, `19 16 13 10 7 4 1`, was the weapon
+   points. So the boss has 120 HP and a sub-weapon hit costs it 7.
+2. *Who writes it.* A write breakpoint on that address (the hook's debug-register code with four slots) fired
+   at `exe+0x7D7A9` with `ecx` = the boss object: a setter that stores the new HP. The field is at **+0x3DC of
+   the object, max HP at +0x3E0** (120), the same layout as the player (HP at +0x3DC of the player struct).
+   The boss object's vtable is `exe+0x39B99C`.
+3. The boss's position is not at +0x1AC/+0x1B0 (those floats are 0): the boss is made of several objects
+   and its position lives elsewhere. A static pointer chain was not found: the object is referenced from about
+   25 places in the heap (list/map nodes), none from the exe's data.
+
+So the editor finds it by search: a background thread scans the heap for a dword equal to a known boss vtable
+(`BOSS_VTABLES` in `main.cpp`) whose HP / max HP fields are sane, keeps the address while the object is valid
+and scans again when it is gone. A scan takes about 0.2 s. Other bosses have other vtables; to add one, run the
+same procedure (step 1 to find the HP series, step 2 to get the object and its vtable) and add the RVA.
+
+Not everything with HP at +0x3DC is an enemy: a generic scan for "vtable object with HP <= max HP at
++0x3DC/+0x3E0" finds hundreds of unrelated objects (UI and effect classes), so a known vtable is required.
+
+### Saving while the game is loading (found after v0.9.0)
+
+A save made while the game is busy (stage assets loading) was restored wrongly in about one run in three at frame 100.
+Every failing run had a long "park the game's threads" phase (140-310 ms); every passing run had 0. The hook now
+refuses such a save (stopping the threads took more than ~20 ms), the host retries a few times 250 ms apart, and a
+thread only counts as stopped when it is in its idle `Sleep(8)` loop (`exe+2BDDAC`), not in an arbitrary wait.
+Remaining: about 1 in 24 early-frame (100) saves still restored badly; saves at frames 400 to 11000 passed in all runs
+made after the change. Per-phase timings of the last save are in `Shm::snap_time` (shown by `tools/sstest`).
+
+### Replays that drift after the stage 1 boss dies (test3.bscotm, around frame 10350-10600)
+
+After the boss kill the player stands still while the game plays its stage-clear sequence, and the health refill (9 to 12)
+is the first visible step. In v0.9.1 it landed on a different frame depending on how the movie was replayed: about 10350 at
+50x with drawing on, 10560-10600 at 50x with all speed-ups (and a few frames of run-to-run jitter), 10673 at 4x, and a
+real-time run differed again; stopping the game every 50 frames changed it too. Savestates are not the cause (the same
+differences exist with them off), and neither is audio: with every XAudio2 callback swallowed it was identical.
+
+What the game does: the pacer thread decides when to run a frame by measuring elapsed time with `QueryPerformanceCounter`,
+and timers in the stage-clear sequence add up those measured frame times. The hook scaled the clocks by the replay speed,
+and two things made the measured frame times differ from one replay to the next:
+
+1. `Sleep(n)` was shortened to `n/speed` ms rounded up to a whole millisecond, which is 50 ms of game time at 50x (three
+   frames). The frame limiter overslept and the game measured long frames.
+2. At high speed a frame is only a fraction of a millisecond of real time, shorter than normal thread preemption, so the
+   pacer often saw two frame boundaries at once.
+
+Fix (on by default, `RunParams::quant_hz = 60`): the clocks the game reads (QPC, `timeGetTime`, file time) are snapped
+down to a 1/60 s grid, so the time between two frames is an exact multiple of a frame, and waits are exact (the part under
+about 4 ms of real time is polled instead of slept). Result on test3.bscotm: the refill lands on frame 10492 at 1x, 4x, 8x
+and 16x in every run (0 of 14 deviated), and a continuous run, a run stopped and saved every 2000 frames and a run that
+loads a state midway are identical frame by frame. At 25x 2 of 8 runs landed up to 9 frames early, at 50x always 6 frames
+early (10486), so the editor's fastest speed is now 16x. Boosting the process priority made 50x worse.
+
+Why the fastest speed was still not exact (v0.9.3): the game runs one frame per **2** grid steps (30 logic updates a second), and
+the free-running grid clock lets a stalled thread inflate a frame: `sstest --cmp` now prints how many grid steps lay between
+consecutive frame markers. At 16x, 10-20 markers per run had 3 or more steps (a thread was descheduled for more than the ~1 ms
+a frame lasts in real time; at 32x it was 100-200) and they fall on different frames in every run, so now and then a run
+measured a longer frame near the refill (1 of 6 pairs at 16x was a frame off). Fix (`quant_lock = 2`, default): the clock a
+thread reads may run at most 2 steps ahead of what the last frame marker was served, so the pacer always measures exactly one
+frame, whatever the scheduler does; a pause of more than a second without a marker (loading) is let through. The value served at
+the last marker travels in the savestate (the clamp is released only after 4 s of real time without a marker; a release after
+a game-second of game time let a 20 ms hiccup at 50x jump the clock by 60 frames). Result: the refill lands on 10492 in 12 of
+12 pairs at 16x and 24x in the first measurement (continuous, chunked with saves, chunked with a load: identical), but later
+batches of 10 pairs at 24x showed 2-4 of 20 runs a frame off (always +-1, mostly the first run of a pair), at 32x about 1 pair
+in 8 and at 50x 1 in 8 to 1 in 2 depending on the variant.
+
+What the remaining scatter is: scheduling noise. Not the savestates (the same scatter with them off), not the audio callbacks
+(all swallowed: still scattered, one run landed on 10446), not GetTickCount/GetTickCount64/SleepEx (the game does not call
+them). Counting calls per frame marker (`sstest --cmp ... --variant 3` prints it): the marker thread makes exactly 3 waits
+per frame every time, but its own Sleep polling goes from 0 to 110 calls a frame, and the game's background thread that loops
+on Sleep(8) wakes 2-5 times a frame (about 4.2 on average, totals differing by 50 over 10,000 frames), so its work lands at
+different points of the frame in every run. Running that thread in lockstep (`Shm::lockstep` = N, `sstest --lockstep 4`: the
+frame marker releases it N times per frame and waits for each wake to finish) makes its count a constant 4 per frame and gave
+7 of 8 exact pairs at 50x (against 3 of 8 without), but at 24x it made no measurable difference, so it stays off by default.
+A busy CPU (8 spinning processes next to the game) moves the refill anywhere from 10490 to 10503 at 24x, so what is left is the
+game depending on real-time interleaving of the marker thread, the background thread and the driver. A fully deterministic
+replay at higher speeds would need the threads scheduled by the hook (one runnable game thread at a time); not done. The
+fastest speed stays 24x; run replays on an otherwise idle machine.
+
+Tried and abandoned: a frame-locked clock (time advances only at frame markers). The game terminates itself with exit code
+143 a few seconds in (a timing check in the protection layer, not through the exe's imports).
+
+Tools: `tools/sstest --cmp ROW --variant N` compares whole runs (1 = chunked without saves, 2 = real time, 3 = a second
+continuous run) and prints the frame where health goes 9 to 12; `--rngscan`, `--dump` plus `tools/dumpdiff` compare game memory.
+
+## Frame clock: exact replays at any speed (replaces the 1/60 s grid and the clamp)
+
+Method: the decrypted code was dumped from the running game with `ReadProcessMemory` (no code touched) and disassembled
+with `objdump -b binary -mi386`; a sampling profiler (another process: suspend a thread, read its context, resume) showed
+where the main thread spends its time.
+
+### What the game does with time
+
+- **The limiter** (`exe+0x2A48A0..0x2A496F`, timer object of 0x20 bytes: +0 "has QPC", +8 last QPC, +0x18 frequency): each
+  spin computes `elapsed = float(now - last) / float(freq)` and compares it with `*(manager+0x10) / 60.0f` (manager =
+  `*(exe+0x483680)`, the value is 1.0). If `elapsed >` that, it sets `last = QPC()` and runs one frame (`exe+0x293070`);
+  otherwise `Sleep(0)`.
+- **Why the grid ran the game at "30 fps":** a grid step of `Freq / 60` ticks (integer division) is a hair *shorter* than
+  1/60 s, so one step never passes the strict `>` test and every frame took two steps (33.3 ms of game time). The game's
+  frames did not change, but everything measured in time ran twice as fast per frame.
+- **Other readers of the clock:** the frame function times its own work (`exe+0x2930F2`/`0x293211`, summed at manager+8,
+  reset every 60 frames: a frame-rate meter) and the renderer times itself (`exe+0x29E110`/`0x29E2A0`). Neither feeds game
+  logic. Game logic itself never reads a clock.
+- **The music sequencer** is the one that matters. A background thread loops on `exe+0x2BDC60`: it measures
+  `dt = QPC() - last` (as a float, seconds), sets `last = QPC()`, then for every playing sequence calls `exe+0x2BCA10(seq, dt)`,
+  which is a MIDI-style sequencer (variable-length delta times, status bytes 0x80-0xF0 dispatched through a table, song
+  position += dt scaled by the tempo at +0x25C), and finally `Sleep(8)` (return address `exe+0x2BDDAC`). This is the
+  "background thread that loops on Sleep(8)" from the notes above. Events that wait for the music (the stage-clear
+  jingle before the health refill) therefore land on a frame that depends on when this thread happened to wake and what
+  time it read: that was the remaining ±1 frame scatter at 24x and above.
+
+### The frame clock (`quant_lock = 3`, the default)
+
+- From the first frame marker on, every clock the game reads (QPC, `timeGetTime`, file time) returns
+  `G(k) = G0 + k * A`, k = frame number, A = the shortest tick count that passes the limiter's float test plus 10 us
+  (166767 ticks at 10 MHz). Time advances only at a marker. The limiter sees exactly one frame each time and starts the
+  next frame at once, so a frame costs only its own work and nothing in it depends on real time.
+- The music thread runs in lockstep: its `Sleep(8)` parks it, and the marker wakes it twice per frame, one wake at a time,
+  serving it `G(k-1) + A/2` and then `G(k)`. Handing the wakes over by spinning (both sides, falling back to a semaphore
+  after ~1-2 ms without a frame) costs nothing measurable; two kernel round trips per frame had cost about 15%.
+- Speed comes from waiting at the marker until frame k is due at the chosen speed (1x = 60 frames per second of real time);
+  Max does not wait.
+- Savestates store the frame clock's offset and the time of the held frame; the marker that a load re-runs does not wake the
+  music thread again (its wakes for that frame happened before the save).
+- Safety valves (each counted in `Shm::fc_diag`, never needed on test3): if the main thread keeps reading the clock 20,000
+  times without reaching a marker (a wait loop), time runs on by one grid step per 64 reads; another thread gets real time
+  after 100 ms without a marker; the music thread is woken anyway after 2 s without a marker (deadlock guard).
+- The earlier "frame-locked clock" (`quant_lock = 1`, exit code 143) advanced one grid step per frame, which the limiter never
+  accepts as a frame, so the game crawled on the fallback path. Exit code 143 was never seen with the frame clock.
+
+### Results (test3.bscotm, 11,400 frames)
+
+- Identical frame by frame (health, weapon points, score, speeds, position, invisibility) between: two runs at Max; Max and
+  1x real time (the 1x run took 190 s = 59.9 frames per second); continuous and stepped in 3-frame pieces; continuous and
+  chunked with a savestate every 2000 frames; and runs that load a state at row 2000, 4000 or 8000 and run on. The stage-clear
+  refill lands on frame 10674 in every run (the 1/60 s grid gave 10492; v0.9.1 at 4x, before the grid, gave 10673).
+  Zero fallbacks and zero timed-out music wakes in all of them.
+- Speed at Max: 1700-1770 frames per second (28-29x real time) without savestates, 1940-2060 (32-34x) with savestates (the
+  private heap is faster than the process heap). The old clamp mode at "24x" managed 717 frames per second (12x), because
+  of the two-steps-per-frame effect above.
+- Where a frame's time goes at Max (main thread, drawing skipped): the game's own logic ~43%, `ntdll` ~39% (mostly the game's
+  heap allocations, `exe+0x316DEB`), D3DX math ~12%, XAudio2 calls ~2%, the hook ~2%. Going faster would mean doing less of
+  the game's own per-frame work.
+
+## Saves on the title screen (render command 29)
+
+A state saved before about frame 165 of the boot / title sequence (no input yet; the game has not loaded its save file)
+restored correctly once, but the game crashed after the *second* load, at marker 170: an access violation at `exe+0x29F707`
+(reading `0xBF800008`), then the game's own handler called `ExitProcess(1)`. Saves at frame 170 and later never failed.
+`sstest --at 100 --gap 300 --reps 3` reproduced it in 11 of 12 launches, also with v0.9.3 and the old clock, so it was not
+caused by the frame clock.
+
+Cause: render command type 29 (handler `exe+0x29F6F0`, not in the skip set) releases two COM objects:
+`cmd+0xC -> +0x14 -> [+4]` and `[+8]`, each through vtable slot 2. Around frame 165 it releases objects that are not made by
+any of the device methods the hook makes immortal, so they were really freed. A load from before that point brings back the
+game's pointers and the replay releases them again; the first time the freed memory still looked like the object, by the
+second replay it had been reused, and `Release` jumped through garbage (`0xBF800000` is the float -1.0).
+
+Fix: with savestates on, the hook routes command 29 through a wrapper (a data write in the command table, like the render
+skip) that makes the class of both objects immortal (the same `ZPatch` as for textures and buffers) and then calls the
+game's handler. Result: saves at frames 50, 100, 120 and 160, 3 launches each, all 3/3 identical; 8 loads in a row from
+frame 100 identical; then different inputs survive.
+
+Note for `sstest`: a state replayed across a stage load can report "differing frames" only while no player exists (the
+history sampler follows the pointer chain into memory the load has not initialised yet); every frame after the load matches.
+`sstest` now prints every differing stretch, so such a self-healing difference is easy to tell from a real divergence.
+
+## Controller (DirectInput)
+
+The game reads gamepads only through DirectInput 8 (ANSI interfaces); there is no XInput import. Everything below was
+read from the decrypted code (memory dump + `objdump`), nothing patched.
+
+- **Set-up** (`IceSDirectInput`, singleton at `*(exe+0x490948)`, created in `exe+0x2C34A0`): `DirectInput8Create`, then
+  `IDirectInput8A::EnumDevices(DI8DEVCLASS_GAMECTRL, callback exe+0x2C3620, this, DIEDFL_ATTACHEDONLY)`. The callback does
+  `CreateDevice`, `SetDataFormat(c_dfDIJoystick)` (the format at `exe+0x36B5FC`: 80-byte `DIJOYSTATE`), six
+  `SetProperty(DIPROP_RANGE, -127..127)` on X Y Z Rx Ry Rz by offset, `Acquire`, and registers the device with the input
+  manager (`exe+0x2A5500`) as id `0x10 + n` under its product name (`DIDEVICEINSTANCEA.tszProductName`, offset 0x12C).
+- **Per frame**: the input update `exe+0x2A5870` first polls the 81 keyboard keys through `GetAsyncKeyState` (the first poll is
+  the tool's frame marker), then calls `exe+0x2C3840` (at `exe+0x2A5982`), which for each pad does `Poll` (vtable slot 25) and
+  `GetDeviceState(80, &state)` (slot 9; on failure `Acquire` and retry, then a cleared state). The state becomes 48 on/off
+  "pad keys" (current at +0x84, previous at +0x04 of the pad's record): buttons 0-31 (`rgbButtons[i] >> 7`), then lX < -64,
+  lX > 64, lY < -64, lY > 64, lZ >= 120, lZ <= -120, lRx < -64, lRx > 64, lRy < -64, lRy > 64, lRz == -127, lRz == 127, and the
+  hat: up = 0 / 4500 / 31500, right = 4500 / 9000 / 13500, down = 13500 / 18000 / 22500, left = 22500 / 27000 / 31500. It also
+  stores lX, lY, lRx, lRy as floats (/127) at +0x184.. .
+- **Mapping**: `exe+0x269FE0` compares the device name with `"XBOX 360 For Windows (Controller)"`; on a match it loads the
+  default Xbox mapping, a table of 18 entries `[name pointer][4 pad-key indices]` at `exe+0x37AF00`: Left = hat left / X-,
+  Right = hat right / X+, Up = hat up / Y-, Down = hat down / Y+, Jump = button 0 (A), MAtk = 2 (X), SAtk = 3 (Y), Action = 1 (B),
+  Start = 7, Select = 6, Decide = 0, Cancel = 1, L = 4 (LB), R = 5 (RB), Debug0/1 = 14/15, L2 = Z+ (LT), R2 = Z- (RT).
+  Other names get a generic table (`exe+0x37AF94`).
+
+### The virtual pad
+
+With a movie's controller on (`Shm::pad_mode = 2`) the hook patches `DirectInput8Create` in the exe's imports and, in
+dinput8.dll's `IDirectInput8A` vtable, `EnumDevices` (slot 4) and `CreateDevice` (slot 3). A request for game controllers gets
+exactly one device: a hook-owned `IDirectInputDevice8A` named "XBOX 360 For Windows (Controller)" (so the game uses its Xbox
+mapping). Its `GetDeviceState` builds a `DIJOYSTATE` from the frame's 24 `PAD_*` bits (buttons 0-9, the hat, both sticks and Z
+at full deflection): from the movie when playing; when recording or playing live, from the first real pad (opened with the
+game's own DirectInput object; set-up calls are passed on to it), made on/off with the game's own thresholds, so the game gets
+exactly what is recorded. With the controller off (`pad_mode = 1`) a request for game controllers finds none.
+
+Checked on test3.bscotm: the movie with its movement keys moved to the D-pad, and the movie with every key moved to the pad
+(Space -> A, mouse -> X / Y, Q / E -> LB / RB, P -> Start, Enter -> A, Esc -> B), each replays identically to the keyboard
+original over all 13,140 frames, and the pad version passes `tools\verify.ps1` (5/5). Recording from a real pad was not
+tested (no pad on the dev machine).

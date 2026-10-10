@@ -96,7 +96,7 @@ uint32_t Session::Row() const {
     return s->paused - 1 - pre;
 }
 
-bool Session::Step(uint16_t keys) {
+bool Session::Step(KeyMask keys) {
     if (!s || !s->paused) return false;
     uint32_t f = s->paused;
     s->keys[f - 1] = keys;
@@ -110,7 +110,7 @@ bool Session::Step(uint16_t keys) {
     return false;
 }
 
-bool Session::BeginSteps(const uint16_t* keys, uint32_t n, uint32_t speed_milli) {
+bool Session::BeginSteps(const KeyMask* keys, uint32_t n, uint32_t speed_milli) {
     if (!s || !s->paused || !n || s->paused - 1 + n > MAX_FRAMES) return false;
     uint32_t f = s->paused;
     for (uint32_t i = 0; i < n; i++) s->keys[f - 1 + i] = keys[i];
@@ -142,6 +142,50 @@ void Session::AbortSteps() {
     s->advance = 0;
     for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 3000 && !s->paused && Alive();) Sleep(1);
     s->speed_milli = 1000;
+}
+
+bool Session::SaveState(int slot) {
+    if (!s || !s->paused || slot < 0 || slot > 7 || !(s->features & FEAT_ARENA_OK)) return false;
+    // The hook also refuses a save when stopping the threads takes a while; retry a few times.
+    for (int attempt = 0; attempt < 12; attempt++) {
+        s->snap_slot = slot;
+        s->snap_result = 0;
+        s->snap_diag[0] = 0;
+        MemoryBarrier();
+        s->snap_cmd = 1;
+        bool answered = false;
+        for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 10000;) {
+            if (!s->snap_cmd) { answered = true; break; }
+            if (!Alive()) return false;
+            Sleep(1);
+        }
+        if (!answered) return false;
+        if (s->snap_result == 1) return true;
+        if (s->snap_diag[0] != 0xFFFFFFFFu) return false;       // a real failure, not "busy"
+        Sleep(250);
+    }
+    return false;
+}
+
+int Session::StateRow(int slot) const {
+    if (!s || slot < 0 || slot > 7 || !s->snap_frame[slot]) return -1;
+    return (int)s->snap_frame[slot] - 1 - (int)pre;
+}
+
+bool Session::LoadState(int slot) {
+    if (!s || !s->paused || slot < 0 || slot > 7 || !s->snap_frame[slot]) return false;
+    uint32_t want = s->snap_frame[slot];
+    s->snap_slot = slot;
+    s->snap_result = 0;
+    MemoryBarrier();
+    s->snap_cmd = 2;
+    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 15000;) {
+        if (!s->snap_cmd && s->paused == want) return s->snap_result == 1;
+        if (!s->snap_cmd && s->snap_result == 2) return false;
+        if (!Alive()) return false;
+        Sleep(1);
+    }
+    return false;
 }
 
 bool Session::StartRecording() {
@@ -219,6 +263,12 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     s->rng_on = p.seeded ? 1 : 0;       // set before the game starts: it reads the clock during start-up
     s->rng_time = p.seed;
     s->rng_log = p.rng_log ? 1 : 0;
+    s->hist_on = p.hist ? 1 : 0;
+    s->features = (p.savestates ? FEAT_SAVESTATE : 0) | (p.drop_callbacks ? FEAT_DROPCB : 0);
+    s->quant_hz = p.quant_hz;
+    s->quant_lock = p.quant_lock;
+    s->lockstep = p.lockstep;
+    s->pad_mode = p.controller ? 2 : 1;     // before the game starts: it looks for controllers once, at start-up
 
     STARTUPINFOW si{};
     si.cb = sizeof si;
@@ -247,8 +297,8 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     // game runs, so frame 1 of the schedule is the game's own first frame marker.
     // (Starting after a wall-clock "ready" wait made the start frame vary from
     // boot to boot, which desynced the prelude.)
-    memcpy(s->keys, p.prelude.data(), p.prelude.size() * sizeof(uint16_t));
-    memcpy(s->keys + p.prelude.size(), p.movie.data(), p.target * sizeof(uint16_t));
+    memcpy(s->keys, p.prelude.data(), p.prelude.size() * sizeof(KeyMask));
+    memcpy(s->keys + p.prelude.size(), p.movie.data(), p.target * sizeof(KeyMask));
     s->frame = 0;
     s->then_record = p.record ? 1 : 0;
     if (p.hold) {

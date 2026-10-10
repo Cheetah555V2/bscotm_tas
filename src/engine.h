@@ -17,11 +17,18 @@ struct RunParams {
     uint32_t target = 0;        // movie frames to play
     bool record = false;        // after `target` frames, keep recording until stopped
     bool hold = false;          // after `target` frames, freeze the game for frame advance
+    bool savestates = false;    // give the game a private heap so SaveState/LoadState work
+    bool drop_callbacks = false;    // diagnosis: swallow every XAudio2 callback (needs savestates: the callbacks go through the hook's shims)
+    uint32_t quant_hz = 60;          // snap the game's clocks to 1/quant_hz s (60 = one frame): makes timer-driven events land on the same frame at any speed
+    uint32_t lockstep = 0;           // experiment: release the game's Sleep-loop thread N times per frame marker (see Shm::lockstep); 0 = free-running (did not make 24x measurably more exact)
+    uint32_t quant_lock = 3;         // 3: frame clock: time is a function of the frame number (exact at any speed, see hook.cpp); 2: the clock a thread reads may run at most 2 grid steps ahead of the last frame marker (exact up to about 16x); 1: experimental frame-locked clock (the game exits); 0: off
     uint32_t speed_milli = 1000;    // clock speed while replaying (1000 = 1x)
     uint32_t speed_mask = 31;       // SPEED_* clocks that run at that speed
     bool seeded = false;            // the game sees a frozen clock at Unix time `seed` (its RNG seed)
     uint32_t seed = 0;
+    bool hist = false;              // sample the player's values at every frame (the Memory window's history)
     bool rng_log = false;           // log the game's random draws (see the RNG log window)
+    bool controller = false;        // the game sees one virtual controller fed from the PAD_* keys (else it sees none); see hook.cpp
 };
 
 struct RunResult {
@@ -51,10 +58,14 @@ struct Session {
     bool Alive() const;
     uint32_t Row() const;           // movie row the held game runs next, or UINT_MAX if running
     // Runs one frame with `keys` as its input and holds again. False if it timed out.
-    bool Step(uint16_t keys);
+    bool Step(KeyMask keys);
     // Runs n frames in a row without blocking: keys[i] is the input of frame i. The game
     // runs at speed_milli (1000 = real time) and freezes again after the last one.
-    bool BeginSteps(const uint16_t* keys, uint32_t n, uint32_t speed_milli);
+    bool BeginSteps(const KeyMask* keys, uint32_t n, uint32_t speed_milli);
+    // Savestates (need RunParams::savestates, the game frozen). Slots 0..7.
+    bool SaveState(int slot);
+    bool LoadState(int slot);       // leaves the game frozen at the marker the slot was saved at
+    int  StateRow(int slot) const;  // movie row the slot restores to, or -1 if empty
     int PollSteps();                // 1 = done (frozen again), 0 = running, -1 = failed
     uint32_t StepsDone() const;     // frames finished so far by the current batch
     void AbortSteps();              // stops the batch at the next frame boundary

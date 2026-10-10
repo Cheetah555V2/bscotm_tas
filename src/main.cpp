@@ -8,6 +8,8 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <tlhelp32.h>
+#include <objbase.h>
+#include <wincodec.h>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -21,7 +23,11 @@ enum {
     IDM_NEW = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEPRE, IDM_SETGAME, IDM_BASESAVE, IDM_EXIT,
     IDM_UNDO, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_PASTEINS, IDM_SELALL,
     IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES, IDM_NOTE_EDIT, IDM_NOTE_DEL, IDM_NOTE_LIST, IDM_RUNTO, IDM_MEMORY, IDM_RNGSEED,
+    IDM_REPEAT, IDM_PATTERN, IDM_FIND, IDM_FINDNEXT, IDM_FINDPREV, IDM_NOTENEXT, IDM_NOTEPREV,
+    IDC_MEM_HIST, IDC_MEM_GRAPH, IDC_MEM_CSV, IDC_MEM_CLR,
+    IDM_HELP_START, IDM_HELP_KEYS, IDM_HELP_TROUBLE, IDM_HELP_ABOUT, IDM_HELP_GUIDE, IDC_HELP_TOPICS,
     IDM_RNGLOG, IDM_VERIFY, IDM_BM_EDIT, IDM_BM_DEL, IDM_BM_LIST, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_JUMPCUR,
+    IDM_SAVESTATES, IDM_SAVESTATE_NOW, IDM_SSINTERVAL, IDM_CONTROLLER, IDM_COLUMNS, IDM_BRANCHES,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
     IDC_BASE = 300, IDC_PRE, IDC_RNG_CHK, IDC_RNG_CLR, IDC_RNG_CSV,
@@ -49,6 +55,8 @@ struct App {
     bool listBm = false;                            // that window shows only the bookmarks
     HWND memWnd = nullptr, memList = nullptr;       // the Game memory window (when open)
     HWND rngWnd = nullptr, rngList = nullptr;       // the RNG log window (when open)
+    HWND graphWnd = nullptr, graphList = nullptr;   // the value graph window (when open)
+    bool histOn = false;                            // record the player's values every frame (Memory window's checkbox)
     bool rngLogOn = false;                          // log the game's random draws (set by the window's checkbox)
     int logPre = 0;                                 // prelude length of the last launch (marker number = movie frame + this)
     int dpi = 96;
@@ -59,6 +67,8 @@ struct App {
     int cursor = 0, anchor = 0;   // selection = [anchor, cursor]
     int reached = 0;              // "greenzone": frames the live game has been advanced through
     int top = 0;                  // first visible row
+    int left = 0;                 // first visible key column (the grid scrolls sideways when the columns do not fit)
+    KeyMask hidden = 0;           // input columns the user hid (View > Columns, or right-click the column headings); saved in the ini
     std::vector<Step> undo, redo;
     Frames clip;
     Notes clipNotes;
@@ -75,6 +85,14 @@ struct App {
     int liveRecRow = 0;           // movie row the live recording started at
     bool pendingStep = false;     // step once the resync job finishes
     bool pendingRun = false;      // run to the cursor once the resync job finishes
+    bool useStates = true;        // Run > Use savestates (on by default): launch the game with the private heap so states can be saved
+    int  ssEvery = 2000;          // automatic state every this many frames while the game is advanced (0 = never)
+    bool ssManual[8] = {};        // slots saved by hand (never evicted automatically)
+    bool ssStale[8] = {};         // slots saved before an edit to an earlier row: never loaded again, only overwritten
+    uint32_t ssGen[8] = {};       // changes whenever a slot is written (0 = empty): a branch's state is live while its slot still has its number
+    uint32_t ssCounter = 0;
+    int ghost = -1;               // the branch whose inputs the grid compares with (Branches window: "Show differences in the grid"), -1 = none
+    int  chunkFrom = 0;           // first row of the batch being run (Run to cursor runs in pieces so states can be saved between them)
     bool stepping = false;        // a batch of frames is running (busy is set too)
     int runFrom = 0, runTarget = 0;   // rows the batch started at / will stop before
     bool busy = false, jobRecord = false, jobNew = false, jobHold = false;
@@ -86,6 +104,39 @@ struct App {
 } A;
 
 int S(int v) { return MulDiv(v, A.dpi, 96); }
+// Grid columns (= KEYS indices): the keyboard keys, plus the controller keys when the movie uses the controller.
+int NumCols() { return A.movie.controller ? NUM_KEYS : NUM_KB_KEYS; }
+// The input columns on screen, left to right (KEYS indices): the available ones the user did not hide. Never empty: if every
+// one is hidden, all are shown.
+void ColumnsMenu(HWND owner, POINT pt);      // the column chooser (below)
+const std::vector<int>& ShownKeys() {
+    static std::vector<int> v;
+    v.clear();
+    for (int k = 0; k < NumCols(); k++) if (!(A.hidden >> k & 1)) v.push_back(k);
+    if (v.empty()) for (int k = 0; k < NumCols(); k++) v.push_back(k);
+    return v;
+}
+
+// A tool window placed next to the editor, moved (and if need be shrunk) into the work area of the editor's monitor,
+// so it never opens off screen when the editor hangs past an edge of the screen.
+RECT OnScreen(int x, int y, int w, int h, HWND on = nullptr) {
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(MonitorFromWindow(on ? on : A.wnd, MONITOR_DEFAULTTONEAREST), &mi);
+    const RECT& wa = mi.rcWork;
+    w = std::min(w, (int)(wa.right - wa.left));
+    h = std::min(h, (int)(wa.bottom - wa.top));
+    x = std::max((int)wa.left, std::min(x, (int)wa.right - w));
+    y = std::max((int)wa.top, std::min(y, (int)wa.bottom - h));
+    return RECT{x, y, x + w, y + h};
+}
+// The same for a tool window that is already open (it may have been left off screen), on the monitor it is on.
+void KeepOnScreen(HWND h) {
+    RECT r;
+    if (!GetWindowRect(h, &r)) return;
+    RECT n = OnScreen(r.left, r.top, r.right - r.left, r.bottom - r.top, h);
+    if (n.left != r.left || n.top != r.top || n.right != r.right || n.bottom != r.bottom)
+        SetWindowPos(h, nullptr, n.left, n.top, n.right - n.left, n.bottom - n.top, SWP_NOZORDER | SWP_NOACTIVATE);
+}
 int RowH()   { return S(18); }
 int HdrH()   { return S(24); }
 int FrameW() { return S(64); }
@@ -110,10 +161,12 @@ std::string U8(const std::wstring& w) {
 // ---- status / title --------------------------------------------------------
 void SetMsg(const std::wstring& m) { SendMessageW(A.status, SB_SETTEXTW, 0, (LPARAM)m.c_str()); }
 
+int NumStates();
 void UpdateStatus() {
     int n = Size();
-    wchar_t b[192], sd[40] = L"";
+    wchar_t b[192], sd[64] = L"";
     if (A.movie.has_seed) swprintf(sd, 40, L"   seed %u", (unsigned)A.movie.seed);
+    if (int ns = NumStates()) swprintf(sd + wcslen(sd), 64 - wcslen(sd), L"   states %d", ns);
     double t = (A.cursor + 1) / 60.0, tt = n / 60.0;
     swprintf(b, 192, L"Frame %d / %d   (%d:%05.2f / %d:%05.2f)   game at %d%ls", n ? A.cursor + 1 : 0, n,
              (int)t / 60, t - 60 * ((int)t / 60), (int)tt / 60, tt - 60 * ((int)tt / 60), A.reached, sd);
@@ -132,11 +185,23 @@ int VisibleRows() {
     return std::max(1, (int)((rc.bottom - HdrH()) / RowH()));
 }
 
+// Key columns that fit beside the frame numbers, leaving some room for the notes.
+int VisibleCols() {
+    RECT rc{};
+    GetClientRect(A.grid, &rc);
+    return std::max(1, (int)(rc.right - FrameW() - S(120)) / KeyW());
+}
+
 void UpdateScroll() {
     int vis = VisibleRows();
     A.top = std::max(0, std::min(A.top, Size()));
     SCROLLINFO si{sizeof si, SIF_RANGE | SIF_PAGE | SIF_POS, 0, Size() + vis - 1, (UINT)vis, A.top, 0};
     SetScrollInfo(A.grid, SB_VERT, &si, TRUE);
+    int cols = VisibleCols();       // sideways: only when the key columns do not all fit (the scroll bar hides itself otherwise)
+    int shown = (int)ShownKeys().size();
+    A.left = std::max(0, std::min(A.left, shown - cols));
+    SCROLLINFO sh{sizeof sh, SIF_RANGE | SIF_PAGE | SIF_POS, 0, shown - 1, (UINT)cols, A.left, 0};
+    SetScrollInfo(A.grid, SB_HORZ, &sh, TRUE);
     InvalidateRect(A.grid, nullptr, FALSE);
 }
 
@@ -151,13 +216,22 @@ void SetCursorRow(int row, bool extend) {
     UpdateStatus();
 }
 
+// A state restores the game frozen before its row, so it depends on every row before that one. An edit at
+// `pos` (-1: the seed, prelude, baseline or movie changed) makes the states after it stale for good: the
+// greenzone grows back past them as the game runs on, so "row <= reached" alone would let them be loaded.
+void StaleStatesAfter(int pos) {
+    for (int i = 0; i < 8; i++) if (A.sess.StateRow(i) > pos) A.ssStale[i] = true;
+}
+
 // ---- editing (every change goes through DoSplice so it is undoable) -------
 void Touch(size_t pos) {
     A.dirty = true;
     if ((int)pos < A.reached) A.reached = (int)pos;
+    StaleStatesAfter((int)pos);
 }
 
 void RefreshNotesList();
+void RefreshBranchList(int select = -2);     // -2: keep the selection
 void JumpTo(int row);
 
 const std::string& NoteAt(int row) {
@@ -256,7 +330,7 @@ void Redo() {
 
 void SetCell(Step& st, int row, int bit, bool on) {
     EnsureRows(st, row + 1);
-    uint16_t m = A.movie.frames[row], n = on ? (uint16_t)(m | (1u << bit)) : (uint16_t)(m & ~(1u << bit));
+    KeyMask m = A.movie.frames[row], n = on ? (m | KeyBit(bit)) : (m & ~KeyBit(bit));
     if (n != m) DoSplice(st, row, 1, Frames{n});
 }
 
@@ -418,6 +492,153 @@ void EditNote() {
     SetFocus(A.grid);
 }
 
+// Repeat the selected rows N more times right after the selection (inserted frames).
+void EditRepeat() {
+    if (A.busy || !Size()) return;
+    int lo = SelLo(), hi = std::min(SelHi(), Size() - 1);
+    if (hi < lo) return;
+    std::wstring t = L"1";
+    if (!AskText(L"Repeat selection", L"Copy the " + std::to_wstring(hi - lo + 1) + L" selected frame(s) this many more times (1 - 1000):", t)) return;
+    wchar_t* end = nullptr;
+    long n = wcstol(t.c_str(), &end, 10);
+    if (t.empty() || *end || n < 1 || n > 1000 || (size_t)(hi - lo + 1) * (size_t)n + (size_t)Size() >= (size_t)MAX_FRAMES - 4) {
+        MessageBoxW(A.wnd, L"Enter a whole number from 1 to 1000 (the movie must stay under the frame limit).", L"Repeat selection", MB_ICONERROR);
+        return;
+    }
+    Frames block(A.movie.frames.begin() + lo, A.movie.frames.begin() + hi + 1), nv;
+    for (long i = 0; i < n; i++) nv.insert(nv.end(), block.begin(), block.end());
+    Step st; st.cur_before = A.cursor;
+    DoSplice(st, hi + 1, 0, nv);
+    A.anchor = lo;
+    A.cursor = hi + (int)nv.size();
+    Commit(st);
+    UpdateScroll(); UpdateStatus();
+    SetMsg(L"Repeated the selection " + std::to_wstring(n) + L" more time(s).");
+}
+
+// Fill the selection with a repeating press of one key: "KEY period on [offset]", e.g. "Jmp 12 2" presses
+// the jump key for 2 frames out of every 12; the key is released on all the other selected frames.
+static int KeyByName(const std::wstring& w) {
+    std::string a = U8(w);
+    for (char& c : a) c = (char)tolower((unsigned char)c);
+    for (int i = 0; i < NumCols(); i++) {
+        std::string n = KEYS[i].name, l = KEYS[i].label;
+        for (char& c : n) c = (char)tolower((unsigned char)c);
+        for (char& c : l) c = (char)tolower((unsigned char)c);
+        if (a == n || a == l) return i;
+    }
+    return -1;
+}
+
+void EditPattern() {
+    if (A.busy) return;
+    int lo = SelLo(), hi = SelHi();
+    if (hi - lo + 1 < 2) { SetMsg(L"Select the frames to fill first (click a frame number, Shift+click another)."); return; }
+    std::wstring t = L"Jmp 12 2";
+    std::wstring keys;
+    for (int i = 0; i < NumCols(); i++) { if (i) keys += L" "; keys += W(KEYS[i].label); }
+    if (!AskText(L"Fill pattern", L"KEY period on [offset] for the " + std::to_wstring(hi - lo + 1) + L" selected frames. Keys: " + keys, t)) return;
+    std::vector<std::wstring> tok;
+    {
+        size_t i = 0;
+        while (i < t.size()) {
+            while (i < t.size() && t[i] == L' ') i++;
+            size_t j = i;
+            while (j < t.size() && t[j] != L' ') j++;
+            if (j > i) tok.push_back(t.substr(i, j - i));
+            i = j;
+        }
+    }
+    int key = tok.size() >= 3 ? KeyByName(tok[0]) : -1;
+    wchar_t* e1 = nullptr; wchar_t* e2 = nullptr; wchar_t* e3 = nullptr;
+    long period = tok.size() >= 3 ? wcstol(tok[1].c_str(), &e1, 10) : 0;
+    long on = tok.size() >= 3 ? wcstol(tok[2].c_str(), &e2, 10) : -1;
+    long offset = tok.size() >= 4 ? wcstol(tok[3].c_str(), &e3, 10) : 0;
+    if (key < 0 || tok.size() > 4 || period < 1 || on < 0 || on > period || offset < 0 || *e1 || *e2 || (e3 && *e3)) {
+        MessageBoxW(A.wnd, L"Format: KEY period on [offset]\nfor example  Jmp 12 2  (jump pressed for 2 frames out of every 12),\nor  R 1 1  (hold right on every frame).\n\nperiod is at least 1, on is 0 to period, offset is how many frames to skip first.",
+                    L"Fill pattern", MB_ICONERROR);
+        return;
+    }
+    Step st; st.cur_before = A.cursor;
+    EnsureRows(st, (size_t)hi + 1);
+    Frames nv(A.movie.frames.begin() + lo, A.movie.frames.begin() + hi + 1);
+    for (int k = 0; k <= hi - lo; k++) {
+        bool down = k >= offset && ((k - offset) % period) < on;
+        if (down) nv[k] |= KeyBit(key); else nv[k] &= ~KeyBit(key);
+    }
+    DoSplice(st, lo, hi - lo + 1, nv);
+    Commit(st);
+    InvalidateRect(A.grid, nullptr, FALSE);
+    UpdateScroll(); UpdateStatus();
+    SetMsg(L"Filled " + std::to_wstring(hi - lo + 1) + L" frames with the pattern.");
+}
+// ---- find in the grid -----------------------------------------------------------------------------------
+// Find: move the cursor to the next / previous frame where a key is pressed (goes from up to down), released
+// (down to up) or any key changes. Notes: jump to the next / previous frame that has a note or bookmark.
+static int FindKey = -1;           // -1 = any key
+static int FindMode = 0;           // 0 = pressed, 1 = released, 2 = any change
+
+static bool FindMatch(int row) {
+    KeyMask cur = A.movie.frames[row], prev = row > 0 ? A.movie.frames[row - 1] : 0;
+    if (FindMode == 2 || FindKey < 0) return FindKey < 0 ? cur != prev : ((cur ^ prev) >> FindKey & 1) != 0;
+    bool now = cur >> FindKey & 1, was = prev >> FindKey & 1;
+    return FindMode == 0 ? (now && !was) : (!now && was);
+}
+
+static std::wstring FindDescription() {
+    std::wstring k = FindKey < 0 ? L"any key" : W(KEYS[FindKey].label);
+    return FindMode == 0 ? k + L" pressed" : FindMode == 1 ? k + L" released" : k + L" changes";
+}
+
+void FindStep(bool forward) {
+    if (A.busy || !Size()) return;
+    int n = Size();
+    for (int r = A.cursor + (forward ? 1 : -1); r >= 0 && r < n; r += forward ? 1 : -1)
+        if (FindMatch(r)) { SetCursorRow(r, false); SetMsg(L"Found: " + FindDescription() + L" at frame " + std::to_wstring(r + 1) + L". F3 / Shift+F3 for the next / previous."); return; }
+    SetMsg(L"No more frames where " + FindDescription() + (forward ? L" after the cursor." : L" before the cursor."));
+}
+
+void FindDialog() {
+    if (A.busy || !Size()) return;
+    std::wstring t = FindKey < 0 ? L"*" : W(KEYS[FindKey].label);
+    if (FindKey >= 0 && FindMode == 1) t += L" released";
+    std::wstring keys;
+    for (int i = 0; i < NumCols(); i++) { if (i) keys += L" "; keys += W(KEYS[i].label); }
+    if (!AskText(L"Find", L"KEY [pressed|released], or * for any change. Keys: " + keys, t)) return;
+    std::vector<std::wstring> tok;
+    size_t i = 0;
+    while (i < t.size()) {
+        while (i < t.size() && t[i] == L' ') i++;
+        size_t j = i;
+        while (j < t.size() && t[j] != L' ') j++;
+        if (j > i) tok.push_back(t.substr(i, j - i));
+        i = j;
+    }
+    int key = -2, mode = 0;
+    if (!tok.empty() && tok.size() <= 2) {
+        key = tok[0] == L"*" ? -1 : KeyByName(tok[0]);
+        if (tok.size() == 2) {
+            std::string m = U8(tok[1]);
+            for (char& c : m) c = (char)tolower((unsigned char)c);
+            if (m == "pressed" || m == "press" || m == "down") mode = 0;
+            else if (m == "released" || m == "release" || m == "up") mode = 1;
+            else key = -2;
+        }
+    }
+    if (key == -2) {
+        MessageBoxW(A.wnd, L"Format: KEY [pressed|released]\nfor example  Jmp  or  Atk released  or  *  (any key changes).", L"Find", MB_ICONERROR);
+        return;
+    }
+    FindKey = key; FindMode = key < 0 ? 2 : mode;
+    FindStep(true);
+}
+
+void NoteStep(bool forward) {
+    if (A.busy || !Size()) return;
+    for (int r = A.cursor + (forward ? 1 : -1); r >= 0 && r < Size(); r += forward ? 1 : -1)
+        if (!NoteAt(r).empty()) { SetCursorRow(r, false); SetMsg(L"Note at frame " + std::to_wstring(r + 1) + L"."); return; }
+    SetMsg(forward ? L"No note after the cursor." : L"No note before the cursor.");
+}
 // Bookmarks: named frames to jump to (see JumpTo). Stored as flagged notes.
 void EditBookmark() {
     if (A.busy || !Size()) return;
@@ -475,11 +696,34 @@ void EditSeed() {
     A.movie.has_seed = has;
     A.movie.seed = (uint32_t)v;
     A.dirty = true;
-    A.reached = 0;
+    A.reached = 0; StaleStatesAfter(-1);
     InvalidateRect(A.grid, nullptr, FALSE);
     UpdateTitle(); UpdateStatus();
     SetMsg(has ? L"RNG seed " + std::to_wstring(A.movie.seed) + L". Rewind (F6) to restart the game with it."
                : L"RNG seed removed: the game uses the real clock. Rewind (F6) to restart it.");
+    SetFocus(A.grid);
+}
+
+// Run > Controller: the game sees one virtual Xbox 360 pad (the PAD_* columns, fed from the movie when playing and from
+// the real pad when recording), or no controller at all. The game looks for controllers when it starts, so the change
+// takes effect from the next launch (Rewind).
+void ToggleController() {
+    if (A.busy) return;
+    bool on = !A.movie.controller;
+    if (!on) {
+        bool used = false;
+        for (KeyMask k : A.movie.frames) if (k & PAD_KEYS_MASK) { used = true; break; }
+        if (used && MessageBoxW(A.wnd, L"This movie has controller inputs. With the controller off the game sees no controller, so they are ignored "
+                                       L"(they stay in the movie, hidden, and come back when you turn the controller on again).\n\nTurn the controller off?",
+                                L"Controller", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    }
+    A.movie.controller = on;
+    A.dirty = true;
+    A.reached = 0; StaleStatesAfter(-1);
+    InvalidateRect(A.grid, nullptr, TRUE);
+    UpdateScroll(); UpdateTitle(); UpdateStatus();
+    SetMsg(on ? L"Controller on: the game sees one Xbox 360 pad (the pA ... RT columns); recording reads your pad. Rewind (F6) to restart the game with it."
+              : L"Controller off: the game sees no controller. Rewind (F6) to restart it.");
     SetFocus(A.grid);
 }
 
@@ -512,7 +756,8 @@ void PaintGrid(HWND h) {
     SelectObject(m, A.font);
     SetBkMode(m, TRANSPARENT);
 
-    const int rh = RowH(), hh = HdrH(), fw = FrameW(), kw = KeyW(), gw = fw + NUM_KEYS * kw;
+    const std::vector<int>& cols = ShownKeys();     // on screen: cols[k0], cols[k0 + 1], ...
+    const int rh = RowH(), hh = HdrH(), fw = FrameW(), kw = KeyW(), k0 = A.left, nc = (int)cols.size(), gw = fw + (nc - k0) * kw;
     Fill(m, 0, 0, rc.right, rc.bottom, cBg);
 
     // header
@@ -520,20 +765,27 @@ void PaintGrid(HWND h) {
     SelectObject(m, A.fontB);
     Text(m, L"Frame", RECT{0, 0, fw - S(6), hh}, DT_RIGHT, RGB(0, 0, 0));
     Text(m, L"Note", RECT{gw + S(6), 0, rc.right, hh}, DT_LEFT, RGB(0, 0, 0));
-    for (int k = 0; k < NUM_KEYS; k++) {
+    for (int d = k0; d < nc; d++) {
+        int k = cols[d];
         wchar_t lb[8];
         swprintf(lb, 8, L"%hs", KEYS[k].label);
-        Text(m, lb, RECT{fw + k * kw, 0, fw + (k + 1) * kw, hh}, DT_CENTER, RGB(0, 0, 0));
+        Text(m, lb, RECT{fw + (d - k0) * kw, 0, fw + (d - k0 + 1) * kw, hh}, DT_CENTER, IsPadKey(k) ? RGB(30, 70, 150) : RGB(0, 0, 0));     // controller keys in blue
     }
     Fill(m, 0, hh - 1, rc.right, hh, cLine60);
     SelectObject(m, A.font);
 
     const int lo = SelLo(), hi = SelHi(), n = Size();
+    // Branches window, "Show differences in the grid": rows whose inputs differ from that branch get an orange mark beside the
+    // frame number, and keys the branch presses but the movie does not are outlined in orange.
+    const Frames* gf = A.ghost >= 0 && A.ghost < (int)A.movie.branches.size() ? &A.movie.branches[A.ghost].frames : nullptr;
+    const COLORREF cGhost = RGB(235, 120, 0);
     for (int i = 0;; i++) {
         int r = A.top + i, y = hh + i * rh;
         if (y >= rc.bottom) break;
         bool real = r < n, sel = r >= lo && r <= hi;
-        uint16_t mask = real ? A.movie.frames[r] : 0;
+        KeyMask mask = real ? A.movie.frames[r] : 0;
+        KeyMask gm = gf && r < (int)gf->size() ? (*gf)[r] : 0;
+        bool gdiff = gf && (real || r < (int)gf->size()) && gm != mask;
 
         Fill(m, 0, y, fw, y + rh, r < A.reached ? (r == A.reached - 1 ? cGreenHead : cGreen) : cHdr);
         wchar_t num[16];
@@ -549,15 +801,29 @@ void PaintGrid(HWND h) {
             Text(m, wn.c_str(), RECT{gw + S(6), y, rc.right - S(4), y + rh}, DT_LEFT | DT_END_ELLIPSIS, bm ? cBmText : cNoteText);
         }
 
-        for (int k = 0; k < NUM_KEYS; k++) {
+        for (int d = k0; d < nc; d++) {
+            int k = cols[d];
             if (!(mask >> k & 1)) continue;
-            int x = fw + k * kw;
+            int x = fw + (d - k0) * kw;
             Fill(m, x + 1, y + 1, x + kw, y + rh, cPressed);
             wchar_t lb[8];
             swprintf(lb, 8, L"%hs", KEYS[k].label);
             Text(m, lb, RECT{x, y, x + kw, y + rh}, DT_CENTER, RGB(255, 255, 255));
         }
-        for (int k = 0; k <= NUM_KEYS; k++) Fill(m, fw + k * kw, y, fw + k * kw + 1, y + rh, cLine);
+        if (gdiff) {
+            Fill(m, fw - S(6), y + 1, fw - 1, y + rh - 1, cGhost);
+            for (int d = k0; d < nc; d++) {
+                int k = cols[d];
+                if (!(gm >> k & 1) || (mask >> k & 1)) continue;
+                int x = fw + (d - k0) * kw, t = S(2);
+                Fill(m, x + 2, y + 2, x + kw - 1, y + 2 + t, cGhost); Fill(m, x + 2, y + rh - 1 - t, x + kw - 1, y + rh - 1, cGhost);
+                Fill(m, x + 2, y + 2, x + 2 + t, y + rh - 1, cGhost); Fill(m, x + kw - 1 - t, y + 2, x + kw - 1, y + rh - 1, cGhost);
+                wchar_t lb[8];
+                swprintf(lb, 8, L"%hs", KEYS[k].label);
+                Text(m, lb, RECT{x, y, x + kw, y + rh}, DT_CENTER, cGhost);
+            }
+        }
+        for (int k = 0; k <= nc - k0; k++) Fill(m, fw + k * kw, y, fw + k * kw + 1, y + rh, cLine);
         Fill(m, gw, y, gw + 1, y + rh, cLine60);
         Fill(m, 0, y + rh - 1, rc.right, y + rh, (r + 1) % 60 == 0 ? cLine60 : cLine);
         if (r == A.cursor) {
@@ -576,7 +842,13 @@ void PaintGrid(HWND h) {
 }
 
 int RowAt(int y) { return A.top + (y < HdrH() ? -1 : (y - HdrH()) / RowH()); }
-int ColAt(int x) { return x < FrameW() ? -1 : (x - FrameW()) / KeyW(); }   // >= NUM_KEYS: outside
+// The key (KEYS index) of the input column at x; -1 = the frame numbers, NUM_KEYS = right of the input columns (notes).
+int ColAt(int x) {
+    if (x < FrameW()) return -1;
+    const std::vector<int>& cols = ShownKeys();
+    size_t d = A.left + (x - FrameW()) / KeyW();
+    return d < cols.size() ? cols[d] : NUM_KEYS;
+}
 
 void PaintTo(int row) {     // paint dragCol from the last row to `row`
     int a = A.dragRow, b = row, step = a <= b ? 1 : -1;
@@ -628,7 +900,12 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_RBUTTONUP: {
             int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
-            if (y < HdrH()) return 0;
+            if (y < HdrH()) {                   // the column headings: choose the input columns
+                POINT pt{x, y};
+                ClientToScreen(h, &pt);
+                if (!A.busy) ColumnsMenu(h, pt);
+                return 0;
+            }
             int row = RowAt(y);
             if (row < SelLo() || row > SelHi()) SetCursorRow(row, false);   // keep a selection the click is inside
             else { A.cursor = row; UpdateScroll(); UpdateStatus(); }
@@ -654,7 +931,8 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDBLCLK:
             if (!A.busy && ColAt((short)LOWORD(lp)) < 0 && (short)HIWORD(lp) >= HdrH()) {
                 SetCursorRow(RowAt((short)HIWORD(lp)), false);
-                PostMessageW(A.wnd, WM_COMMAND, IDM_REWIND, 0);
+                PostMessageW(A.wnd, WM_COMMAND, IDM_JUMPCUR, 0);      // run forward if the frozen game has not got there yet, else rewind
+
             }
             return 0;
         case WM_MOUSEWHEEL:
@@ -674,6 +952,23 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             UpdateScroll();
             return 0;
         }
+        case WM_HSCROLL: {
+            SCROLLINFO si{sizeof si, SIF_ALL};
+            GetScrollInfo(h, SB_HORZ, &si);
+            switch (LOWORD(wp)) {
+                case SB_LINELEFT: A.left--; break;
+                case SB_LINERIGHT: A.left++; break;
+                case SB_PAGELEFT: A.left -= si.nPage; break;
+                case SB_PAGERIGHT: A.left += si.nPage; break;
+                case SB_THUMBTRACK: case SB_THUMBPOSITION: A.left = si.nTrackPos; break;
+            }
+            UpdateScroll();
+            return 0;
+        }
+        case WM_MOUSEHWHEEL:
+            A.left += GET_WHEEL_DELTA_WPARAM(wp) / 120 * 2;
+            UpdateScroll();
+            return 0;
         case WM_KEYDOWN: {
             bool shift = GetKeyState(VK_SHIFT) < 0, ctrl = GetKeyState(VK_CONTROL) < 0;
             int page = std::max(1, VisibleRows() - 1);
@@ -697,6 +992,7 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 // Every note with its frame number; double-click or Enter jumps the cursor there,
 // Delete removes the note.
 void RefreshNotesList() {
+    RefreshBranchList();                    // "differs at" follows every change of the movie
     HWND lv = A.notesList;
     if (!lv) return;
     SendMessageW(lv, WM_SETREDRAW, FALSE, 0);
@@ -762,9 +1058,10 @@ void ShowNotesList(bool bookmarks = false) {
     A.listBm = bookmarks;
     RECT pr;
     GetWindowRect(A.wnd, &pr);
+    RECT nr = OnScreen(pr.right - S(460), pr.top + S(90), S(440), S(360));
     A.notesWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmNotes", bookmarks ? L"Bookmarks" : L"Frame notes",
                                  WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
-                                 pr.right - S(460), pr.top + S(90), S(440), S(360), A.wnd, nullptr, nullptr, nullptr);
+                                 nr.left, nr.top, nr.right - nr.left, nr.bottom - nr.top, A.wnd, nullptr, nullptr, nullptr);
     if (!A.notesWnd) return;
     A.notesList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
@@ -785,11 +1082,497 @@ void ShowNotesList(bool bookmarks = false) {
     RefreshNotesList();
 }
 
+// ---- thumbnails: the game's picture as a small PNG (Windows Imaging Component), base64 ---------------------------------
+static IWICImagingFactory* Wic() {
+    static IWICImagingFactory* f;
+    static bool tried;
+    if (!f && !tried) {
+        tried = true;
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory, (void**)&f);
+    }
+    return f;
+}
+static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static std::string ToBase64(const uint8_t* p, size_t n) {
+    std::string o;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = p[i] << 16 | (i + 1 < n ? p[i + 1] << 8 : 0) | (i + 2 < n ? p[i + 2] : 0);
+        o += B64[v >> 18 & 63]; o += B64[v >> 12 & 63];
+        o += i + 1 < n ? B64[v >> 6 & 63] : '=';
+        o += i + 2 < n ? B64[v & 63] : '=';
+    }
+    return o;
+}
+static std::vector<uint8_t> FromBase64(const std::string& s) {
+    std::vector<uint8_t> o;
+    uint32_t v = 0; int bits = 0;
+    for (char c : s) {
+        const char* q = strchr(B64, c);
+        if (!q || !c) continue;
+        v = v << 6 | (uint32_t)(q - B64); bits += 6;
+        if (bits >= 8) { bits -= 8; o.push_back((uint8_t)(v >> bits)); }
+    }
+    return o;
+}
+static std::string EncodePng(HBITMAP bmp) {
+    IWICImagingFactory* f = Wic();
+    if (!f) return "";
+    std::string out;
+    IWICBitmap* wb = nullptr; IStream* st = nullptr; IWICBitmapEncoder* enc = nullptr; IWICBitmapFrameEncode* fr = nullptr; IPropertyBag2* props = nullptr;
+    if (SUCCEEDED(f->CreateBitmapFromHBITMAP(bmp, nullptr, WICBitmapIgnoreAlpha, &wb)) && SUCCEEDED(CreateStreamOnHGlobal(nullptr, TRUE, &st)) &&
+        SUCCEEDED(f->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) && SUCCEEDED(enc->Initialize(st, WICBitmapEncoderNoCache)) &&
+        SUCCEEDED(enc->CreateNewFrame(&fr, &props)) && SUCCEEDED(fr->Initialize(props))) {
+        UINT w = 0, h = 0;
+        wb->GetSize(&w, &h);
+        WICPixelFormatGUID pf = GUID_WICPixelFormat24bppBGR;
+        if (SUCCEEDED(fr->SetSize(w, h)) && SUCCEEDED(fr->SetPixelFormat(&pf)) && SUCCEEDED(fr->WriteSource(wb, nullptr)) &&
+            SUCCEEDED(fr->Commit()) && SUCCEEDED(enc->Commit())) {
+            HGLOBAL hg = nullptr;
+            LARGE_INTEGER z{}; ULARGE_INTEGER size{};
+            if (SUCCEEDED(st->Seek(z, STREAM_SEEK_END, &size)) && SUCCEEDED(GetHGlobalFromStream(st, &hg))) {
+                const uint8_t* p = (const uint8_t*)GlobalLock(hg);
+                if (p) { out = ToBase64(p, (size_t)size.QuadPart); GlobalUnlock(hg); }
+            }
+        }
+    }
+    if (props) props->Release();
+    if (fr) fr->Release();
+    if (enc) enc->Release();
+    if (st) st->Release();
+    if (wb) wb->Release();
+    return out;
+}
+// base64 PNG -> a 32-bit top-down DIB section (nullptr if it cannot be read).
+static HBITMAP DecodePng(const std::string& b64, int& w, int& h) {
+    IWICImagingFactory* f = Wic();
+    std::vector<uint8_t> bytes = FromBase64(b64);
+    if (!f || bytes.empty()) return nullptr;
+    HBITMAP hb = nullptr;
+    IWICStream* ws = nullptr; IWICBitmapDecoder* dec = nullptr; IWICBitmapFrameDecode* fr = nullptr; IWICFormatConverter* cv = nullptr;
+    UINT uw = 0, uh = 0;
+    if (SUCCEEDED(f->CreateStream(&ws)) && SUCCEEDED(ws->InitializeFromMemory(bytes.data(), (DWORD)bytes.size())) &&
+        SUCCEEDED(f->CreateDecoderFromStream(ws, nullptr, WICDecodeMetadataCacheOnLoad, &dec)) && SUCCEEDED(dec->GetFrame(0, &fr)) &&
+        SUCCEEDED(f->CreateFormatConverter(&cv)) &&
+        SUCCEEDED(cv->Initialize(fr, GUID_WICPixelFormat32bppBGR, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)) &&
+        SUCCEEDED(cv->GetSize(&uw, &uh)) && uw && uh && uw < 4096 && uh < 4096) {
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = (LONG)uw; bi.bmiHeader.biHeight = -(LONG)uh;
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        hb = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (hb && FAILED(cv->CopyPixels(nullptr, uw * 4, uw * 4 * uh, (BYTE*)bits))) { DeleteObject(hb); hb = nullptr; }
+        w = (int)uw; h = (int)uh;
+    }
+    if (cv) cv->Release();
+    if (fr) fr->Release();
+    if (dec) dec->Release();
+    if (ws) ws->Release();
+    return hb;
+}
+// The running game's top-level window (the biggest visible one of its process).
+struct GameWndFind { DWORD pid; HWND best; LONG area; };
+static BOOL CALLBACK GameWndCb(HWND h, LPARAM l) {
+    GameWndFind* f = (GameWndFind*)l;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    RECT r;
+    if (pid == f->pid && IsWindowVisible(h) && GetClientRect(h, &r) && r.right * r.bottom > f->area) { f->area = r.right * r.bottom; f->best = h; }
+    return TRUE;
+}
+static HWND GameWindow() {
+    if (!A.sess.Active() || !A.sess.proc) return nullptr;
+    GameWndFind fd{GetProcessId(A.sess.proc), nullptr, 0};
+    EnumWindows(GameWndCb, (LPARAM)&fd);
+    return fd.best;
+}
+// What the frozen game shows, 192 pixels wide, as base64 PNG ("" if there is no game or no picture).
+static std::string CaptureThumb() {
+    HWND gw = GameWindow();
+    RECT rc;
+    if (!gw || !GetClientRect(gw, &rc) || rc.right < 8 || rc.bottom < 8) return "";
+    HDC sdc = GetDC(nullptr);
+    HDC full = CreateCompatibleDC(sdc), small = CreateCompatibleDC(sdc);
+    HBITMAP fb = CreateCompatibleBitmap(sdc, rc.right, rc.bottom);
+    int tw = 192, th = std::max(1, (int)(rc.bottom * 192 / rc.right));
+    HBITMAP sb = CreateCompatibleBitmap(sdc, tw, th);
+    HGDIOBJ o1 = SelectObject(full, fb), o2 = SelectObject(small, sb);
+    std::string png;
+    if (PrintWindow(gw, full, 0x1 /*PW_CLIENTONLY*/ | 0x2 /*PW_RENDERFULLCONTENT: also Direct3D windows*/)) {
+        SetStretchBltMode(small, HALFTONE);
+        SetBrushOrgEx(small, 0, 0, nullptr);
+        StretchBlt(small, 0, 0, tw, th, full, 0, 0, rc.right, rc.bottom, SRCCOPY);
+        SelectObject(small, o2);
+        png = EncodePng(sb);
+    } else SelectObject(small, o2);
+    SelectObject(full, o1);
+    DeleteObject(fb); DeleteObject(sb);
+    DeleteDC(full); DeleteDC(small);
+    ReleaseDC(nullptr, sdc);
+    return png;
+}
+
+// ---- branches (like TAStudio) -----------------------------------------------------------------------------------------
+// A branch is a saved version of the movie (inputs, notes, RNG seed, controller) plus the frame the game was at and a
+// picture of the game there. Branches are saved in the movie file. Loading one replaces the movie with it as one undo step,
+// rewriting the inputs only from the first frame where they differ, so savestates before that frame stay valid and the
+// game gets there quickly. A branch saved while the game is frozen (savestates on) also keeps a savestate for as long as
+// that game runs, and loading it is then instant.
+const int IDC_BR_LIST = 7000, IDC_BR_SAVE = 7001, IDC_BR_UPDATE = 7002, IDC_BR_LOAD = 7003, IDC_BR_RENAME = 7004, IDC_BR_DEL = 7005,
+          IDC_BR_GHOST = 7006;
+static const int BR_MAX_STATES = 4;                 // branches that may hold a savestate at once (the other slots stay automatic)
+static HWND BrWnd, BrList, BrGhost;
+static HBITMAP BrPic;                                // the selected branch's picture, decoded
+static int BrPicW, BrPicH, BrPicFor = -1;
+bool StatesOn();
+int SaveStateSlot(bool manual);
+
+// The first row where two versions differ (inputs or length); -1 if the inputs are the same.
+static int FirstDiff(const Frames& a, const Frames& b) {
+    size_t n = std::min(a.size(), b.size()), d = 0;
+    while (d < n && a[d] == b[d]) d++;
+    return d == a.size() && d == b.size() ? -1 : (int)d;
+}
+
+// The frame a new branch is saved at: where the frozen game is, else the cursor row (as if rewound to it).
+static uint32_t BranchFrame() {
+    if (A.sess.Active() && A.sess.Alive()) { int r = (int)A.sess.Row(); if (r >= 0) return (uint32_t)r; }
+    return (uint32_t)std::min(A.cursor + 1, Size());
+}
+
+// The branch's savestate still exists in the running game (same slot, not written since).
+static bool BranchStateLive(const Branch& b) {
+    return b.slot >= 0 && b.slot < 8 && b.slotGen && A.ssGen[b.slot] == b.slotGen && StatesOn() && A.sess.StateRow(b.slot) == (int)b.frame;
+}
+
+// A branch keeps its savestate in this slot. Such a slot is never reused for another state, even when an edit makes it
+// stale for the current movie: the branch has its own inputs, and loading the branch makes the state right again.
+static bool BranchHolds(int slot) {
+    for (const Branch& b : A.movie.branches) if (b.slot == slot && BranchStateLive(b)) return true;
+    return false;
+}
+
+static std::string NowText() {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char b[32];
+    sprintf(b, "%04u-%02u-%02u %02u:%02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    return b;
+}
+
+static int BrSelected() { return BrList ? ListView_GetNextItem(BrList, -1, LVNI_SELECTED) : -1; }
+
+// The grid's comparison follows the selected branch while "Show differences in the grid" is ticked.
+static void UpdateGhost() {
+    int g = (BrGhost && SendMessageW(BrGhost, BM_GETCHECK, 0, 0) == BST_CHECKED) ? BrSelected() : -1;
+    if (g != A.ghost) { A.ghost = g; InvalidateRect(A.grid, nullptr, FALSE); }
+}
+
+static void UpdatePicture() {
+    int sel = BrSelected();
+    if (sel == BrPicFor && BrPic) return;
+    if (BrPic) { DeleteObject(BrPic); BrPic = nullptr; }
+    BrPicFor = sel;
+    if (sel >= 0 && sel < (int)A.movie.branches.size() && !A.movie.branches[sel].thumb.empty())
+        BrPic = DecodePng(A.movie.branches[sel].thumb, BrPicW, BrPicH);
+    if (BrWnd) InvalidateRect(BrWnd, nullptr, TRUE);
+}
+
+void RefreshBranchList(int select) {
+    if (!BrList) return;
+    int sel = select == -2 ? BrSelected() : select;
+    SendMessageW(BrList, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(BrList);
+    for (size_t i = 0; i < A.movie.branches.size(); i++) {
+        const Branch& b = A.movie.branches[i];
+        std::wstring name = W(b.name);
+        LVITEMW it{};
+        it.mask = LVIF_TEXT;
+        it.iItem = (int)i;
+        it.pszText = (LPWSTR)name.c_str();
+        SendMessageW(BrList, LVM_INSERTITEMW, 0, (LPARAM)&it);
+        int d = FirstDiff(A.movie.frames, b.frames);
+        std::wstring cols[] = {
+            std::to_wstring(b.frame), std::to_wstring(b.frames.size()),
+            d < 0 ? std::wstring(L"same inputs") : L"frame " + std::to_wstring(d + 1),
+            BranchStateLive(b) ? L"instant" : L"-",
+            b.has_seed ? std::to_wstring(b.seed) : std::wstring(L"-"), b.controller ? L"on" : L"-", W(b.saved),
+        };
+        for (int c = 0; c < 7; c++) ListView_SetItemText(BrList, (int)i, c + 1, (LPWSTR)cols[c].c_str());
+    }
+    if (sel >= 0 && sel < (int)A.movie.branches.size()) {
+        ListView_SetItemState(BrList, sel, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(BrList, sel, FALSE);
+    }
+    SendMessageW(BrList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(BrList, nullptr, TRUE);
+    BrPicFor = -2;              // the branch at that index may be another one now
+    UpdatePicture();
+    UpdateGhost();
+}
+
+// Gives the branch a savestate of the frozen game (it must be frozen at the branch's frame), making room if needed.
+static void KeepBranchState(Branch& b, int self) {
+    b.slot = -1; b.slotGen = 0;
+    if (!StatesOn() || (int)A.sess.Row() != (int)b.frame) return;
+    std::vector<int> holders;
+    for (int i = 0; i < (int)A.movie.branches.size(); i++)
+        if (i != self && BranchStateLive(A.movie.branches[i])) holders.push_back(i);
+    while ((int)holders.size() >= BR_MAX_STATES) {      // the branch whose state is oldest gives its slot back to the automatic states
+        auto it = std::min_element(holders.begin(), holders.end(), [](int x, int y) { return A.movie.branches[x].slotGen < A.movie.branches[y].slotGen; });
+        Branch& o = A.movie.branches[*it];
+        A.ssManual[o.slot] = false;
+        o.slot = -1; o.slotGen = 0;
+        holders.erase(it);
+    }
+    int slot = SaveStateSlot(true);
+    if (slot >= 0) { b.slot = slot; b.slotGen = A.ssGen[slot]; }
+}
+
+// Saves the current movie as a new branch (idx < 0) or over branch idx (keeping its name).
+void SaveBranch(int idx) {
+    if (A.busy) return;
+    Branch b;
+    b.saved = NowText();
+    b.frame = BranchFrame();
+    b.frames = A.movie.frames;
+    b.notes = A.movie.notes;
+    b.notes.resize(b.frames.size());
+    b.has_seed = A.movie.has_seed;
+    b.seed = A.movie.seed;
+    b.controller = A.movie.controller;
+    bool frozen = A.sess.Active() && A.sess.Alive() && (int)A.sess.Row() == (int)b.frame;
+    if (idx < 0) {
+        int n = (int)A.movie.branches.size() + 1;
+        for (;; n++) {          // the first free "Branch N"
+            std::string nm = "Branch " + std::to_string(n);
+            bool used = false;
+            for (const Branch& o : A.movie.branches) if (o.name == nm) used = true;
+            if (!used) { b.name = nm; break; }
+        }
+    } else {
+        if (idx >= (int)A.movie.branches.size()) return;
+        std::wstring q = L"Overwrite \"" + W(A.movie.branches[idx].name) + L"\" with the current movie (frame " + std::to_wstring(b.frame) + L")?";
+        if (MessageBoxW(BrWnd ? BrWnd : A.wnd, q.c_str(), L"Update branch", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        b.name = A.movie.branches[idx].name;
+        if (BranchStateLive(A.movie.branches[idx])) A.ssManual[A.movie.branches[idx].slot] = false;     // its old state goes
+    }
+    if (frozen) {
+        b.thumb = CaptureThumb();
+        KeepBranchState(b, idx);
+    }
+    if (idx < 0) {
+        A.movie.branches.push_back(std::move(b));
+        idx = (int)A.movie.branches.size() - 1;
+    } else A.movie.branches[idx] = std::move(b);
+    const Branch& s = A.movie.branches[idx];
+    A.dirty = true;
+    UpdateTitle();
+    RefreshBranchList(idx);
+    SetMsg(L"Saved branch \"" + W(s.name) + L"\" at frame " + std::to_wstring(s.frame) +
+           (BranchStateLive(s) ? L", with a savestate (loading it is instant while this game runs)." :
+            frozen ? L"." : L" (no game frozen there: no picture, and loading it replays to the frame)."));
+}
+
+void LoadBranch(int idx) {
+    if (A.busy || idx < 0 || idx >= (int)A.movie.branches.size()) return;
+    const Branch b = A.movie.branches[idx];         // a copy: the edit below must not see the list change
+    Frames& cur = A.movie.frames;
+    size_t n = cur.size(), m = b.frames.size(), d = 0;
+    while (d < n && d < m && cur[d] == b.frames[d]) d++;
+    A.movie.notes.resize(n);
+    Notes bn = b.notes;
+    bn.resize(m);
+    Step st;
+    st.cur_before = A.cursor;
+    if (!std::equal(A.movie.notes.begin(), A.movie.notes.begin() + d, bn.begin())) {     // notes before the first input change: a note-only edit
+        Notes nn(bn.begin(), bn.begin() + d);
+        DoSplice(st, 0, d, Frames(cur.begin(), cur.begin() + d), &nn);
+    }
+    if (d < n || d < m) {
+        Notes nn(bn.begin() + d, bn.end());
+        DoSplice(st, d, n - d, Frames(b.frames.begin() + d, b.frames.end()), &nn);
+    }
+    bool settings = b.has_seed != A.movie.has_seed || (b.has_seed && b.seed != A.movie.seed) || b.controller != A.movie.controller;
+    if (settings) {             // the RNG seed and the controller act at the game's start: it has to be relaunched
+        A.movie.has_seed = b.has_seed;
+        A.movie.seed = b.seed;
+        A.movie.controller = b.controller;
+        A.dirty = true;
+        A.reached = 0; StaleStatesAfter(-1);
+    }
+    A.cursor = A.anchor = (int)std::min<size_t>(b.frame ? b.frame - 1 : 0, (size_t)std::max(0, Size() - 1));
+    Commit(st);
+    UpdateScroll(); UpdateTitle(); UpdateStatus();
+    InvalidateRect(A.grid, nullptr, TRUE);
+    std::wstring what = L"Loaded branch \"" + W(b.name) + L"\"" + (d < n || d < m ? L" (inputs differ from frame " + std::to_wstring(d + 1) + L")" : L" (same inputs)") +
+                        (settings ? L"; its RNG seed / controller setting differ, so the game restarts" : L"");
+    bool frozen = A.sess.Active() && A.sess.Alive();
+    if (!settings && frozen && BranchStateLive(b)) {        // its own savestate: the game is back at the branch's frame at once
+        DWORD t0 = GetTickCount();
+        if (A.sess.LoadState(b.slot)) {
+            A.ssStale[b.slot] = false;                      // the state was made with exactly these inputs
+            A.reached = std::max(A.reached, (int)b.frame);
+            RefreshBranchList(idx);
+            SetCursorRow(A.cursor, false);
+            SetMsg(what + L"; the game is at frame " + std::to_wstring(b.frame) + L" (its savestate, " + std::to_wstring(GetTickCount() - t0) + L" ms). Undo (Ctrl+Z) goes back.");
+            return;
+        }
+        A.sess.Close();
+        SetMsg(L"Loading the branch's savestate failed; the game is gone. Rewind (F6) relaunches it.");
+        RefreshBranchList(idx);
+        return;
+    }
+    RefreshBranchList(idx);
+    what += L". Undo (Ctrl+Z) goes back.";
+    if (b.frame > 0 && frozen) { SetMsg(what); JumpTo((int)b.frame - 1); return; }      // the game goes there (savestates make it quick)
+    SetCursorRow(A.cursor, false);
+    SetMsg(what + (b.frame > 0 ? L" Rewind (F6) to take the game to frame " + std::to_wstring(b.frame) + L"." : L""));
+}
+
+void RenameBranch(int idx) {
+    if (idx < 0 || idx >= (int)A.movie.branches.size()) return;
+    std::wstring t = W(A.movie.branches[idx].name);
+    if (!AskText(L"Rename branch", L"Name:", t) || t.empty()) return;
+    A.movie.branches[idx].name = U8(t);
+    A.dirty = true;
+    UpdateTitle();
+    RefreshBranchList(idx);
+}
+
+void DeleteBranch(int idx) {
+    if (idx < 0 || idx >= (int)A.movie.branches.size()) return;
+    std::wstring q = L"Delete branch \"" + W(A.movie.branches[idx].name) + L"\"? This cannot be undone.";
+    if (MessageBoxW(BrWnd ? BrWnd : A.wnd, q.c_str(), L"Delete branch", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    if (BranchStateLive(A.movie.branches[idx])) A.ssManual[A.movie.branches[idx].slot] = false;      // its slot goes back to the automatic states
+    A.movie.branches.erase(A.movie.branches.begin() + idx);
+    A.dirty = true;
+    UpdateTitle();
+    RefreshBranchList(std::min(idx, (int)A.movie.branches.size() - 1));
+}
+
+// The picture pane right of the list.
+static const int BR_PIC_W = 320;
+static RECT BrPicRect(HWND h) {
+    RECT cr;
+    GetClientRect(h, &cr);
+    return RECT{cr.right - S(BR_PIC_W) - S(6), S(36), cr.right - S(6), cr.bottom - S(6)};
+}
+
+LRESULT CALLBACK BranchProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE: {
+            int w = LOWORD(lp), hh = HIWORD(lp), bh = S(30);
+            if (BrList) MoveWindow(BrList, 0, bh + S(4), std::max(0, w - S(BR_PIC_W) - S(12)), std::max(0, hh - bh - S(4)), TRUE);
+            InvalidateRect(h, nullptr, TRUE);
+            return 0;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(h, &ps);
+            RECT pr = BrPicRect(h);
+            SelectObject(dc, A.font);
+            SetBkMode(dc, TRANSPARENT);
+            if (BrPic && BrPicW > 0) {
+                int w = pr.right - pr.left, ht = BrPicH * w / BrPicW;
+                HDC m = CreateCompatibleDC(dc);
+                HGDIOBJ o = SelectObject(m, BrPic);
+                SetStretchBltMode(dc, HALFTONE);
+                SetBrushOrgEx(dc, 0, 0, nullptr);
+                StretchBlt(dc, pr.left, pr.top, w, ht, m, 0, 0, BrPicW, BrPicH, SRCCOPY);
+                SelectObject(m, o);
+                DeleteDC(m);
+            } else {
+                RECT t = pr;
+                DrawTextW(dc, BrSelected() < 0 ? L"Select a branch to see its picture." : L"No picture: the branch was saved without a frozen game.",
+                          -1, &t, DT_WORDBREAK | DT_NOPREFIX);
+            }
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_COMMAND:
+            switch (LOWORD(wp)) {
+                case IDC_BR_SAVE: SaveBranch(-1); break;
+                case IDC_BR_UPDATE: if (BrSelected() >= 0) SaveBranch(BrSelected()); else SetMsg(L"Select the branch to update first."); break;
+                case IDC_BR_LOAD: LoadBranch(BrSelected()); break;
+                case IDC_BR_RENAME: RenameBranch(BrSelected()); break;
+                case IDC_BR_DEL: DeleteBranch(BrSelected()); break;
+                case IDC_BR_GHOST: UpdateGhost(); break;
+            }
+            return 0;
+        case WM_NOTIFY: {
+            NMHDR* nh = (NMHDR*)lp;
+            if (nh->hwndFrom != BrList) break;
+            if (nh->code == NM_DBLCLK) LoadBranch(BrSelected());
+            else if (nh->code == LVN_ITEMCHANGED && (((NMLISTVIEW*)lp)->uChanged & LVIF_STATE)) { UpdatePicture(); UpdateGhost(); }
+            else if (nh->code == LVN_KEYDOWN) {
+                WORD k = ((NMLVKEYDOWN*)lp)->wVKey;
+                if (k == VK_RETURN) LoadBranch(BrSelected());
+                else if (k == VK_DELETE) DeleteBranch(BrSelected());
+                else if (k == VK_F2) RenameBranch(BrSelected());
+            }
+            return 0;
+        }
+        case WM_CLOSE: DestroyWindow(h); return 0;
+        case WM_DESTROY:
+            BrWnd = BrList = BrGhost = nullptr;
+            if (BrPic) { DeleteObject(BrPic); BrPic = nullptr; }
+            BrPicFor = -1;
+            if (A.ghost >= 0) { A.ghost = -1; InvalidateRect(A.grid, nullptr, FALSE); }
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowBranches() {
+    if (BrWnd) { KeepOnScreen(BrWnd); RefreshBranchList(); SetForegroundWindow(BrWnd); return; }
+    RECT pr;
+    GetWindowRect(A.wnd, &pr);
+    RECT r = OnScreen(pr.left + S(80), pr.top + S(110), S(1120), S(380));
+    BrWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmBranches", L"Branches",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
+                            r.left, r.top, r.right - r.left, r.bottom - r.top, A.wnd, nullptr, nullptr, nullptr);
+    if (!BrWnd) return;
+    struct { int id; const wchar_t* t; int w; } bt[] = {
+        {IDC_BR_SAVE, L"Save new branch", 130}, {IDC_BR_UPDATE, L"Update selected", 120}, {IDC_BR_LOAD, L"Load selected", 110},
+        {IDC_BR_RENAME, L"Rename...", 90}, {IDC_BR_DEL, L"Delete", 70},
+    };
+    int x = S(4);
+    for (auto& e : bt) {
+        HWND b = CreateWindowExW(0, L"BUTTON", e.t, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                 x, S(2), S(e.w), S(26), BrWnd, (HMENU)(INT_PTR)e.id, nullptr, nullptr);
+        SendMessageW(b, WM_SETFONT, (WPARAM)A.font, TRUE);
+        x += S(e.w) + S(4);
+    }
+    BrGhost = CreateWindowExW(0, L"BUTTON", L"Show differences in the grid", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                              x + S(8), S(4), S(220), S(22), BrWnd, (HMENU)(INT_PTR)IDC_BR_GHOST, nullptr, nullptr);
+    SendMessageW(BrGhost, WM_SETFONT, (WPARAM)A.font, TRUE);
+    BrList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                             0, 0, 0, 0, BrWnd, (HMENU)(INT_PTR)IDC_BR_LIST, nullptr, nullptr);
+    SendMessageW(BrList, WM_SETFONT, (WPARAM)A.font, TRUE);
+    ListView_SetExtendedListViewStyle(BrList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    struct { const wchar_t* t; int w; } cols[] = {
+        {L"Name", 150}, {L"Frame", 55}, {L"Length", 55}, {L"Differs from the movie at", 150}, {L"Load", 55}, {L"RNG seed", 80}, {L"Pad", 40}, {L"Saved", 130},
+    };
+    for (int c = 0; c < 8; c++) {
+        LVCOLUMNW lc{};
+        lc.mask = LVCF_TEXT | LVCF_WIDTH;
+        lc.pszText = (LPWSTR)cols[c].t;
+        lc.cx = S(cols[c].w);
+        SendMessageW(BrList, LVM_INSERTCOLUMNW, c, (LPARAM)&lc);
+    }
+    RECT cr;
+    GetClientRect(BrWnd, &cr);
+    SendMessageW(BrWnd, WM_SIZE, 0, MAKELPARAM(cr.right, cr.bottom));
+    RefreshBranchList(A.movie.branches.empty() ? -1 : 0);
+}
+
 // ---- game memory window -------------------------------------------------------
 // Reads the running COTM.exe (any instance, frozen or live) with ReadProcessMemory every 100 ms.
 // Pointer chains are from the community cheat table: dereference *(exe+root), then for each offset
 // in reverse order dereference (p + off), and add the last one without dereferencing.
-enum MemKind { MK_U8, MK_U32, MK_F32, MK_HEX };
+enum MemKind { MK_U8, MK_U32, MK_F32, MK_HEX, MK_BOSSHP, MK_BOSSMAX };   // the last two come from the boss finder, not a pointer chain
 struct MemField { const wchar_t* name; uint32_t root; std::vector<uint32_t> xml; MemKind kind; };
 const std::vector<MemField>& MemFields() {
     static const std::vector<uint32_t> pl = {0x84, 0x08, 0x20, 0x20, 0x6C, 0x08};
@@ -816,6 +1599,8 @@ const std::vector<MemField>& MemFields() {
         {L"RNG state y",     0x48365C, {0x2F8}, MK_HEX},
         {L"RNG state z",     0x48365C, {0x2FC}, MK_HEX},
         {L"RNG state w",     0x48365C, {0x300}, MK_HEX},
+        {L"Boss HP",         0, {0}, MK_BOSSHP},
+        {L"Boss max HP",     0, {0}, MK_BOSSMAX},
     };
     return f;
 }
@@ -854,7 +1639,100 @@ bool ReadU32(const GameProc& gp, uintptr_t a, uint32_t& v) {
 }
 
 // Returns the text for one field, or "-" if the chain cannot be followed (menu, loading, no stage).
+// ---- boss finder ------------------------------------------------------------------------------------------
+// The boss is not reachable from a fixed pointer chain, so a background thread looks for it in the game's
+// heap: an object whose first dword is a known boss vtable (BOSS_VTABLES, RVAs in COTM.exe) and whose
+// health fields look right (HP at +0x3DC, max HP at +0x3E0; the same layout as the player). It keeps the
+// address while the object stays valid and scans again when it is gone (a new boss, a new launch).
+// Found with a memory search during the stage 1 boss of test3.bscotm: HP 120, minus 7 per sub-weapon hit.
+static const uint32_t BOSS_VTABLES[] = {0x39B99C};      // stage 1 boss
+static const uint32_t BOSS_HP_OFF = 0x3DC, BOSS_MAX_OFF = 0x3E0;
+static volatile uint32_t BossObj;                        // 0 = none found
+static volatile LONG BossStop;
+static HANDLE BossThread;
+static bool OpenGameProc(GameProc& g, int tries = 100);
+
+static bool BossValid(HANDLE h, uint32_t base, uint32_t obj) {
+    uint32_t vt = 0, hp = 0, mx = 0;
+    SIZE_T g;
+    if (!ReadProcessMemory(h, (void*)(uintptr_t)obj, &vt, 4, &g) || g != 4) return false;
+    bool known = false;
+    for (uint32_t rva : BOSS_VTABLES) if (vt == base + rva) known = true;
+    if (!known) return false;
+    if (!ReadProcessMemory(h, (void*)(uintptr_t)(obj + BOSS_HP_OFF), &hp, 4, &g) || g != 4) return false;
+    if (!ReadProcessMemory(h, (void*)(uintptr_t)(obj + BOSS_MAX_OFF), &mx, 4, &g) || g != 4) return false;
+    return mx >= 2 && mx <= 100000 && hp <= mx;
+}
+
+static uint32_t BossScan(HANDLE h, uint32_t base) {
+    std::vector<uint8_t> buf;
+    for (uintptr_t a = 0; a < 0x7FFE0000 && !BossStop;) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQueryEx(h, (void*)a, &mbi, sizeof mbi)) break;
+        uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) && !(mbi.Protect & PAGE_GUARD)) {
+            buf.resize(mbi.RegionSize);
+            SIZE_T g = 0;
+            if (ReadProcessMemory(h, mbi.BaseAddress, buf.data(), mbi.RegionSize, &g))
+                for (size_t o = 0; o + 4 <= g; o += 4) {
+                    uint32_t v;
+                    memcpy(&v, &buf[o], 4);
+                    for (uint32_t rva : BOSS_VTABLES)
+                        if (v == base + rva && BossValid(h, base, (uint32_t)((uintptr_t)mbi.BaseAddress + o))) return (uint32_t)((uintptr_t)mbi.BaseAddress + o);
+                }
+        }
+        a = next;
+    }
+    return 0;
+}
+
+static DWORD WINAPI BossProc(LPVOID) {
+    HANDLE h = nullptr;
+    uint32_t base = 0;
+    DWORD pid = 0;
+    while (!BossStop) {
+        if (h && WaitForSingleObject(h, 0) != WAIT_TIMEOUT) { CloseHandle(h); h = nullptr; BossObj = 0; }
+        if (!h) {
+            GameProc probe;
+            // find COTM.exe without keeping the memory window's handle: OpenGameProc opens its own
+            if (OpenGameProc(probe, 1)) {
+                pid = probe.pid;
+                base = (uint32_t)probe.base;
+                CloseHandle(probe.h);
+                h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE, FALSE, pid);
+            }
+        }
+        if (h) {
+            uint32_t obj = BossObj;
+            if (!obj || !BossValid(h, base, obj)) BossObj = obj = BossScan(h, base);
+            Sleep(obj ? 250 : 700);
+        } else {
+            Sleep(500);
+        }
+    }
+    if (h) CloseHandle(h);
+    return 0;
+}
+
+static void StartBossFinder() {
+    if (BossThread) return;
+    BossStop = 0;
+    BossThread = CreateThread(nullptr, 0, BossProc, nullptr, 0, nullptr);
+}
+static void StopBossFinder() {
+    if (!BossThread) return;
+    BossStop = 1;
+    WaitForSingleObject(BossThread, 3000);
+    CloseHandle(BossThread);
+    BossThread = nullptr;
+    BossObj = 0;
+}
 std::wstring ReadField(const GameProc& gp, const MemField& f) {
+    if (f.kind == MK_BOSSHP || f.kind == MK_BOSSMAX) {            // from the boss finder
+        uint32_t obj = BossObj, v = 0;
+        if (!obj || !ReadU32(gp, obj + (f.kind == MK_BOSSHP ? BOSS_HP_OFF : BOSS_MAX_OFF), v)) return L"-";
+        return std::to_wstring(v);
+    }
     uint32_t p = 0;
     if (!ReadU32(gp, gp.base + f.root, p) || !p) return L"-";
     for (size_t i = f.xml.size() - 1; i > 0; i--)
@@ -881,6 +1759,211 @@ std::wstring ReadField(const GameProc& gp, const MemField& f) {
     return b;
 }
 
+// ---- value history (graph and CSV) -------------------------------------------------------------------
+// The hook samples the player's values at every frame marker while the box is ticked; the editor copies the
+// samples from the shared memory. Frames are movie frames: the state after that frame.
+static Shm* OpenLogShm();
+bool PickFile(bool save, const wchar_t* filter, const wchar_t* ext, std::wstring& io, const std::wstring& dir);
+struct HistRow { int frame; uint32_t v[HIST_FIELDS]; };
+static std::vector<HistRow> Hist;
+static uint32_t HistLast;
+static const wchar_t* const HIST_NAMES[HIST_FIELDS] = {L"Health", L"Weapon points", L"Score", L"X speed", L"Y speed", L"X position", L"Y position", L"Invisibility"};
+static const bool HIST_FLOAT[HIST_FIELDS] = {false, false, false, true, true, true, true, true};
+
+static bool HistValue(const HistRow& r, int f, double& out) {
+    if (HIST_FLOAT[f]) {
+        float x;
+        memcpy(&x, &r.v[f], 4);
+        if (x != x) return false;
+        out = x;
+        return true;
+    }
+    if (r.v[f] == 0xFFFFFFFFu) return false;
+    out = r.v[f];
+    return true;
+}
+
+void RefreshGraph();
+
+void RefreshHistory() {
+    Shm* s = OpenLogShm();
+    if (!s) return;
+    s->hist_on = A.histOn ? 1 : 0;
+    uint32_t n = s->hist_n;
+    if (n < HistLast) { Hist.clear(); HistLast = 0; }              // the game was relaunched: new history
+    if (n - HistLast > HIST_MAX) HistLast = n - HIST_MAX;           // fell behind (old samples were overwritten)
+    if (n == HistLast) return;
+    for (uint32_t i = HistLast; i < n; i++) {
+        const HistEntry& e = s->hist_buf[i & (HIST_MAX - 1)];
+        int fr = (int)e.frame - 1 - A.logPre;                       // state after this movie frame
+        if (fr < 1) continue;
+        HistRow r;
+        r.frame = fr;
+        memcpy(r.v, e.v, sizeof r.v);
+        Hist.push_back(r);
+    }
+    HistLast = n;
+    if (Hist.size() > 400000) Hist.erase(Hist.begin(), Hist.begin() + 100000);
+    RefreshGraph();
+}
+
+static void HistSaveCsv() {
+    std::wstring p;
+    if (!PickFile(true, L"CSV (*.csv)\0*.csv\0", L"csv", p, A.root)) return;
+    FILE* f = _wfopen(p.c_str(), L"wb");
+    if (!f) { MessageBoxW(A.wnd, L"Cannot write the file.", L"Value history", MB_ICONERROR); return; }
+    fputs("frame", f);
+    for (int i = 0; i < HIST_FIELDS; i++) { std::string n = U8(HIST_NAMES[i]); for (char& c : n) if (c == ' ') c = '_'; fprintf(f, ",%s", n.c_str()); }
+    fputs("\r\n", f);
+    for (const HistRow& r : Hist) {
+        fprintf(f, "%d", r.frame);
+        for (int i = 0; i < HIST_FIELDS; i++) {
+            double v;
+            if (!HistValue(r, i, v)) fputs(",", f);
+            else if (HIST_FLOAT[i]) fprintf(f, ",%.4f", v);
+            else fprintf(f, ",%.0f", v);
+        }
+        fputs("\r\n", f);
+    }
+    fclose(f);
+    SetMsg(L"Saved " + std::to_wstring(Hist.size()) + L" frames of values to " + p);
+}
+
+// The graph: every selected value as a line over the frames, each scaled to the full height (the legend
+// shows its range); move the mouse over the plot to read the values of one frame.
+static int GraphMouseX = -1;
+static const COLORREF GRAPH_COLORS[HIST_FIELDS] = {RGB(200, 40, 40), RGB(40, 120, 200), RGB(120, 120, 120), RGB(30, 150, 60),
+                                                    RGB(220, 130, 20), RGB(130, 60, 190), RGB(20, 160, 170), RGB(170, 90, 90)};
+
+static RECT GraphPlotRect(HWND h) {
+    RECT rc;
+    GetClientRect(h, &rc);
+    rc.left = S(190) + S(8); rc.top = S(60); rc.right -= S(10); rc.bottom -= S(26);
+    return rc;
+}
+
+void RefreshGraph() { if (A.graphWnd) InvalidateRect(A.graphWnd, nullptr, FALSE); }
+
+static void PaintGraph(HWND h) {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    RECT cr;
+    GetClientRect(h, &cr);
+    HDC m = CreateCompatibleDC(dc);
+    HBITMAP bm = CreateCompatibleBitmap(dc, cr.right, cr.bottom);
+    HGDIOBJ old = SelectObject(m, bm);
+    Fill(m, 0, 0, cr.right, cr.bottom, cBg);
+    SelectObject(m, A.font);
+    SetBkMode(m, TRANSPARENT);
+    RECT pr = GraphPlotRect(h);
+    int pw = pr.right - pr.left, ph = pr.bottom - pr.top;
+    std::vector<int> sel;
+    for (int i = 0; i < HIST_FIELDS; i++) if (SendMessageW(A.graphList, LB_GETSEL, i, 0) > 0) sel.push_back(i);
+    HPEN frame = CreatePen(PS_SOLID, 1, cLine60);
+    HGDIOBJ op = SelectObject(m, frame);
+    MoveToEx(m, pr.left, pr.top, nullptr); LineTo(m, pr.left, pr.bottom); LineTo(m, pr.right, pr.bottom);
+    SelectObject(m, op);
+    DeleteObject(frame);
+    if (Hist.empty() || sel.empty() || pw < 10 || ph < 10) {
+        std::wstring msg = Hist.empty() ? L"No values yet. Tick \"Record history\" in the Memory window, then step or jump." : L"Select one or more values on the left.";
+        Text(m, msg.c_str(), RECT{pr.left + S(10), pr.top + S(10), pr.right, pr.top + S(40)}, DT_LEFT, RGB(90, 90, 90));
+    } else {
+        int f0 = Hist.front().frame, f1 = Hist.back().frame;
+        if (f1 <= f0) f1 = f0 + 1;
+        wchar_t b[96];
+        swprintf(b, 96, L"%d", f0);
+        Text(m, b, RECT{pr.left, pr.bottom + S(4), pr.left + S(100), pr.bottom + S(22)}, DT_LEFT, RGB(60, 60, 60));
+        swprintf(b, 96, L"frame %d", f1);
+        Text(m, b, RECT{pr.right - S(120), pr.bottom + S(4), pr.right, pr.bottom + S(22)}, DT_RIGHT, RGB(60, 60, 60));
+        int hover = -1;
+        if (GraphMouseX >= pr.left && GraphMouseX <= pr.right) {
+            int fr = f0 + (int)((double)(GraphMouseX - pr.left) / pw * (f1 - f0) + 0.5);
+            size_t lo = 0, hi = Hist.size() - 1;
+            while (lo < hi) { size_t mid = (lo + hi) / 2; if (Hist[mid].frame < fr) lo = mid + 1; else hi = mid; }
+            hover = (int)lo;
+        }
+        int lx = pr.left + S(4);
+        for (int f : sel) {
+            double mn = 1e300, mx = -1e300;
+            for (const HistRow& r : Hist) { double v; if (HistValue(r, f, v)) { mn = std::min(mn, v); mx = std::max(mx, v); } }
+            if (mn > mx) continue;
+            if (mx - mn < 1e-9) { mn -= 1; mx += 1; }
+            HPEN pen = CreatePen(PS_SOLID, 2, GRAPH_COLORS[f]);
+            HGDIOBJ op2 = SelectObject(m, pen);
+            bool started = false;
+            size_t step = std::max<size_t>(1, Hist.size() / (size_t)(pw * 2));
+            for (size_t i = 0; i < Hist.size(); i += step) {
+                double v;
+                if (!HistValue(Hist[i], f, v)) { started = false; continue; }
+                int x = pr.left + (int)((double)(Hist[i].frame - f0) / (f1 - f0) * pw);
+                int y = pr.bottom - (int)((v - mn) / (mx - mn) * ph);
+                if (!started) { MoveToEx(m, x, y, nullptr); started = true; } else LineTo(m, x, y);
+            }
+            SelectObject(m, op2);
+            DeleteObject(pen);
+            std::wstring name = HIST_NAMES[f];
+            swprintf(b, 96, L"%ls  [%g .. %g]", name.c_str(), mn, mx);
+            Fill(m, lx, S(8), lx + S(10), S(18), GRAPH_COLORS[f]);
+            Text(m, b, RECT{lx + S(14), S(4), lx + S(260), S(22)}, DT_LEFT, RGB(30, 30, 30));
+            lx += S(250);
+            if (lx > cr.right - S(260)) lx = pr.left + S(4);
+        }
+        if (hover >= 0) {
+            const HistRow& r = Hist[hover];
+            int x = pr.left + (int)((double)(r.frame - f0) / (f1 - f0) * pw);
+            HPEN hp = CreatePen(PS_SOLID, 1, RGB(120, 120, 120));
+            HGDIOBJ o3 = SelectObject(m, hp);
+            MoveToEx(m, x, pr.top, nullptr); LineTo(m, x, pr.bottom);
+            SelectObject(m, o3);
+            DeleteObject(hp);
+            std::wstring line = L"frame " + std::to_wstring(r.frame);
+            for (int f : sel) { double v; wchar_t t[64]; if (HistValue(r, f, v)) swprintf(t, 64, L"   %ls %g", HIST_NAMES[f], v); else swprintf(t, 64, L"   %ls -", HIST_NAMES[f]); line += t; }
+            Text(m, line.c_str(), RECT{pr.left + S(4), S(28), cr.right - S(8), S(48)}, DT_LEFT, RGB(30, 30, 30));
+        }
+    }
+    BitBlt(dc, 0, 0, cr.right, cr.bottom, m, 0, 0, SRCCOPY);
+    SelectObject(m, old);
+    DeleteObject(bm);
+    DeleteDC(m);
+    EndPaint(h, &ps);
+}
+
+LRESULT CALLBACK GraphProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE:
+            if (A.graphList) MoveWindow(A.graphList, 0, 0, S(190), HIWORD(lp), TRUE);
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        case WM_COMMAND:
+            if (HIWORD(wp) == LBN_SELCHANGE) InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        case WM_MOUSEMOVE: GraphMouseX = (short)LOWORD(lp); InvalidateRect(h, nullptr, FALSE); return 0;
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: PaintGraph(h); return 0;
+        case WM_CLOSE: DestroyWindow(h); return 0;
+        case WM_DESTROY: A.graphWnd = A.graphList = nullptr; return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowGraph() {
+    if (A.graphWnd) { KeepOnScreen(A.graphWnd); SetForegroundWindow(A.graphWnd); return; }
+    RECT pr;
+    GetWindowRect(A.wnd, &pr);
+    RECT gr = OnScreen(pr.left + S(80), pr.top + S(100), S(900), S(500));
+    A.graphWnd = CreateWindowExW(0, L"BscotmGraph", L"Value graph", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                 gr.left, gr.top, gr.right - gr.left, gr.bottom - gr.top, A.wnd, nullptr, nullptr, nullptr);
+    if (!A.graphWnd) return;
+    A.graphList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_MULTIPLESEL,
+                                  0, 0, 0, 0, A.graphWnd, nullptr, nullptr, nullptr);
+    SendMessageW(A.graphList, WM_SETFONT, (WPARAM)A.font, TRUE);
+    for (int i = 0; i < HIST_FIELDS; i++) SendMessageW(A.graphList, LB_ADDSTRING, 0, (LPARAM)HIST_NAMES[i]);
+    SendMessageW(A.graphList, LB_SETSEL, TRUE, 3);       // X speed and Y speed to start with
+    SendMessageW(A.graphList, LB_SETSEL, TRUE, 4);
+    RECT cr;
+    GetClientRect(A.graphWnd, &cr);
+    SendMessageW(A.graphWnd, WM_SIZE, 0, MAKELPARAM(cr.right, cr.bottom));
+}
 void RefreshMemory() {
     if (!A.memList) return;
     bool on = AttachGame();
@@ -892,17 +1975,31 @@ void RefreshMemory() {
         if (v != cur) ListView_SetItemText(A.memList, (int)i, 1, (LPWSTR)v.c_str());
     }
     SetWindowTextW(A.memWnd, on ? L"Game memory" : L"Game memory (game not running)");
+    RefreshHistory();
 }
 
 LRESULT CALLBACK MemProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-        case WM_SIZE:
-            if (A.memList) MoveWindow(A.memList, 0, 0, LOWORD(lp), HIWORD(lp), TRUE);
+        case WM_SIZE: {
+            int top = S(34);
+            if (A.memList) MoveWindow(A.memList, 0, top, LOWORD(lp), std::max(0, (int)HIWORD(lp) - top), TRUE);
+            return 0;
+        }
+        case WM_COMMAND:
+            switch (LOWORD(wp)) {
+                case IDC_MEM_HIST: A.histOn = SendMessageW((HWND)lp, BM_GETCHECK, 0, 0) == BST_CHECKED; RefreshHistory(); break;
+                case IDC_MEM_GRAPH: ShowGraph(); break;
+                case IDC_MEM_CSV: HistSaveCsv(); break;
+                case IDC_MEM_CLR: Hist.clear(); RefreshGraph(); break;
+            }
             return 0;
         case WM_TIMER: RefreshMemory(); return 0;
         case WM_CLOSE: DestroyWindow(h); return 0;
         case WM_DESTROY:
             KillTimer(h, 1);
+            StopBossFinder();
+            A.histOn = false;
+            if (OpenLogShm()) OpenLogShm()->hist_on = 0;
             A.memWnd = A.memList = nullptr;
             if (gp.h) { CloseHandle(gp.h); gp = GameProc(); }
             return 0;
@@ -911,13 +2008,23 @@ LRESULT CALLBACK MemProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowMemory() {
-    if (A.memWnd) { SetForegroundWindow(A.memWnd); return; }
+    if (A.memWnd) { KeepOnScreen(A.memWnd); SetForegroundWindow(A.memWnd); return; }
     RECT pr;
     GetWindowRect(A.wnd, &pr);
+    RECT r = OnScreen(pr.right - S(440), pr.top + S(60), S(420), S(700));
     A.memWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmMem", L"Game memory",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
-                               pr.right - S(340), pr.top + S(90), S(320), S(600), A.wnd, nullptr, nullptr, nullptr);
+                               r.left, r.top, r.right - r.left, r.bottom - r.top, A.wnd, nullptr, nullptr, nullptr);
     if (!A.memWnd) return;
+    HWND hchk = CreateWindowExW(0, L"BUTTON", L"Record history", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                S(8), S(6), S(130), S(22), A.memWnd, (HMENU)(INT_PTR)IDC_MEM_HIST, nullptr, nullptr);
+    HWND hgr = CreateWindowExW(0, L"BUTTON", L"Graph...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                               S(144), S(4), S(80), S(26), A.memWnd, (HMENU)(INT_PTR)IDC_MEM_GRAPH, nullptr, nullptr);
+    HWND hcs = CreateWindowExW(0, L"BUTTON", L"Save CSV...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                               S(228), S(4), S(96), S(26), A.memWnd, (HMENU)(INT_PTR)IDC_MEM_CSV, nullptr, nullptr);
+    HWND hcl = CreateWindowExW(0, L"BUTTON", L"Clear", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                               S(328), S(4), S(70), S(26), A.memWnd, (HMENU)(INT_PTR)IDC_MEM_CLR, nullptr, nullptr);
+    for (HWND c : {hchk, hgr, hcs, hcl}) SendMessageW(c, WM_SETFONT, (WPARAM)A.font, TRUE);
     A.memList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                 WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER,
                                 0, 0, 0, 0, A.memWnd, nullptr, nullptr, nullptr);
@@ -942,8 +2049,9 @@ void ShowMemory() {
     }
     RECT cr;
     GetClientRect(A.memWnd, &cr);
-    MoveWindow(A.memList, 0, 0, cr.right, cr.bottom, TRUE);
+    SendMessageW(A.memWnd, WM_SIZE, 0, MAKELPARAM(cr.right, cr.bottom));
     RefreshMemory();
+    StartBossFinder();
     SetTimer(A.memWnd, 1, 100, nullptr);
 }
 
@@ -1073,12 +2181,13 @@ LRESULT CALLBACK RngProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowRngLog() {
-    if (A.rngWnd) { SetForegroundWindow(A.rngWnd); return; }
+    if (A.rngWnd) { KeepOnScreen(A.rngWnd); SetForegroundWindow(A.rngWnd); return; }
     RECT pr;
     GetWindowRect(A.wnd, &pr);
+    RECT rr = OnScreen(pr.left + S(60), pr.top + S(120), S(760), S(480));
     A.rngWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"BscotmRng", L"RNG log",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
-                               pr.left + S(60), pr.top + S(120), S(760), S(480), A.wnd, nullptr, nullptr, nullptr);
+                               rr.left, rr.top, rr.right - rr.left, rr.bottom - rr.top, A.wnd, nullptr, nullptr, nullptr);
     if (!A.rngWnd) return;
     HWND chk = CreateWindowExW(0, L"BUTTON", L"Log the game's random draws", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                S(8), S(6), S(210), S(22), A.rngWnd, (HMENU)(INT_PTR)IDC_RNG_CHK, nullptr, nullptr);
@@ -1108,6 +2217,185 @@ void ShowRngLog() {
     LogLast = LogShm ? LogShm->rng_log_n : 0;     // only draws from now on
     SetTimer(A.rngWnd, 1, 150, nullptr);
 }
+// ---- Help window ------------------------------------------------------------------------------------
+// A guide for people who have not used the tool: topics on the left, text on the right. The text is part
+// of the program so it is always there and always matches this version.
+const wchar_t* const APP_VERSION = L"0.8.0";
+
+struct HelpTopic { const wchar_t* title; const wchar_t* text; };
+const HelpTopic HELP_TOPICS[] = {
+    {L"Getting started",
+     L"What this is\r\n"
+     L"bscotm-tas is a TAStudio-style editor for Bloodstained: Curse of the Moon (Steam, version 1.1.2). A movie is a list of frames; each frame says which keys are held. The tool starts the game, feeds it the movie one frame at a time, and lets you step, rewind and re-record.\r\n\r\n"
+     L"First run\r\n"
+     L"1. Put bscotm_tas.exe and bscotm_hook.dll in the same folder (the DLL is injected into the game).\r\n"
+     L"2. Start bscotm_tas.exe. It looks for Bloodstained Curse of the Moon\\exe\\COTM.exe in the folders above it. If it cannot find it, use File > Set game path.\r\n"
+     L"3. Close the game if it is running. The tool starts its own copy and closes it when a new run starts.\r\n\r\n"
+     L"Baseline and prelude\r\n"
+     L"Baseline: a copy of the game's save files that is restored before every launch, so every run starts from the same state. Make one with File > Save current game saves as baseline (the game must be closed).\r\n"
+     L"Prelude: the input that takes the game from launch to the first controllable frame (menus). It is played before your movie. Record it once, then File > Save as prelude.\r\n"
+     L"Choose both in the two drop-downs at the top.\r\n\r\n"
+     L"Your first movie\r\n"
+     L"Press Record new (F8), click the game window and play. Press Stop (F9) when you are done, then File > Save (Ctrl+S).\r\n"
+     L"To edit it: press Rewind to cursor (F6) to get the game to the cursor row, then step with the period key or paint keys in the grid."},
+    {L"Recording and playing",
+     L"Record new (F8): relaunch the game and record your keyboard from its first frame.\r\n"
+     L"Play (F5): relaunch the game and play the whole movie in real time.\r\n"
+     L"Rewind to cursor (F6): relaunch, fast-forward to the cursor row and freeze the game there.\r\n"
+     L"Double-click a frame number: go to that frame. If the frozen game has not reached it yet it just runs forward from where it is; if the game is past it, or a frame before the game's position was edited, it rewinds.\r\n"
+     L"Record from cursor (F7): play to the cursor row, then record live from the next frame.\r\n"
+     L"Record here (F12): unfreeze the game and record your keyboard from the frozen frame. Stop (F9) freezes it again.\r\n"
+     L"Resume live (F11): unfreeze the game and take over with the keyboard (not recorded).\r\n"
+     L"Stop (F9): end the current run.\r\n\r\n"
+     L"Fast-forward\r\n"
+     L"Rewind and the jumps run the game faster than real time. The speed is in Run > Fast-forward speed (default: Max, as fast as the game can run, about 25-30x). The game window may look frozen or garbled while it fast-forwards; audio is garbled too. Only the last frames before the stopping point are drawn.\r\n\r\n"
+     L"The game window\r\n"
+     L"The game accepts the tool's input even when the editor has focus. To type into the game yourself (Record here, Resume live), click the game window first."},
+    {L"Frame advance and run",
+     L"Frame advance (the period key): run exactly one frame of the frozen game using the next grid row's inputs. Hold the key to repeat. The game is held at a frame boundary before that frame reads its input, so you can still edit the row.\r\n\r\n"
+     L"Run to cursor (F4, or right-click a row): advance the frozen game through many frames at once, up to the cursor row, using the grid's inputs. It runs at the fast-forward speed and gives the same result as stepping one by one. Stop (F9) cancels. Past the end of the movie it appends blank frames. If the game is already past the cursor, use Rewind.\r\n\r\n"
+     L"Greenzone\r\n"
+     L"Green frame numbers are frames the live game has been advanced through. Editing a frame before the game's position makes the later green frames invalid: the next advance first replays from the start to the edge of the green area, then steps.\r\n\r\n"
+     L"Going back\r\n"
+     L"The game cannot step backwards. To go back, move the cursor and Rewind (F6): it relaunches the game and fast-forwards to the cursor. A launch takes about 1.5 s; the replay runs at roughly 1700-2000 frames per second at Max, and gives exactly the same result at every speed."},
+    {L"Editing frames",
+     L"Painting: click or drag on a key cell to toggle it. Rows past the end extend the movie.\r\n"
+     L"Selecting rows: click a frame number; Shift+click or drag to extend.\r\n"
+     L"Delete clears inputs. Insert inserts blank frames. Ctrl+Delete removes frames.\r\n"
+     L"Ctrl+C / Ctrl+X copy and cut. Ctrl+V pastes over; Ctrl+Shift+V pastes as inserted frames.\r\n"
+     L"Ctrl+Z / Ctrl+Y undo and redo. Ctrl+A selects all.\r\n\r\n"
+     L"Notes\r\n"
+     L"Right-click a row (or use the Edit menu) to add a note to that frame. Notes show in the Note column and as an orange flag. Edit > Notes list opens every note; double-click jumps to it. Notes move with their frames on insert, delete, cut and paste and are saved in the movie file.\r\n\r\n"
+     L"Finding\r\n"
+     L"The grid has one column per key the tool tracks: arrows, A D W S, jump (space), attack (left mouse), sub-weapon (right mouse), Q, E, P, Enter and Esc."},
+    {L"Bookmarks and jumping",
+     L"A bookmark is a named frame you can jump back to. Ctrl+B (or right-click > Add bookmark here) names the cursor frame; it shows with a purple flag and a star. Ctrl+Shift+B removes it.\r\n\r\n"
+     L"F2 / Shift+F2: jump to the next / previous bookmark.\r\n"
+     L"Ctrl+G: jump to any frame number.\r\n"
+     L"Edit > Bookmarks list: every bookmark; double-click or Enter jumps there, Delete removes it.\r\n\r\n"
+     L"What a jump does\r\n"
+     L"Forward (the frozen game has not reached the frame yet): the game just runs ahead at the fast-forward speed, no restart. Backward, or no game running: the game restarts and fast-forwards to the frame.\r\n\r\n"
+     L"Bookmarks are frame notes with a flag, so they move with their frames, are covered by undo and are saved in the movie file."},
+    {L"Branches",
+     L"The Branches button in the menu bar opens a list of saved versions of the movie, for trying ideas side by side (like TAStudio's branches).\r\n\r\n"
+     L"Save new branch: keeps the current inputs, notes, RNG seed and controller setting, and the frame the frozen game is at (or the cursor row).\r\n"
+     L"Load selected (or double-click, or Enter): puts that version back as one undo step (Ctrl+Z goes back) and takes the frozen game to the branch's frame. Only the inputs from the first frame where they differ are rewritten, so savestates before it stay valid and the jump is quick. A different RNG seed or controller setting restarts the game.\r\n"
+     L"Update selected: overwrites the branch with the current movie. Rename (F2), Delete.\r\n\r\n"
+     L"The list shows each branch's frame, length, the frame where it first differs from the current movie, whether it loads instantly, its seed and controller setting, and when it was saved. Branches are saved in the movie file.\r\n\r\n"
+     L"Instant loading: a branch saved while the game is frozen at its frame (with savestates on) keeps a savestate of that moment for as long as this game runs, and loading it puts the game back at once (Load column: instant). Up to 4 branches hold one; a fifth takes the oldest one's slot. After the game is relaunched a branch loads by replaying from the nearest valid state.\r\n\r\n"
+     L"Picture: saving a branch while the game is frozen keeps a small picture of the game (saved in the file), shown right of the list.\r\n\r\n"
+     L"Show differences in the grid: rows whose inputs differ from the selected branch get an orange mark beside the frame number, and keys the branch presses that the movie does not are outlined in orange."},
+    {L"Choosing the input columns",
+     L"Right-click the column headings (or View > Columns) for a check list of every input column. Untick a column to hide it, tick it to show it again.\r\n\r\n"
+     L"Presets at the top: show all columns, keyboard columns only, controller columns only (with the controller on), or only the columns this movie uses. In the list, every key the movie presses somewhere is marked (used).\r\n\r\n"
+     L"Hiding a column only hides it from the grid: its inputs stay in the movie and are still played. The choice is remembered (bscotm_tas.ini). The grid scrolls sideways when the columns do not fit."},
+    {L"Controller",
+     L"Run > Controller (virtual Xbox 360 pad) makes the game see one Xbox 360 controller. The grid then gets 24 more columns (blue headings, scroll sideways): pA pB pX pY (face buttons), LB RB, Bk St (Back, Start), LS RS (stick clicks), dU dR dD dL (D-pad), LsL LsR LsU LsD and RsL RsR RsU RsD (left / right stick pushed past half way), LT RT (triggers).\r\n\r\n"
+     L"The game's default Xbox buttons: move = D-pad or left stick, jump = pA, attack = pX, sub-weapon = pY, switch character = LB / RB, pause = St, confirm = pA, cancel = pB.\r\n\r\n"
+     L"Playing a movie feeds the pad from these columns, so a replay needs no controller. Recording (Record new, Record from cursor, Record here) reads your real controller, the first one Windows finds; the game gets exactly what is recorded (sticks and triggers as on / off, the way the game itself reads them), so a replay matches the recording. Keyboard and controller keys can be mixed in one movie.\r\n\r\n"
+     L"With the controller off the game sees no controller at all, even if one is plugged in, so it cannot disturb a keyboard movie. The setting is saved in the movie; changing it restarts the game on the next Rewind. Turning it off keeps any controller inputs in the movie (hidden, ignored)."},
+    {L"RNG seed and RNG log",
+     L"How the game's randomness works\r\n"
+     L"The game uses one random number generator, seeded from the clock (Unix time in seconds) when it starts. Launch the same movie one second later and the random numbers differ, so drops and enemy behaviour can differ.\r\n\r\n"
+     L"RNG seed (Run > RNG seed)\r\n"
+     L"Set a number from 0 to 4294967295 (avoid 0: it makes the generator stick at zero). The game then sees a frozen clock at that time, so every launch gets the same random numbers. The seed is saved in the movie. The status bar shows it. Changing it restarts the game on the next Rewind or advance. Seeds one second apart behave almost the same, so try seeds far apart.\r\n\r\n"
+     L"RNG log (menu bar)\r\n"
+     L"Opens a window that lists every random draw the game makes in the frames near where you stop (the last 300 frames of a Rewind, Run to cursor or Jump, and every frame you advance by hand). Tick Log the game's random draws, then step or jump as usual. Each row shows the frame, the code that made the draw, the range asked for (100 for an item-drop roll), the result and the generator state. A frame with no rows made no draws. Save CSV exports the list.\r\n\r\n"
+     L"A seed fixes the random numbers at launch only. If you change your inputs, the game may draw a different number of values before an event, and that event's result changes too."},
+    {L"Memory window",
+     L"The Memory button in the menu bar opens a read-only window with the running game's values, 10 times a second: health, weapon points and maximum, score, X and Y speed, X and Y position (physics and the render copy), invisibility, difficulty, style, the four characters and the four RNG state words.\r\n\r\n"
+     L"A dash means the game has no value yet (menus, loading). The window follows any COTM.exe that is running, frozen or live.\r\n\r\n"
+     L"Value history\r\n"
+     L"Tick Record history, then step, run or jump as usual: the game samples health, weapon points, score, X and Y speed, X and Y position and invisibility at every frame, also while fast-forwarding. Graph... draws the selected values over the frames (each value is scaled to the full height, its range is in the legend; move the mouse over the plot to read the values of one frame). Save CSV... writes every recorded frame; Clear empties the history. A new launch of the game (a rewind) starts a new history. Each row is the state after that movie frame."},
+    {L"Verify fast-forward",
+     L"Run > Verify fast-forward replays your whole movie twice at the fastest speed: once with every speed-up (no drawing, skipped render commands) and once with only the clock speed-up and normal drawing. It compares the game's values (the Memory window's list) at about 20 evenly spaced frames and tells you the first frame and value that differ, or that all matched.\r\n\r\n"
+     L"Use it on your own movie, especially one that goes through other stages, before you trust a long fast-forward. Checkpoints during loading are skipped (loading runs on real time). The picture is not compared. A 10,000-frame movie takes about 40 seconds.\r\n\r\n"
+     L"If it reports a difference, tell the developer which frame and value; some speed-up changes the game there."},
+    {L"Keyboard shortcuts",
+     L"File: Ctrl+N new, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as\r\n"
+     L"Edit: Ctrl+Z undo, Ctrl+Y redo, Ctrl+X cut, Ctrl+C copy, Ctrl+V paste, Ctrl+Shift+V paste insert, Ctrl+A select all, Delete clear, Insert insert frames, Ctrl+Delete delete frames, Ctrl+R repeat selection, Ctrl+Shift+R fill pattern, Ctrl+F find, F3 / Shift+F3 find next / previous, Alt+Down / Alt+Up next / previous note\r\n"
+     L"Bookmarks: Ctrl+B add / rename, Ctrl+Shift+B remove, F2 next, Shift+F2 previous, Ctrl+G jump to frame\r\n"
+     L"Run: F5 play, F6 rewind to cursor, F7 record from cursor, F8 record new, F9 stop, F4 run to cursor, period frame advance, F11 resume live, F12 record here\r\n"
+     L"Help: F1 this guide"},
+    {L"Troubleshooting",
+     L"The tool says it cannot find the game\r\n"
+     L"Use File > Set game path and pick COTM.exe.\r\n\r\n"
+     L"bscotm_hook.dll must be next to bscotm_tas.exe\r\n"
+     L"Keep the two files together; unzip the release into one folder.\r\n\r\n"
+     L"The game exits right away or the tool cannot start it\r\n"
+     L"Close any running copy of the game first, and run the tool from a folder you can write to. Some antivirus programs block the injected DLL; add an exception for the folder.\r\n\r\n"
+     L"The movie plays differently from last time\r\n"
+     L"Set an RNG seed (random drops and enemies depend on the launch second), use the same baseline and prelude, and run Verify fast-forward to check the speed-ups.\r\n\r\n"
+     L"The game picture is black or wrong after a fast jump\r\n"
+     L"Step one frame or press Rewind (F6) again. The picture is only drawn for the last frames before a stop.\r\n\r\n"
+     L"Keys typed into the editor appear in the game, or the reverse\r\n"
+     L"Live keys only count while the game window is in front. If you use Record here or Resume live, click the game window first."},
+    {L"About",
+     nullptr},
+};
+const int NUM_HELP_TOPICS = (int)(sizeof HELP_TOPICS / sizeof HELP_TOPICS[0]);
+
+HWND helpWnd = nullptr, helpList = nullptr, helpText = nullptr;
+
+void ShowHelpTopic(int i) {
+    if (!helpText || i < 0 || i >= NUM_HELP_TOPICS) return;
+    std::wstring t;
+    if (HELP_TOPICS[i].text) t = HELP_TOPICS[i].text;
+    else t = std::wstring(L"bscotm-tas ") + APP_VERSION + L"\r\n\r\nA TAStudio-style frame editor for Bloodstained: Curse of the Moon (Steam, version 1.1.2).\r\n\r\n"
+             L"Project: https://github.com/Cheetah555V2/bscotm_tas\r\nReleases: https://github.com/Cheetah555V2/bscotm_tas/releases\r\n"
+             L"License: MIT.\r\n\r\nThe tool injects bscotm_hook.dll into the game. It patches only the game's import tables and data, never its code. How it works and every finding: docs\\REVERSE_ENGINEERING.md in the repository.";
+    SetWindowTextW(helpText, t.c_str());
+    SendMessageW(helpText, EM_SETSEL, 0, 0);
+    SendMessageW(helpText, EM_SCROLLCARET, 0, 0);
+    SendMessageW(helpList, LB_SETCURSEL, i, 0);
+}
+
+LRESULT CALLBACK HelpProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE: {
+            int lw = S(190), w = LOWORD(lp), ht = HIWORD(lp);
+            if (helpList) MoveWindow(helpList, 0, 0, lw, ht, TRUE);
+            if (helpText) MoveWindow(helpText, lw, 0, std::max(0, w - lw), ht, TRUE);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wp) == IDC_HELP_TOPICS && HIWORD(wp) == LBN_SELCHANGE)
+                ShowHelpTopic((int)SendMessageW(helpList, LB_GETCURSEL, 0, 0));
+            return 0;
+        case WM_CLOSE: DestroyWindow(h); return 0;
+        case WM_DESTROY: helpWnd = helpList = helpText = nullptr; return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowHelp(int topic) {
+    if (!helpWnd) {
+        RECT pr;
+        GetWindowRect(A.wnd, &pr);
+        RECT hr = OnScreen(pr.left + S(50), pr.top + S(60), S(860), S(560));
+        helpWnd = CreateWindowExW(0, L"BscotmHelp", L"bscotm-tas Help",
+                                  WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                  hr.left, hr.top, hr.right - hr.left, hr.bottom - hr.top, A.wnd, nullptr, nullptr, nullptr);
+        if (!helpWnd) return;
+        helpList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | WS_VSCROLL,
+                                   0, 0, 0, 0, helpWnd, (HMENU)(INT_PTR)IDC_HELP_TOPICS, nullptr, nullptr);
+        helpText = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
+                                   0, 0, 0, 0, helpWnd, nullptr, nullptr, nullptr);
+        LOGFONTW lf{};
+        GetObjectW(A.font, sizeof lf, &lf);
+        lf.lfHeight = lf.lfHeight * 12 / 10;
+        static HFONT big = CreateFontIndirectW(&lf);
+        SendMessageW(helpList, WM_SETFONT, (WPARAM)big, TRUE);
+        SendMessageW(helpText, WM_SETFONT, (WPARAM)big, TRUE);
+        for (const HelpTopic& t : HELP_TOPICS) SendMessageW(helpList, LB_ADDSTRING, 0, (LPARAM)t.title);
+        RECT cr;
+        GetClientRect(helpWnd, &cr);
+        SendMessageW(helpWnd, WM_SIZE, 0, MAKELPARAM(cr.right, cr.bottom));
+    }
+    ShowHelpTopic(topic);
+    ShowWindow(helpWnd, SW_SHOWNORMAL);
+    SetForegroundWindow(helpWnd);
+}
 // ---- files, paths, config ---------------------------------------------------
 bool PickFile(bool save, const wchar_t* filter, const wchar_t* ext, std::wstring& io, const std::wstring& dir) {
     wchar_t buf[MAX_PATH * 2] = {};
@@ -1135,6 +2423,48 @@ std::wstring IniGet(const wchar_t* sec, const wchar_t* key) {
 }
 void IniSet(const wchar_t* sec, const wchar_t* key, const std::wstring& v) {
     WritePrivateProfileStringW(sec, key, v.c_str(), A.ini.c_str());
+}
+
+// ---- choosing the input columns (like TAStudio) ----------------------------------------------------------------------
+// Right-click the column headings (or View > Columns): a check list of every input column plus presets. Hiding a column
+// only hides it from the grid: its inputs stay in the movie and are still played.
+const int IDM_COL0 = 6000, IDM_COLS_ALL = 6100, IDM_COLS_KB = 6101, IDM_COLS_PAD = 6102, IDM_COLS_USED = 6103;
+
+void LoadHidden() { A.hidden = (KeyMask)wcstoull(IniGet(L"view", L"hidden").c_str(), nullptr, 16); }
+
+void SetHidden(KeyMask h) {
+    KeyMask avail = NumCols() == NUM_KEYS ? ~(KeyMask)0 : (KeyBit(NUM_KB_KEYS) - 1);
+    if ((h & avail) == avail) { SetMsg(L"At least one input column has to stay visible."); return; }
+    A.hidden = h;
+    wchar_t b[24];
+    swprintf(b, 24, L"%llx", (unsigned long long)h);
+    IniSet(L"view", L"hidden", b);
+    UpdateScroll();
+    InvalidateRect(A.grid, nullptr, TRUE);
+}
+
+void ColumnsMenu(HWND owner, POINT pt) {
+    KeyMask used = 0;
+    for (KeyMask k : A.movie.frames) used |= k;
+    HMENU pm = CreatePopupMenu();
+    AppendMenuW(pm, MF_STRING, IDM_COLS_ALL, L"Show all columns");
+    AppendMenuW(pm, MF_STRING, IDM_COLS_KB, L"Keyboard columns only");
+    if (A.movie.controller) AppendMenuW(pm, MF_STRING, IDM_COLS_PAD, L"Controller columns only");
+    AppendMenuW(pm, MF_STRING | (used ? 0 : MF_GRAYED), IDM_COLS_USED, L"Only the columns this movie uses");
+    AppendMenuW(pm, MF_SEPARATOR, 0, nullptr);
+    for (int k = 0; k < NumCols(); k++) {
+        std::wstring t = W(KEYS[k].label) + L"\t" + W(KEYS[k].name) + ((used >> k & 1) ? L"  (used)" : L"");
+        UINT fl = MF_STRING | ((A.hidden >> k & 1) ? MF_UNCHECKED : MF_CHECKED) | (k == NUM_KB_KEYS ? MF_MENUBARBREAK : 0);    // controller keys: a second column
+        AppendMenuW(pm, fl, IDM_COL0 + k, t.c_str());
+    }
+    int cmd = TrackPopupMenu(pm, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, owner, nullptr);
+    DestroyMenu(pm);
+    KeyMask kb = KeyBit(NUM_KB_KEYS) - 1;
+    if (cmd >= IDM_COL0 && cmd < IDM_COL0 + NUM_KEYS) SetHidden(A.hidden ^ KeyBit(cmd - IDM_COL0));
+    else if (cmd == IDM_COLS_ALL) SetHidden(0);
+    else if (cmd == IDM_COLS_KB) SetHidden(~kb);
+    else if (cmd == IDM_COLS_PAD) SetHidden(kb);
+    else if (cmd == IDM_COLS_USED) SetHidden(~used);
 }
 
 void ResolvePaths() {
@@ -1210,7 +2540,7 @@ void LoadPath(const std::wstring& p) {
     A.path = p;
     A.dirty = false;
     A.undo.clear(); A.redo.clear();
-    A.cursor = A.anchor = A.top = A.reached = 0;
+    A.cursor = A.anchor = A.top = A.reached = 0; StaleStatesAfter(-1);
     if (!A.movie.prelude_id.empty()) {
         int i = (int)SendMessageW(A.cbPre, CB_FINDSTRINGEXACT, 0, (LPARAM)W(A.movie.prelude_id).c_str());
         if (i >= 0) SendMessageW(A.cbPre, CB_SETCURSEL, i, 0);
@@ -1267,7 +2597,7 @@ void FileNew() {
     A.movie = Movie();
     A.path.clear(); A.dirty = false;
     A.undo.clear(); A.redo.clear();
-    A.cursor = A.anchor = A.top = A.reached = 0;
+    A.cursor = A.anchor = A.top = A.reached = 0; StaleStatesAfter(-1);
     UpdateTitle(); UpdateScroll(); UpdateStatus(); RefreshNotesList();
 }
 
@@ -1320,7 +2650,10 @@ DWORD WINAPI JobThread(LPVOID a) {
     return 0;
 }
 
-const uint32_t SPEEDS[4] = {1000, 4000, 16000, 50000};
+// Max: no real-time pacing at all; the game runs as fast as its frames can be computed (about 25-30x). With the frame clock
+// (RunParams::quant_lock 3) every speed plays out exactly as in real time, see docs.
+const uint32_t SPEED_MAX = 1000000;
+const uint32_t SPEEDS[4] = {1000, 2000, 8000, SPEED_MAX};
 
 // The parts of a run that do not depend on what it is for: game, hook, saves, prelude and RNG seed.
 bool FillParams(RunParams& p) {
@@ -1342,6 +2675,7 @@ bool FillParams(RunParams& p) {
     }
     p.seeded = A.movie.has_seed;
     p.seed = A.movie.seed;
+    p.controller = A.movie.controller;
     return true;
 }
 // realtime: ignore the fast-forward setting (watching a movie, not seeking).
@@ -1358,6 +2692,7 @@ void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, b
     RunParams& p = j->p;
     if (!FillParams(p)) { delete j; return; }
     p.rng_log = A.rngWnd && A.rngLogOn;
+    p.hist = A.memWnd && A.histOn;
     A.logPre = (int)p.prelude.size();
     if (!fresh) p.movie = A.movie.frames;
     p.target = target;
@@ -1367,6 +2702,7 @@ void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, b
     // can be thawed without a burst of catch-up frames.
     p.speed_mask = p.speed_milli > 1000 ? SPEED_ALL : (SPEED_ALL & ~SPEED_NOVSYNC);
     p.hold = hold;
+    p.savestates = A.useStates && hold;
 
     A.jobRecord = record; A.jobNew = fresh; A.jobTarget = target; A.jobHold = hold;
     A.busy = true;
@@ -1392,8 +2728,8 @@ struct VerifyRun {
 
 static void VerifyNote(const std::wstring& t) { PostMessageW(A.wnd, WM_VERIFY_PROGRESS, 0, (LPARAM)new std::wstring(t)); }
 
-static bool OpenGameProc(GameProc& g) {            // like AttachGame, but for the worker thread's own handle
-    for (int i = 0; i < 100 && !g.h; i++) {
+static bool OpenGameProc(GameProc& g, int tries) {            // like AttachGame, but for the worker thread's own handle
+    for (int i = 0; i < tries && !g.h; i++) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         PROCESSENTRY32W pe{sizeof pe};
         DWORD pid = 0;
@@ -1420,7 +2756,7 @@ static bool OpenGameProc(GameProc& g) {            // like AttachGame, but for t
 
 static bool VerifyPass(const VerifyArgs& va, uint32_t mask, const wchar_t* label, VerifyRun& out) {
     RunParams p = va.p;
-    p.speed_milli = 50000;
+    p.speed_milli = SPEED_MAX;
     p.speed_mask = mask;
     p.hold = true;
     p.record = false;
@@ -1437,7 +2773,7 @@ static bool VerifyPass(const VerifyArgs& va, uint32_t mask, const wchar_t* label
     int pos = 1;
     for (int cp : va.cps) {
         if (cp > pos) {
-            if (!ss.BeginSteps(p.movie.data() + pos, (uint32_t)(cp - pos), 50000)) { out.error = "could not run the game"; break; }
+            if (!ss.BeginSteps(p.movie.data() + pos, (uint32_t)(cp - pos), SPEED_MAX)) { out.error = "could not run the game"; break; }
             int r;
             while (!(r = ss.PollSteps())) {
                 if (A.stop) ss.AbortSteps();
@@ -1447,7 +2783,7 @@ static bool VerifyPass(const VerifyArgs& va, uint32_t mask, const wchar_t* label
             pos = cp;
         }
         std::vector<std::wstring> row;
-        for (const MemField& f : fs) row.push_back(ReadField(g, f));
+        for (const MemField& f : fs) row.push_back(f.kind >= MK_BOSSHP ? std::wstring(L"-") : ReadField(g, f));
         out.vals.push_back(std::move(row));
         wchar_t b[96];
         swprintf(b, 96, L"%ls: frame %d / %d", label, cp, va.cps.back());
@@ -1519,7 +2855,7 @@ void VerifyFastForward() {
     va->p.movie = A.movie.frames;
     for (int c = gap; c < n; c += gap) va->cps.push_back(c);
     va->cps.push_back(n);
-    A.reached = 0;
+    A.reached = 0; StaleStatesAfter(-1);
     A.busy = true;
     A.stop = 0;
     EnableUi();
@@ -1558,6 +2894,96 @@ void FrameAdvance();
 void RunToCursor();
 void StopRecordHere();
 
+// ---- savestates --------------------------------------------------------------------------------
+// A state restores "the game frozen before movie row R". It is valid while no frame before R was edited
+// (R <= A.reached). Rewinding loads the latest valid state at or before the target instead of relaunching.
+bool StatesOn() {
+    return A.useStates && A.sess.Active() && A.sess.Alive() && A.sess.s && (A.sess.s->features & FEAT_ARENA_OK);
+}
+
+bool StateValid(int slot) {
+    int r = A.sess.StateRow(slot);
+    return r >= 0 && r <= A.reached && !A.ssStale[slot];
+}
+
+int NumStates() {
+    int n = 0;
+    if (A.sess.Active() && A.sess.s) for (int i = 0; i < 8; i++) if (StateValid(i)) n++;
+    return n;
+}
+
+// The slot to rewind from for a game that has to run row `next` next: the latest valid state at or before it.
+int BestState(int next) {
+    int best = -1, bestRow = -1;
+    for (int i = 0; i < 8; i++) {
+        int r = A.sess.StateRow(i);
+        if (StateValid(i) && r <= next && r > bestRow) { best = i; bestRow = r; }
+    }
+    return best;
+}
+
+// The slot to save row `row` in: the same row, an empty or stale slot, or else the automatic state whose
+// neighbours are closest together (so the saved rows stay spread out). Slots that branches hold are left alone.
+int PickSlot(int row) {
+    int empty = -1, stale = -1;
+    for (int i = 0; i < 8; i++) {
+        if (BranchHolds(i)) continue;
+        int r = A.sess.StateRow(i);
+        if (r == row) return i;
+        if (r < 0) { if (empty < 0) empty = i; }
+        else if (!StateValid(i)) { if (stale < 0) stale = i; }
+    }
+    if (empty >= 0) return empty;
+    if (stale >= 0) return stale;
+    int best = -1, bestGap = 0x7FFFFFFF;
+    for (int i = 0; i < 8; i++) {
+        if (A.ssManual[i]) continue;
+        int r = A.sess.StateRow(i), lo = 0, hi = r + std::max(A.ssEvery, 1000);
+        for (int j = 0; j < 8; j++) {
+            if (j == i) continue;
+            int q = A.sess.StateRow(j);
+            if (q >= 0 && q <= r) lo = std::max(lo, q);
+            if (q > r) hi = std::min(hi, q);
+        }
+        if (hi - lo < bestGap) { bestGap = hi - lo; best = i; }
+    }
+    return best;
+}
+
+// Saves the frozen game's position; returns the slot, or -1. Not for use while a batch is running.
+int SaveStateSlot(bool manual) {
+    if (!StatesOn()) return -1;
+    int row = (int)A.sess.Row();
+    if (row < 0 || row > A.reached) return -1;
+    int slot = PickSlot(row);
+    bool keep = slot >= 0 && A.sess.StateRow(slot) == row && A.ssManual[slot] && !A.ssStale[slot];      // saving over the same row keeps a manual state manual
+    if (slot < 0 || !A.sess.SaveState(slot)) return -1;
+    A.ssManual[slot] = manual || keep;
+    A.ssStale[slot] = false;
+    A.ssGen[slot] = ++A.ssCounter;
+    return slot;
+}
+bool SaveStateAt(bool manual) { return SaveStateSlot(manual) >= 0; }
+
+// Puts the game back to the latest state at or before the cursor row and runs it forward from there.
+bool RewindWithState(int row) {
+    if (A.busy || !StatesOn()) return false;
+    int slot = BestState(row + 1);
+    if (slot < 0) return false;
+    int r = A.sess.StateRow(slot);
+    DWORD t0 = GetTickCount();
+    if (!A.sess.LoadState(slot)) {
+        A.sess.Close();
+        SetMsg(L"Loading the savestate failed; the game is gone. Rewind again to relaunch.");
+        return true;
+    }
+    SetMsg(L"Loaded the state at frame " + std::to_wstring(r) + L" (" + std::to_wstring(GetTickCount() - t0) + L" ms).");
+    UpdateStatus();
+    InvalidateRect(A.grid, nullptr, FALSE);
+    if (r <= row) RunToCursor();
+    return true;
+}
+
 void OnJobDone(RunResult* r) {
     if (A.thread) { WaitForSingleObject(A.thread, 2000); CloseHandle(A.thread); A.thread = nullptr; }
     A.busy = false;
@@ -1591,6 +3017,12 @@ void OnJobDone(RunResult* r) {
             A.sess = A.jobSess;
             A.jobSess = Session();
             SetMsg(L"Game frozen after frame " + std::to_wstring(r->played) + L". Press . to advance a frame, F11 to resume live.");
+            if (A.useStates) {
+                for (bool& m : A.ssManual) m = false;       // a new game has no states yet
+                for (bool& m : A.ssStale) m = false;
+                for (uint32_t& g : A.ssGen) g = 0;     // (branches' states belonged to the old game)
+                if (SaveStateAt(false)) SetMsg(L"Game frozen after frame " + std::to_wstring(r->played) + L"; state saved. Press . to advance a frame, F11 to resume live.");
+            }
         } else {
             SetMsg(L"Reached frame " + std::to_wstring(r->played) + L". The game is left running.");
         }
@@ -1674,12 +3106,16 @@ void RunToCursor() {
     Step st; st.cur_before = A.cursor;
     EnsureRows(st, target);
     Commit(st);
-    Frames keys(A.movie.frames.begin() + row, A.movie.frames.begin() + target);
+    // With savestates the batch runs in pieces ending at multiples of ssEvery, with a state saved at each.
+    int end = target;
+    if (StatesOn() && A.ssEvery > 0) end = std::min(target, (row / A.ssEvery + 1) * A.ssEvery);
+    Frames keys(A.movie.frames.begin() + row, A.movie.frames.begin() + end);
     if (!A.sess.BeginSteps(keys.data(), (uint32_t)keys.size(), SPEEDS[A.speed])) {
         A.sess.Close();
         SetMsg(L"Could not start running the game.");
         return;
     }
+    A.chunkFrom = row;
     A.runFrom = row; A.runTarget = target;
     A.stepping = true;
     A.busy = true;
@@ -1707,7 +3143,8 @@ void FinishRun(int result, bool aborted) {
 }
 
 // Go to a frame: if the frozen game has not reached it yet, just run it forward at the fast-forward
-// speed (no restart); if it is behind us (or there is no frozen game), rewind (restart + fast-forward).
+// speed (no restart); if it is behind us, an earlier frame was edited, or there is no frozen game, rewind (the nearest
+// valid savestate, else restart + fast-forward).
 void JumpTo(int row) {
     if (A.busy) { SetMsg(L"Wait for the running job to finish (Stop = F9) before jumping."); return; }
     if (!Size()) return;
@@ -1715,17 +3152,29 @@ void JumpTo(int row) {
     SetCursorRow(row, false);
     bool frozen = A.sess.Active() && A.sess.Alive();
     int next = frozen ? (int)A.sess.Row() : -1;         // the row the frozen game runs next
-    if (frozen && next >= 0 && next <= row) { RunToCursor(); return; }
-    if (frozen && next == row + 1) { SetMsg(L"The game is already at frame " + std::to_wstring(row + 1) + L"."); return; }
+    if (frozen && next >= 0 && next <= row && next <= A.reached) { RunToCursor(); return; }     // ahead, and the game's inputs are still the movie's
+    if (frozen && next == row + 1 && next <= A.reached) { SetMsg(L"The game is already at frame " + std::to_wstring(row + 1) + L"."); return; }
+    if (RewindWithState(row)) return;
     StartJob(false, (uint32_t)(row + 1), false, false, true);
 }
 
 void PollRun() {
     int r = A.sess.PollSteps();
     if (r == 0) {
-        SetMsg(L"Running to the cursor: frame " + std::to_wstring(A.runFrom + (int)A.sess.StepsDone()) + L" / " +
+        SetMsg(L"Running to the cursor: frame " + std::to_wstring(A.chunkFrom + (int)A.sess.StepsDone()) + L" / " +
                std::to_wstring(A.runTarget) + L". Stop (F9) to cancel.");
         return;
+    }
+    if (r == 1 && StatesOn()) {
+        int row = (int)A.sess.Row();
+        A.reached = std::max(A.reached, row);
+        if (row >= 0 && (row == A.runTarget || (A.ssEvery > 0 && row % A.ssEvery == 0))) SaveStateAt(false);
+        if (row >= 0 && row < A.runTarget) {            // the next piece
+            int end = std::min(A.runTarget, A.ssEvery > 0 ? (row / A.ssEvery + 1) * A.ssEvery : A.runTarget);
+            Frames keys(A.movie.frames.begin() + row, A.movie.frames.begin() + end);
+            if (A.sess.BeginSteps(keys.data(), (uint32_t)keys.size(), SPEEDS[A.speed])) { A.chunkFrom = row; return; }
+            r = -1;
+        }
     }
     FinishRun(r, false);
 }
@@ -1825,10 +3274,18 @@ void BuildMenu(HWND w) {
     add(e, IDM_CLEAR, L"C&lear inputs\tDel");
     add(e, IDM_INSERT, L"&Insert frames\tIns");
     add(e, IDM_DELFRAMES, L"&Delete frames\tCtrl+Del");
+    add(e, IDM_REPEAT, L"Repeat selection...\tCtrl+R");
+    add(e, IDM_PATTERN, L"Fill selection with a &pattern...\tCtrl+Shift+R");
     AppendMenuW(e, MF_SEPARATOR, 0, nullptr);
     add(e, IDM_NOTE_EDIT, L"Add / edit frame &note...");
     add(e, IDM_NOTE_DEL, L"Remove notes in selection");
     add(e, IDM_NOTE_LIST, L"Notes &list...");
+    add(e, IDM_NOTENEXT, L"Next note\tAlt+Down");
+    add(e, IDM_NOTEPREV, L"Previous note\tAlt+Up");
+    AppendMenuW(e, MF_SEPARATOR, 0, nullptr);
+    add(e, IDM_FIND, L"&Find...\tCtrl+F");
+    add(e, IDM_FINDNEXT, L"Find &next\tF3");
+    add(e, IDM_FINDPREV, L"Find pre&vious\tShift+F3");
     AppendMenuW(e, MF_SEPARATOR, 0, nullptr);
     add(e, IDM_BM_EDIT, L"Add / rename &bookmark...\tCtrl+B");
     add(e, IDM_BM_DEL, L"Remove bookmark\tCtrl+Shift+B");
@@ -1847,18 +3304,35 @@ void BuildMenu(HWND w) {
     add(r, IDM_STOP, L"&Stop\tF9");
     AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
     add(r, IDM_RNGSEED, L"RNG see&d...");
+    add(r, IDM_CONTROLLER, L"&Controller (virtual Xbox 360 pad)");
     add(r, IDM_VERIFY, L"&Verify fast-forward...");
+    AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
+    add(r, IDM_SAVESTATES, L"Use &savestates (applies at the next launch)");
+    add(r, IDM_SAVESTATE_NOW, L"Save s&tate at the game's position\tShift+F5");
+    add(r, IDM_SSINTERVAL, L"Savestate &interval (frames)...");
     A.speedMenu = CreatePopupMenu();
     add(A.speedMenu, IDM_SPEED0, L"Real time (1x)");
-    add(A.speedMenu, IDM_SPEED1, L"4x");
-    add(A.speedMenu, IDM_SPEED2, L"16x");
-    add(A.speedMenu, IDM_SPEED3, L"Max (50x)");
+    add(A.speedMenu, IDM_SPEED1, L"2x");
+    add(A.speedMenu, IDM_SPEED2, L"8x");
+    add(A.speedMenu, IDM_SPEED3, L"Max (as fast as possible)");
     AppendMenuW(r, MF_POPUP, (UINT_PTR)A.speedMenu, L"Fast-forward &speed (rewind / record from cursor)");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)f, L"&File");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)e, L"&Edit");
+    HMENU vw = CreatePopupMenu();
+    add(vw, IDM_COLUMNS, L"&Columns...\tor right-click the column headings");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)vw, L"&View");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)r, L"&Run");
     AppendMenuW(bar, MF_STRING, IDM_MEMORY, L"&Memory");
+    AppendMenuW(bar, MF_STRING, IDM_BRANCHES, L"&Branches");
     AppendMenuW(bar, MF_STRING, IDM_RNGLOG, L"RNG &log");     // a plain menu-bar button: opens the window
+    HMENU hp = CreatePopupMenu();
+    add(hp, IDM_HELP_GUIDE, L"&Guide...\tF1");
+    add(hp, IDM_HELP_START, L"&Getting started");
+    add(hp, IDM_HELP_KEYS, L"&Keyboard shortcuts");
+    add(hp, IDM_HELP_TROUBLE, L"&Troubleshooting");
+    AppendMenuW(hp, MF_SEPARATOR, 0, nullptr);
+    add(hp, IDM_HELP_ABOUT, L"&About");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)hp, L"&Help");
     SetMenu(w, bar);
 }
 
@@ -1908,13 +3382,17 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             A.cbPre = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
                                       0, 0, 0, 0, w, (HMENU)IDC_PRE, nullptr, nullptr);
             for (HWND c : {A.lblBase, A.lblPre, A.cbBase, A.cbPre, A.status}) SendMessageW(c, WM_SETFONT, (WPARAM)A.font, TRUE);
-            A.grid = CreateWindowExW(WS_EX_CLIENTEDGE, L"TasGrid", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP,
+            A.grid = CreateWindowExW(WS_EX_CLIENTEDGE, L"TasGrid", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP,
                                      0, 0, 0, 0, w, nullptr, nullptr, nullptr);
             ResolvePaths();
             {
                 std::wstring sp = IniGet(L"last", L"speed");
                 A.speed = sp.empty() ? 3 : std::max(0, std::min(3, _wtoi(sp.c_str())));
                 CheckMenuRadioItem(A.speedMenu, IDM_SPEED0, IDM_SPEED3, IDM_SPEED0 + A.speed, MF_BYCOMMAND);
+                A.useStates = IniGet(L"last", L"savestates") != L"0";
+                LoadHidden();
+                std::wstring ev = IniGet(L"last", L"ssevery");
+                if (!ev.empty()) A.ssEvery = std::max(0, _wtoi(ev.c_str()));
             }
             RefreshCombos(IniGet(L"last", L"baseline"), IniGet(L"last", L"prelude"));
             EnableUi();
@@ -1931,8 +3409,14 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             auto en = [&](int id, bool on) { EnableMenuItem(m, id, MF_BYCOMMAND | (on ? MF_ENABLED : MF_GRAYED)); };
             for (int id : {IDM_NEW, IDM_OPEN, IDM_CUT, IDM_PASTE, IDM_PASTEINS, IDM_CLEAR, IDM_INSERT, IDM_DELFRAMES,
                            IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_RECORD, IDM_BASESAVE, IDM_STEP, IDM_RESUME, IDM_RECHERE,
-                           IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED, IDM_VERIFY, IDM_BM_EDIT, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV})
+                           IDM_NOTE_EDIT, IDM_RUNTO, IDM_RNGSEED, IDM_VERIFY, IDM_BM_EDIT, IDM_GOTO, IDM_BM_NEXT, IDM_BM_PREV, IDM_REPEAT, IDM_PATTERN, IDM_FIND, IDM_FINDNEXT, IDM_FINDPREV, IDM_NOTENEXT, IDM_NOTEPREV})
                 en(id, !A.busy);
+            CheckMenuItem(m, IDM_SAVESTATES, MF_BYCOMMAND | (A.useStates ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(m, IDM_CONTROLLER, MF_BYCOMMAND | (A.movie.controller ? MF_CHECKED : MF_UNCHECKED));
+            en(IDM_CONTROLLER, !A.busy);
+            en(IDM_SAVESTATES, !A.busy);
+            en(IDM_SSINTERVAL, !A.busy);
+            en(IDM_SAVESTATE_NOW, !A.busy && StatesOn());
             en(IDM_NOTE_DEL, !A.busy && SelectionHasNote());
             en(IDM_BM_DEL, !A.busy && RowIsBm(A.cursor));
             en(IDM_UNDO, !A.busy && !A.undo.empty());
@@ -1960,6 +3444,13 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_CLEAR: EditClear(); break;
                 case IDM_INSERT: EditInsert(); break;
                 case IDM_DELFRAMES: EditDelete(); break;
+                case IDM_REPEAT: EditRepeat(); break;
+                case IDM_FIND: FindDialog(); break;
+                case IDM_FINDNEXT: FindStep(true); break;
+                case IDM_FINDPREV: FindStep(false); break;
+                case IDM_NOTENEXT: NoteStep(true); break;
+                case IDM_NOTEPREV: NoteStep(false); break;
+                case IDM_PATTERN: EditPattern(); break;
                 case IDM_NOTE_EDIT: EditNote(); break;
                 case IDM_NOTE_DEL: RemoveNotesInSelection(); break;
                 case IDM_NOTE_LIST: ShowNotesList(false); break;
@@ -1971,11 +3462,50 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_GOTO: GoToFrame(); break;
                 case IDM_JUMPCUR: JumpTo(A.cursor); break;
                 case IDM_RNGSEED: EditSeed(); break;
+                case IDM_CONTROLLER: ToggleController(); break;
+                case IDM_BRANCHES: ShowBranches(); break;
+                case IDM_COLUMNS: { POINT pt; GetCursorPos(&pt); ColumnsMenu(A.wnd, pt); break; }
                 case IDM_VERIFY: VerifyFastForward(); break;
                 case IDM_MEMORY: ShowMemory(); break;
+                case IDM_HELP_GUIDE: case IDM_HELP_START: ShowHelp(0); break;
+                case IDM_HELP_KEYS: ShowHelp(8); break;
+                case IDM_HELP_TROUBLE: ShowHelp(9); break;
+                case IDM_HELP_ABOUT: ShowHelp(NUM_HELP_TOPICS - 1); break;
                 case IDM_RNGLOG: ShowRngLog(); break;
                 case IDM_PLAY: StartJob(false, (uint32_t)Size(), false, true); break;
-                case IDM_REWIND: StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true); break;
+                case IDM_REWIND:
+                    if (Size() && RewindWithState(std::min(A.cursor, Size() - 1))) break;
+                    StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true);
+                    break;
+                case IDM_SAVESTATES:
+                    A.useStates = !A.useStates;
+                    IniSet(L"last", L"savestates", A.useStates ? L"1" : L"0");
+                    SetMsg(A.useStates ? L"Savestates on: the game launched from now on can save and load states (Rewind and Jump use them)."
+                                       : L"Savestates off for the next launch.");
+                    break;
+                case IDM_SSINTERVAL: {
+                    if (A.busy) break;
+                    std::wstring t = std::to_wstring(A.ssEvery);
+                    if (!AskText(L"Savestate interval", L"Frames between automatic savestates while the game is advanced (0 = never; 100 - 20000):", t)) break;
+                    wchar_t* end = nullptr;
+                    long n = wcstol(t.c_str(), &end, 10);
+                    if (t.empty() || *end || n < 0 || (n > 0 && n < 100) || n > 20000) {
+                        MessageBoxW(A.wnd, L"Enter 0, or a number of frames from 100 to 20000.", L"Savestate interval", MB_ICONERROR);
+                        break;
+                    }
+                    A.ssEvery = (int)n;
+                    IniSet(L"last", L"ssevery", std::to_wstring(A.ssEvery));
+                    SetMsg(n ? L"A savestate is made every " + std::to_wstring(n) + L" frames while the game is advanced. Shorter = faster rewinds, more memory."
+                             : L"No automatic savestates (Shift+F5 still saves one by hand).");
+                    break;
+                }
+                case IDM_SAVESTATE_NOW:
+                    if (A.busy) break;
+                    if (!StatesOn()) { SetMsg(A.useStates ? L"No frozen game that can save states. Rewind to cursor (F6) first." : L"Savestates are off (Run > Use savestates), then Rewind to cursor (F6)."); break; }
+                    if (SaveStateAt(true)) SetMsg(L"State saved at frame " + std::to_wstring(A.sess.Row()) + L" (kept until the game is relaunched).");
+                    else SetMsg(L"Could not save a state here.");
+                    UpdateStatus();
+                    break;
                 case IDM_STEP: FrameAdvance(); break;
                 case IDM_RUNTO: RunToCursor(); break;
                 case IDM_RECHERE: RecordHere(); break;
@@ -2000,7 +3530,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     if (HIWORD(wp) == CBN_SELCHANGE) {
                         IniSet(L"last", L"baseline", ComboSel(A.cbBase));
                         IniSet(L"last", L"prelude", ComboSel(A.cbPre));
-                        A.reached = 0;
+                        A.reached = 0; StaleStatesAfter(-1);
                         InvalidateRect(A.grid, nullptr, FALSE);
                     }
                     break;
@@ -2055,11 +3585,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
     nd.lpfnWndProc = NotesProc;
     nd.lpszClassName = L"BscotmNotes";
     RegisterClassExW(&nd);
+    nd.lpfnWndProc = BranchProc;
+    nd.lpszClassName = L"BscotmBranches";
+    RegisterClassExW(&nd);
     nd.lpfnWndProc = MemProc;
     nd.lpszClassName = L"BscotmMem";
     RegisterClassExW(&nd);
     nd.lpfnWndProc = RngProc;
     nd.lpszClassName = L"BscotmRng";
+    RegisterClassExW(&nd);
+    nd.lpfnWndProc = GraphProc;
+    nd.lpszClassName = L"BscotmGraph";
+    RegisterClassExW(&nd);
+    nd.lpfnWndProc = HelpProc;
+    nd.lpszClassName = L"BscotmHelp";
     RegisterClassExW(&nd);
 
     WNDCLASSEXW c{sizeof c};
@@ -2087,10 +3626,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
         {FCONTROL | FVIRTKEY, 'X', IDM_CUT},      {FCONTROL | FVIRTKEY, 'C', IDM_COPY},
         {FCONTROL | FVIRTKEY, 'V', IDM_PASTE},    {FCONTROL | FSHIFT | FVIRTKEY, 'V', IDM_PASTEINS},
         {FCONTROL | FVIRTKEY, 'A', IDM_SELALL},   {FVIRTKEY, VK_F5, IDM_PLAY},
-        {FVIRTKEY, VK_F6, IDM_REWIND},            {FVIRTKEY, VK_F7, IDM_RECFROM},
+        {FSHIFT | FVIRTKEY, VK_F5, IDM_SAVESTATE_NOW}, {FVIRTKEY, VK_F6, IDM_REWIND},            {FVIRTKEY, VK_F7, IDM_RECFROM},
         {FVIRTKEY, VK_F8, IDM_RECORD},            {FVIRTKEY, VK_F9, IDM_STOP},
-        {FVIRTKEY, VK_OEM_PERIOD, IDM_STEP},      {FVIRTKEY, VK_F4, IDM_RUNTO},       {FVIRTKEY, VK_F11, IDM_RESUME},       {FVIRTKEY, VK_F12, IDM_RECHERE},
-        {FCONTROL | FVIRTKEY, 'B', IDM_BM_EDIT}, {FCONTROL | FSHIFT | FVIRTKEY, 'B', IDM_BM_DEL}, {FCONTROL | FVIRTKEY, 'G', IDM_GOTO},
+        {FVIRTKEY, VK_OEM_PERIOD, IDM_STEP},      {FVIRTKEY, VK_F4, IDM_RUNTO},       {FVIRTKEY, VK_F1, IDM_HELP_GUIDE}, {FVIRTKEY, VK_F11, IDM_RESUME},       {FVIRTKEY, VK_F12, IDM_RECHERE},
+        {FCONTROL | FVIRTKEY, 'B', IDM_BM_EDIT}, {FCONTROL | FSHIFT | FVIRTKEY, 'B', IDM_BM_DEL}, {FCONTROL | FVIRTKEY, 'G', IDM_GOTO}, {FCONTROL | FVIRTKEY, 'R', IDM_REPEAT}, {FCONTROL | FVIRTKEY, 'F', IDM_FIND}, {FVIRTKEY, VK_F3, IDM_FINDNEXT}, {FSHIFT | FVIRTKEY, VK_F3, IDM_FINDPREV}, {FALT | FVIRTKEY, VK_DOWN, IDM_NOTENEXT}, {FALT | FVIRTKEY, VK_UP, IDM_NOTEPREV}, {FCONTROL | FSHIFT | FVIRTKEY, 'R', IDM_PATTERN},
         {FVIRTKEY, VK_F2, IDM_BM_NEXT}, {FSHIFT | FVIRTKEY, VK_F2, IDM_BM_PREV},
     };
     ACCEL acc[sizeof keys / sizeof keys[0]];

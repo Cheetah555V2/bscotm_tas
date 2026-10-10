@@ -20,12 +20,21 @@ $B/app.o: src/app.rc src/app.manifest | $B
 	$(WINDRES) -O coff -i $< -o $@
 
 $B/bscotm_tas.exe: src/main.cpp src/engine.cpp src/movie.cpp src/common.h src/engine.h src/movie.h $B/app.o
-	$(CXX) $(CXXFLAGS) -mwindows -municode src/main.cpp src/engine.cpp src/movie.cpp $B/app.o -o $@ $(LDFLAGS) -lcomctl32 -lcomdlg32
+	$(CXX) $(CXXFLAGS) -mwindows -municode src/main.cpp src/engine.cpp src/movie.cpp $B/app.o -o $@ $(LDFLAGS) -lcomctl32 -lcomdlg32 -lole32 -lwindowscodecs -luuid
 
 $B/bscotm_hook.dll: src/hook.cpp src/common.h | $B
 	$(CXX) $(CXXFLAGS) -shared src/hook.cpp -o $@ $(LDFLAGS)
 
+# Test tools (not in the release zip): `build.bat tools`; tools\verify.ps1 builds and runs them.
+tools: $B/sstest.exe $B/dumpdiff.exe
+
+$B/sstest.exe: tools/sstest.cpp src/engine.cpp src/movie.cpp src/common.h src/engine.h src/movie.h | $B
+	$(CXX) $(CXXFLAGS) -municode tools/sstest.cpp src/engine.cpp src/movie.cpp -o $@ $(LDFLAGS) -lpsapi
+
+$B/dumpdiff.exe: tools/dumpdiff.cpp | $B
+	$(CXX) $(CXXFLAGS) tools/dumpdiff.cpp -o $@ $(LDFLAGS)
+
 clean:
 	rm -rf $B
 
-.PHONY: all clean
+.PHONY: all clean tools
