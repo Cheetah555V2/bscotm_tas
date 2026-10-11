@@ -196,6 +196,8 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
     has_seed = false; seed = 0;
     const J* sd = root.get("rng_seed");
     if (sd && sd->t == J::Num && sd->n >= 0 && sd->n <= 4294967295.0) { has_seed = true; seed = (uint32_t)sd->n; }
+    const J* cv = root.get("clock_version");
+    clock_version = cv && cv->t == J::Num ? (int)cv->n : 0;
     const J* ct = root.get("controller");     // the game sees a (virtual) controller: see Movie::controller
     controller = ct && Truthy(*ct);
     Expand(*fr, frames);
@@ -216,6 +218,11 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
     return true;
 }
 
+bool Movie::MaybeStaleClock() const {
+    // PR #21 merged 2026-10-09 16:34 UTC, the exact frame clock (PR #23) 2026-10-10 13:20 UTC; ISO strings compare in order.
+    return clock_version < kClockVersion && created >= "2026-10-09T16:34:00Z" && created <= "2026-10-10T13:20:04Z";
+}
+
 bool Movie::Save(const std::wstring& path, std::string& err) const {
     FILE* f = _wfopen(path.c_str(), L"wb");
     if (!f) { err = "cannot write file"; return false; }
@@ -229,6 +236,7 @@ bool Movie::Save(const std::wstring& path, std::string& err) const {
     fputs(",\"created_utc\":", f);
     Esc(f, created);
     if (has_seed) fprintf(f, ",\"rng_seed\":%u", (unsigned)seed); else fputs(",\"rng_seed\":null", f);
+    fprintf(f, ",\"clock_version\":%d", clock_version);   // kept as loaded, so an old movie stays flagged until re-synced
     if (controller) fputs(",\"controller\":true", f);       // only when on, so keyboard movies are written as before
     fputs(",\"anchors\":[],\"prelude_id\":", f);
     if (prelude_id.empty()) fputs("null", f); else Esc(f, prelude_id);

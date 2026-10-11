@@ -2026,6 +2026,11 @@ void LoadPath(const std::wstring& p) {
     }
     UpdateTitle(); UpdateScroll(); UpdateStatus(); RefreshNotesList();
     SetMsg(L"Loaded " + p);
+    if (A.movie.MaybeStaleClock())
+        MessageBoxW(A.wnd, L"This movie was recorded between Oct 9 and Oct 10, when the game's music clock ran too fast.\n\n"
+                    L"Events timed by the music (such as the stage-clear sequence) now land later, so inputs after them may need "
+                    L"re-syncing: replay it and insert or delete frames where it drifts.",
+                    L"Older movie timing", MB_ICONINFORMATION);
 }
 
 bool WriteMovie(const std::wstring& p, const std::wstring& preludeId = L"") {
