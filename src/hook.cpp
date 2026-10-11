@@ -514,21 +514,67 @@ static HRESULT __stdcall H_Dipup(void* d, UINT t, UINT mi, UINT nv, UINT pc, con
 // game released afterwards. Releasing such a pointer again (the restored game does, exactly as it did the
 // first time) would hit freed memory. So with savestates on, a D3D resource is never destroyed: when the
 // game releases what would be the last reference, the object is kept (one reference stays with us) and the
-// game is told it is gone. The price is video memory that is not given back; a restore is safe.
+// game is told it is gone. Kept objects are destroyed for real once they died before the oldest saved slot (ZOnSave/ZDrain); a restore is safe.
 struct ZClass { void** vt; ULONG (__stdcall *addref)(void*); ULONG (__stdcall *release)(void*); };
 static ZClass ZC[64];
 static volatile LONG NZC;
 static volatile LONG ZombieKept;                     // releases swallowed (statistics)
+static volatile LONG ZombieFreed;                    // kept objects finally destroyed (statistics)
+// Kept objects are given back once no saved state can bring them back: ZSerial counts deaths and saves; an object
+// that died (ZSeq) before the oldest saved slot was taken (ZSlot) is only a dangling pointer in every restorable
+// memory image, and the game never touches such a pointer (it did not the first time either).
+struct ZZombie { void* obj; ZClass* z; uint32_t seq; };
+static const int ZMAX = 65536;
+static ZZombie* ZList;                               // VirtualAlloc'd on first use; when full, further objects are simply never freed
+static int ZCount;
+static uint32_t ZSerial = 1;                  // starts at 1 so a slot value of 0 can mean empty
+static uint32_t ZSlot[8];                            // ZSerial when each slot was saved (0 = empty)
+static uint32_t ZFreeBelow;                          // pending: destroy kept objects with seq <= this (0 = nothing to do)
+static SRWLOCK ZLock = SRWLOCK_INIT;
 static ZClass* ZFind(void* obj) {
     void** vt = *(void***)obj;
     for (LONG i = 0; i < NZC; i++) if (ZC[i].vt == vt) return &ZC[i];
     return nullptr;
 }
+static void ZKeep(void* obj, ZClass* z) {
+    AcquireSRWLockExclusive(&ZLock);
+    if (!ZList) ZList = (ZZombie*)VirtualAlloc(nullptr, ZMAX * sizeof(ZZombie), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (ZList) {
+        int i = ZCount;
+        while (i-- > 0) if (ZList[i].obj == obj) break;     // died before, was brought back by a restore, died again
+        if (i >= 0) ZList[i].seq = ++ZSerial;
+        else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, ++ZSerial};
+    }
+    ReleaseSRWLockExclusive(&ZLock);
+}
+static void ZDrain() {
+    if (!ZFreeBelow) return;
+    AcquireSRWLockExclusive(&ZLock);
+    uint32_t below = ZFreeBelow;
+    ZFreeBelow = 0;
+    int keep = 0;
+    for (int i = 0; i < ZCount; i++) {
+        if (ZList[i].seq <= below) { ZList[i].z->release(ZList[i].obj); InterlockedIncrement(&ZombieFreed); }
+        else ZList[keep++] = ZList[i];
+    }
+    ZCount = keep;
+    ReleaseSRWLockExclusive(&ZLock);
+}
+// Called with the game frozen, right after a save into `slot`.
+static void ZOnSave(int slot) {
+    AcquireSRWLockExclusive(&ZLock);
+    ZSlot[slot] = ZSerial;
+    uint32_t oldest = 0xFFFFFFFFu;
+    for (int i = 0; i < 8; i++) if (ZSlot[i] && ZSlot[i] < oldest) oldest = ZSlot[i];
+    if (oldest != 0xFFFFFFFFu && ZCount) ZFreeBelow = oldest;
+    ReleaseSRWLockExclusive(&ZLock);
+}
 static ULONG __stdcall H_ZRelease(void* self) {
     ZClass* z = ZFind(self);
     if (!z) return 0;
+    ZDrain();                                        // on a game thread that releases D3D objects anyway
     ULONG c = z->addref(self);                       // the count including this temporary reference
-    if (c <= 2) { z->release(self); InterlockedIncrement(&ZombieKept); return 0; }
+    if (c <= 2) { z->release(self); ZKeep(self, z); InterlockedIncrement(&ZombieKept); return 0; }
     z->release(self);
     return z->release(self);
 }
@@ -1473,7 +1519,7 @@ static void HandleSnap(Shm* s, uint32_t f, int64_t frozen) {
         if (ok && DebugLog()) WriteThreadInfo();
         XaResume();
         s->snap_time[0] = hp1 - hp0; s->snap_time[6] = hp2 - hp1; s->snap_time[7] = GetTickCount() - hp2;
-        if (ok) XaOnSave((int)slot);
+        if (ok) { XaOnSave((int)slot); ZOnSave((int)slot); }
         s->snap_frame[slot] = ok ? f : 0;
         s->snap_result = ok ? 1 : 2;
     } else if (cmd == 3) {                       // quiet check: can the game's threads be stopped at once?

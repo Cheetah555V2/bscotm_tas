@@ -304,7 +304,7 @@ restored.
 
 - Savestates are experimental (*Run > Use savestates*, on by default). Rewind and Jump load the nearest
   state and fast-forward from there; with savestates off, or when none is usable, they restart the game and
-  replay from frame 1. Known gaps: sound and picture are not restored, D3D9 video memory is not given back while states exist, and nothing
+  replay from frame 1. Known gaps: sound and picture are not restored, D3D9 objects are only given back once no saved state can need them, and nothing
   survives closing the game. Details: `docs/REVERSE_ENGINEERING.md`.
 - Movies recorded with the 1/60 s clock grid (pull requests #21 and #22, Oct 9-10) ran the game's music clock at double
   speed per frame, so music-timed events (the stage-clear sequence) land later now and such movies may need
