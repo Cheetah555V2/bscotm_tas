@@ -194,6 +194,27 @@ captured against a different start point.
   [offset]`, e.g. `Jmp 12 2` presses jump for 2 frames out of every 12, `R 1 1` holds right on
   every frame. The key is released on the other selected frames; `offset` frames are skipped first.
   Both are one undo step.
+- **Branches.** The **Branches** button in the menu bar opens a list of saved versions of the
+  movie, like TAStudio's branches, for trying ideas side by side. *Save new branch* keeps the
+  current inputs, notes, RNG seed and controller setting, plus the frame the game is at (or the
+  cursor). *Load selected* (or double-click) puts that version back as one undo step and takes the
+  frozen game to its frame: the inputs are rewritten only from the first frame where they differ,
+  so savestates before it stay valid and the jump is quick. *Update selected* overwrites a branch
+  with the current movie; *Rename...* (F2) and *Delete* manage the list. Each row shows the frame
+  where the branch first differs from the current movie. Branches are saved in the `.bscotm` file
+  (an optional `branches` list), so they survive closing the editor. Each branch is a full copy of
+  the inputs (about 40 KB for a 13,000-frame movie).
+  - **Instant loading.** A branch saved while the game is frozen at its frame (savestates on) also
+    keeps a savestate of that moment, for as long as that game runs: loading it puts the game back
+    at once (the *Load* column says "instant"). Up to 4 branches hold one at a time; saving a fifth
+    gives the oldest one's slot back to the automatic states. Editing the movie does not cost a
+    branch its savestate: the branch has its own inputs. Savestates do not survive closing the
+    game, so after a relaunch a branch loads by replaying from the nearest valid state.
+  - **Picture.** Saving a branch while the game is frozen also keeps a small picture of the game
+    (saved in the file); the pane right of the list shows the selected branch's picture.
+  - **Compare.** Tick *Show differences in the grid*: rows whose inputs differ from the selected
+    branch get an orange mark beside the frame number, and keys the branch presses that the movie
+    does not are outlined in orange.
 - **Choosing the input columns.** Right-click the column headings (or *View > Columns...*) for a
   check list of every input column, like TAStudio: untick the ones you do not need. Presets: all
   columns, keyboard only, controller only, or only the columns this movie uses (each key the movie
