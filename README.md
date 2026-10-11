@@ -154,6 +154,7 @@ otherwise use **File > Set game path**.
 | **Stop** (F9) | End the current run |
 
 **Recording mode** (*Run > Recording mode*, saved in the ini) decides what *Record here* and *Record from cursor* do to the frames after the new ones, like TAStudio's recording modes: *Overwrite* (default) replaces the rows the recording covers and adds rows past the end; *Insert* pushes the later rows down so nothing is lost; *Truncate* replaces the rows it covers and drops everything after. Each recording is one undo step.
+**Rerecord count.** The status bar shows *rerecords N* once it is above zero, and the movie file keeps it (an optional `rerecord_count`). It goes up by one every time you rewrite history: an edit or a recording that changes rows the game had already played, one per undo step. Edits past the game's position, undo and redo do not count; a new recording starts again at zero.
 
 Frame advance works like TAStudio: the game is held at a frame boundary, before the
 next frame reads its input, so you can still edit that row. Stepping past the end of

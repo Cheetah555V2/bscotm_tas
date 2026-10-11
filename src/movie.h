@@ -39,6 +39,7 @@ struct Movie {
     Frames frames;
     bool has_seed = false;            // RNG seed = the Unix time the game sees at launch; none = real clock
     uint32_t seed = 0;
+    uint32_t rerecords = 0;           // times history was rewritten: an edit or recording at a row the game had already passed (optional "rerecord_count")
     bool controller = false;          // the game sees one virtual controller (the PAD_* keys); off = it sees none
     std::vector<std::string> notes;   // UTF-8 note per frame ("" = none); frames.size() long once loaded
     Frames prelude;     // embedded prelude (optional)

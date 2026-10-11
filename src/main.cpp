@@ -82,6 +82,7 @@ struct App {
     HMENU speedMenu = nullptr;
     Session sess;                 // the frozen game frame advance steps (when Active)
     Session jobSess;              // handed over by a finished hold job
+    bool rrPending = false;       // the current edit rewrote rows the game had passed: Commit counts one rerecord
     bool liveRec = false;         // recording live from the frozen game (busy is set too)
     int liveRecRow = 0;           // movie row the live recording started at
     int recMode = 0;              // what a recording does to the frames after it: 0 overwrite, 1 insert, 2 truncate (Run > Recording mode)
@@ -168,9 +169,10 @@ int NumStates();
 int StateMark(int row);     // 0: no usable savestate at this row, 1: automatic, 2: manual, 3: held by a branch
 void UpdateStatus() {
     int n = Size();
-    wchar_t b[192], sd[64] = L"";
+    wchar_t b[192], sd[96] = L"";
     if (A.movie.has_seed) swprintf(sd, 40, L"   seed %u", (unsigned)A.movie.seed);
-    if (int ns = NumStates()) swprintf(sd + wcslen(sd), 64 - wcslen(sd), L"   states %d", ns);
+    if (int ns = NumStates()) swprintf(sd + wcslen(sd), 96 - wcslen(sd), L"   states %d", ns);
+    if (A.movie.rerecords) swprintf(sd + wcslen(sd), 96 - wcslen(sd), L"   rerecords %u", (unsigned)A.movie.rerecords);
     double t = (A.cursor + 1) / 60.0, tt = n / 60.0;
     swprintf(b, 192, L"Frame %d / %d   (%d:%05.2f / %d:%05.2f)   game at %d%ls", n ? A.cursor + 1 : 0, n,
              (int)t / 60, t - 60 * ((int)t / 60), (int)tt / 60, tt - 60 * ((int)tt / 60), A.reached, sd);
@@ -230,7 +232,7 @@ void StaleStatesAfter(int pos) {
 // ---- editing (every change goes through DoSplice so it is undoable) -------
 void Touch(size_t pos) {
     A.dirty = true;
-    if ((int)pos < A.reached) A.reached = (int)pos;
+    if ((int)pos < A.reached) { A.reached = (int)pos; A.rrPending = true; }
     StaleStatesAfter((int)pos);
 }
 
@@ -285,6 +287,8 @@ void EnsureRows(Step& st, size_t n) {
 }
 
 void Commit(Step& st) {
+    if (A.rrPending && !st.parts.empty()) A.movie.rerecords++;
+    A.rrPending = false;
     if (st.parts.empty()) return;
     st.cur_after = A.cursor;
     A.undo.push_back(std::move(st));
@@ -301,6 +305,7 @@ void Commit(Step& st) {
 int ApplyRecording(Step& st, size_t at, const Frames& rec) {
     EnsureRows(st, at);
     size_t after = Size() - at;
+    if (after) A.rrPending = true;               // the recording covers rows that already had inputs
     if (A.recMode == 1) DoSplice(st, at, 0, rec);
     else DoSplice(st, at, A.recMode == 2 ? after : std::min(rec.size(), after), rec);
     return (int)(at + rec.size());
@@ -320,7 +325,7 @@ void RunStep(const Step& st, bool undo) {
             if (p.oldv != p.newv) lo = std::min(lo, p.pos);
         }
     }
-    if (lo != (size_t)-1) Touch(lo);
+    if (lo != (size_t)-1) { Touch(lo); A.rrPending = false; }     // undo / redo is not a rerecord, and the count never goes down
     UpdateTitle();
     RefreshNotesList();
     A.cursor = A.anchor = undo ? st.cur_before : st.cur_after;
@@ -3030,7 +3035,7 @@ void OnJobDone(RunResult* r) {
             if (A.jobNew) {
                 Notes none(r->recorded.size());
                 DoSplice(st, 0, Size(), r->recorded, &none);
-                A.path.clear();
+                A.path.clear(); A.rrPending = false; A.movie.rerecords = 0;     // a new recording starts a new count
                 A.movie.prelude.clear();
             } else {
                 ApplyRecording(st, r->first, r->recorded);

@@ -227,6 +227,8 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
     if (sd && sd->t == J::Num && sd->n >= 0 && sd->n <= 4294967295.0) { has_seed = true; seed = (uint32_t)sd->n; }
     const J* cv = root.get("clock_version");
     clock_version = cv && cv->t == J::Num ? (int)cv->n : 0;
+    const J* rr = root.get("rerecord_count");
+    rerecords = rr && rr->t == J::Num && rr->n > 0 && rr->n < 4294967295.0 ? (uint32_t)rr->n : 0;
     const J* ct = root.get("controller");     // the game sees a (virtual) controller: see Movie::controller
     controller = ct && Truthy(*ct);
     Expand(*fr, frames);
@@ -274,6 +276,7 @@ bool Movie::Save(const std::wstring& path, std::string& err) const {
     Esc(f, created);
     if (has_seed) fprintf(f, ",\"rng_seed\":%u", (unsigned)seed); else fputs(",\"rng_seed\":null", f);
     fprintf(f, ",\"clock_version\":%d", clock_version);   // kept as loaded, so an old movie stays flagged until re-synced
+    if (rerecords) fprintf(f, ",\"rerecord_count\":%u", (unsigned)rerecords);
     if (controller) fputs(",\"controller\":true", f);       // only when on, so keyboard movies are written as before
     fputs(",\"anchors\":[],\"prelude_id\":", f);
     if (prelude_id.empty()) fputs("null", f); else Esc(f, prelude_id);
