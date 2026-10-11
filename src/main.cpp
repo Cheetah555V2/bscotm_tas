@@ -89,6 +89,7 @@ struct App {
     HMENU recModeMenu = nullptr;
     bool pendingStep = false;     // step once the resync job finishes
     bool pendingRun = false;      // run to the cursor once the resync job finishes
+    int pendingRunCursor = 0;     // the cursor row F4 was pressed at (a finished job moves the cursor to where the game stopped)
     bool useStates = true;        // Run > Use savestates (on by default): launch the game with the private heap so states can be saved
     int  ssEvery = 2000;          // automatic state every this many frames while the game is advanced (0 = never)
     bool ssManual[8] = {};        // slots saved by hand (never evicted automatically)
@@ -3079,7 +3080,7 @@ void OnJobDone(RunResult* r) {
     }
     if (A.pendingRun) {
         A.pendingRun = false;
-        if (A.sess.Active()) RunToCursor();
+        if (A.sess.Active()) { A.cursor = A.anchor = A.pendingRunCursor; RunToCursor(); }
     }
 }
 
@@ -3130,7 +3131,7 @@ void RunToCursor() {
     int row = (int)A.sess.Row();
     if (row < 0) { SetMsg(L"The game is not frozen."); return; }
     if (row > A.reached) {      // an edit before the game's position invalidated it: replay first
-        A.pendingRun = true;
+        A.pendingRun = true; A.pendingRunCursor = A.cursor;
         StartJob(false, (uint32_t)A.reached, false, false, true);
         if (!A.busy) A.pendingRun = false;
         return;
