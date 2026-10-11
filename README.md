@@ -290,6 +290,9 @@ captured against a different start point.
   Read-only; the pointer chains come from the community cheat table.
 - Green frame numbers are the "greenzone": frames the live game has been advanced
   through. Editing a frame invalidates the greenzone after it.
+  A thin bar at the right edge of a frame number marks a row where the game can be put back at once from a
+  savestate (blue: automatic, orange: saved by hand, purple: held by a branch); jumping to or past such a row
+  starts from there instead of replaying from frame 1.
 
 Set the environment variable `BSCOTM_DEBUG` to make the hook also write diagnostic files to `%TEMP%`
 (`bscotm_probe.txt`, `bscotm_threads.txt`, `bscotm_exit.txt`); the crash log `bscotm_crash.txt` is always
