@@ -152,6 +152,7 @@ otherwise use **File > Set game path**.
 | **Resume live** (F11) | Unfreeze the game and take over with the keyboard (not recorded) |
 | **Record from cursor** (F7) | Play up to the cursor row, then record live from the next frame |
 | **Stop** (F9) | End the current run |
+
 **Recording mode** (*Run > Recording mode*, saved in the ini) decides what *Record here* and *Record from cursor* do to the frames after the new ones, like TAStudio's recording modes: *Overwrite* (default) replaces the rows the recording covers and adds rows past the end; *Insert* pushes the later rows down so nothing is lost; *Truncate* replaces the rows it covers and drops everything after. Each recording is one undo step.
 
 Frame advance works like TAStudio: the game is held at a frame boundary, before the
