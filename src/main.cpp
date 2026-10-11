@@ -162,6 +162,7 @@ std::string U8(const std::wstring& w) {
 void SetMsg(const std::wstring& m) { SendMessageW(A.status, SB_SETTEXTW, 0, (LPARAM)m.c_str()); }
 
 int NumStates();
+int StateMark(int row);     // 0: no usable savestate at this row, 1: automatic, 2: manual, 3: held by a branch
 void UpdateStatus() {
     int n = Size();
     wchar_t b[192], sd[64] = L"";
@@ -788,6 +789,7 @@ void PaintGrid(HWND h) {
         bool gdiff = gf && (real || r < (int)gf->size()) && gm != mask;
 
         Fill(m, 0, y, fw, y + rh, r < A.reached ? (r == A.reached - 1 ? cGreenHead : cGreen) : cHdr);
+        if (int sm = StateMark(r)) Fill(m, fw - S(4), y, fw - S(1), y + rh, sm == 3 ? RGB(150, 60, 190) : sm == 2 ? RGB(235, 120, 0) : RGB(40, 100, 220));     // instant-jump point
         wchar_t num[16];
         swprintf(num, 16, L"%d", r + 1);
         Text(m, num, RECT{0, y, fw - S(6), y + rh}, DT_RIGHT, real ? RGB(0, 0, 0) : cPhantom);
@@ -2915,6 +2917,18 @@ int NumStates() {
     int n = 0;
     if (A.sess.Active() && A.sess.s) for (int i = 0; i < 8; i++) if (StateValid(i)) n++;
     return n;
+}
+
+// Which savestate (if any) the game could be put back to at the start of `row`: shown as a bar beside the frame number.
+int StateMark(int row) {
+    if (!A.sess.Active() || !A.sess.s) return 0;
+    int mark = 0;
+    for (int i = 0; i < 8; i++)
+        if (A.sess.StateRow(i) == row && StateValid(i)) {
+            int k = BranchHolds(i) ? 3 : A.ssManual[i] ? 2 : 1;
+            if (k > mark) mark = k;
+        }
+    return mark;
 }
 
 // The slot to rewind from for a game that has to run row `next` next: the latest valid state at or before it.
