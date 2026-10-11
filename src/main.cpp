@@ -30,6 +30,7 @@ enum {
     IDM_SAVESTATES, IDM_SAVESTATE_NOW, IDM_SSINTERVAL, IDM_CONTROLLER, IDM_COLUMNS, IDM_BRANCHES,
     IDM_RECORD, IDM_PLAY, IDM_REWIND, IDM_RECFROM, IDM_STOP,
     IDM_SPEED0, IDM_SPEED1, IDM_SPEED2, IDM_SPEED3, IDM_STEP, IDM_RESUME, IDM_RECHERE,
+    IDM_RECMODE0, IDM_RECMODE1, IDM_RECMODE2,
     IDC_BASE = 300, IDC_PRE, IDC_RNG_CHK, IDC_RNG_CLR, IDC_RNG_CSV,
 };
 const UINT WM_JOB_PROGRESS = WM_APP + 1;   // wParam = Phase, lParam = movie frame
@@ -83,6 +84,8 @@ struct App {
     Session jobSess;              // handed over by a finished hold job
     bool liveRec = false;         // recording live from the frozen game (busy is set too)
     int liveRecRow = 0;           // movie row the live recording started at
+    int recMode = 0;              // what a recording does to the frames after it: 0 overwrite, 1 insert, 2 truncate (Run > Recording mode)
+    HMENU recModeMenu = nullptr;
     bool pendingStep = false;     // step once the resync job finishes
     bool pendingRun = false;      // run to the cursor once the resync job finishes
     bool useStates = true;        // Run > Use savestates (on by default): launch the game with the private heap so states can be saved
@@ -290,6 +293,17 @@ void Commit(Step& st) {
     st = Step();
     UpdateTitle();
     RefreshNotesList();
+}
+
+// Puts a finished recording into the movie at row `at`, as one undoable step, by the recording mode:
+// overwrite replaces the rows it covers (rows past the end are added), insert pushes the later rows down,
+// truncate replaces the rows it covers and drops everything after. Returns the row after the recording.
+int ApplyRecording(Step& st, size_t at, const Frames& rec) {
+    EnsureRows(st, at);
+    size_t after = Size() - at;
+    if (A.recMode == 1) DoSplice(st, at, 0, rec);
+    else DoSplice(st, at, A.recMode == 2 ? after : std::min(rec.size(), after), rec);
+    return (int)(at + rec.size());
 }
 
 void RunStep(const Step& st, bool undo) {
@@ -3019,8 +3033,7 @@ void OnJobDone(RunResult* r) {
                 A.path.clear();
                 A.movie.prelude.clear();
             } else {
-                size_t at = r->first;
-                DoSplice(st, at, std::min(r->recorded.size(), (size_t)Size() - at), r->recorded);
+                ApplyRecording(st, r->first, r->recorded);
             }
             int end = (int)(r->first + r->recorded.size());
             A.cursor = A.anchor = end - 1;
@@ -3234,10 +3247,7 @@ void StopRecordHere() {
         SetMsg(L"No frames recorded.");
     } else {
         Step st; st.cur_before = A.cursor;
-        size_t at = (size_t)A.liveRecRow;
-        EnsureRows(st, at);
-        DoSplice(st, at, std::min(rec.size(), (size_t)Size() - at), rec);
-        int end = (int)(at + rec.size());
+        int end = ApplyRecording(st, (size_t)A.liveRecRow, rec);
         A.cursor = A.anchor = end - 1;
         Commit(st);
         A.reached = end;        // the game is frozen right after the recording
@@ -3319,6 +3329,11 @@ void BuildMenu(HWND w) {
     add(r, IDM_BM_NEXT, L"&Next bookmark (jump)\tF2");
     add(r, IDM_BM_PREV, L"Pre&vious bookmark (jump)\tShift+F2");
     add(r, IDM_RECHERE, L"Record &here (live, from the frozen game)\tF12");
+    A.recModeMenu = CreatePopupMenu();
+    add(A.recModeMenu, IDM_RECMODE0, L"&Overwrite (replace the frames it covers)");
+    add(A.recModeMenu, IDM_RECMODE1, L"&Insert (push the later frames down)");
+    add(A.recModeMenu, IDM_RECMODE2, L"&Truncate (replace, then drop everything after)");
+    AppendMenuW(r, MF_POPUP, (UINT_PTR)A.recModeMenu, L"Recording &mode (record here / from cursor)");
     add(r, IDM_RESUME, L"Resume &live (unfreeze)\tF11");
     add(r, IDM_STOP, L"&Stop\tF9");
     AppendMenuW(r, MF_SEPARATOR, 0, nullptr);
@@ -3409,6 +3424,8 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 A.speed = sp.empty() ? 3 : std::max(0, std::min(3, _wtoi(sp.c_str())));
                 CheckMenuRadioItem(A.speedMenu, IDM_SPEED0, IDM_SPEED3, IDM_SPEED0 + A.speed, MF_BYCOMMAND);
                 A.useStates = IniGet(L"last", L"savestates") != L"0";
+                A.recMode = std::max(0, std::min(2, _wtoi(IniGet(L"last", L"recmode").c_str())));
+                CheckMenuRadioItem(A.recModeMenu, IDM_RECMODE0, IDM_RECMODE2, IDM_RECMODE0 + A.recMode, MF_BYCOMMAND);
                 LoadHidden();
                 std::wstring ev = IniGet(L"last", L"ssevery");
                 if (!ev.empty()) A.ssEvery = std::max(0, _wtoi(ev.c_str()));
@@ -3534,6 +3551,11 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     if (!A.busy && Size() && MessageBoxW(w, L"Replace the current movie with a new recording?\n(You can undo this.)",
                                                          L"Record new", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) break;
                     StartJob(true, 0, true);
+                    break;
+                case IDM_RECMODE0: case IDM_RECMODE1: case IDM_RECMODE2:
+                    A.recMode = LOWORD(wp) - IDM_RECMODE0;
+                    CheckMenuRadioItem(A.recModeMenu, IDM_RECMODE0, IDM_RECMODE2, LOWORD(wp), MF_BYCOMMAND);
+                    IniSet(L"last", L"recmode", std::to_wstring(A.recMode));
                     break;
                 case IDM_SPEED0: case IDM_SPEED1: case IDM_SPEED2: case IDM_SPEED3:
                     A.speed = LOWORD(wp) - IDM_SPEED0;
