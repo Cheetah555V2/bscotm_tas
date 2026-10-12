@@ -207,14 +207,6 @@ static void WINAPI H_Ft(FILETIME* f) {
     f->dwHighDateTime = (DWORD)(t >> 32);
 }
 
-static DWORD Shorten(DWORD ms) {
-    if (!(S->speed_mask & SPEED_SLEEP) || !ms || ms == INFINITE) return ms;
-    uint32_t sp = Speed();
-    if (sp <= 1000) return ms;
-    DWORD n = (DWORD)((uint64_t)ms * 1000 / sp);
-    return n ? n : 1;
-}
-
 // Exact scaled waits. At speed s a game wait of `ms` should take ms/s of real time. Rounding that up to whole
 // milliseconds (Sleep(1)) would be 50 ms of game time at 50x, i.e. several frames, and the game would measure
 // those frames as long: timers that add up the measured frame time would run fast. So the time left under ~4 ms of real time is
@@ -520,6 +512,7 @@ static ZClass ZC[64];
 static volatile LONG NZC;
 static volatile LONG ZombieKept;                     // releases swallowed (statistics)
 static volatile LONG ZombieFreed;                    // kept objects finally destroyed (statistics)
+static volatile LONG ZombieUntracked;                // kept but not listed because the list was full
 // Kept objects are given back once no saved state can bring them back: ZSerial counts deaths and saves; an object
 // that died (ZSeq) before the oldest saved slot was taken (ZSlot) is only a dangling pointer in every restorable
 // memory image, and the game never touches such a pointer (it did not the first time either).
@@ -536,6 +529,11 @@ static ZClass* ZFind(void* obj) {
     for (LONG i = 0; i < NZC; i++) if (ZC[i].vt == vt) return &ZC[i];
     return nullptr;
 }
+static void ZPublish() {                       // caller holds ZLock
+    if (!S) return;
+    S->zombie_stats[0] = (uint32_t)ZombieKept; S->zombie_stats[1] = (uint32_t)ZombieFreed;
+    S->zombie_stats[2] = (uint32_t)ZCount; S->zombie_stats[3] = (uint32_t)ZombieUntracked;
+}
 static void ZKeep(void* obj, ZClass* z) {
     AcquireSRWLockExclusive(&ZLock);
     if (!ZList) ZList = (ZZombie*)VirtualAlloc(nullptr, ZMAX * sizeof(ZZombie), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -544,7 +542,10 @@ static void ZKeep(void* obj, ZClass* z) {
         while (i-- > 0) if (ZList[i].obj == obj) break;     // died before, was brought back by a restore, died again
         if (i >= 0) ZList[i].seq = ++ZSerial;
         else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, ++ZSerial};
+        else InterlockedIncrement(&ZombieUntracked);
     }
+    InterlockedIncrement(&ZombieKept);
+    ZPublish();
     ReleaseSRWLockExclusive(&ZLock);
 }
 static void ZDrain() {
@@ -558,6 +559,7 @@ static void ZDrain() {
         else ZList[keep++] = ZList[i];
     }
     ZCount = keep;
+    ZPublish();
     ReleaseSRWLockExclusive(&ZLock);
 }
 // Called with the game frozen, right after a save into `slot`.
@@ -574,7 +576,7 @@ static ULONG __stdcall H_ZRelease(void* self) {
     if (!z) return 0;
     ZDrain();                                        // on a game thread that releases D3D objects anyway
     ULONG c = z->addref(self);                       // the count including this temporary reference
-    if (c <= 2) { z->release(self); ZKeep(self, z); InterlockedIncrement(&ZombieKept); return 0; }
+    if (c <= 2) { z->release(self); ZKeep(self, z); return 0; }
     z->release(self);
     return z->release(self);
 }
@@ -1138,7 +1140,6 @@ static void XaKillCb(XaVoice* v) {           // the game's callback object is ab
     XaWaitIdle(v);
 }
 
-static bool AnySlot() { for (int i = 0; i < 8; i++) if (SlotSerial[i]) return true; return false; }
 
 static void XaCrashInfo(void* cb, char* out, int n) {
     int found = 0, live = 0;

@@ -467,6 +467,7 @@ int wmain(int argc, wchar_t** argv) {
             mem("saved", row, GetTickCount() - t1);
             printf("         state pages %u, copied %u, pool in use %u pages (%.0f MB)\n", ss.s->snap_stats[2], ss.s->snap_stats[1], ss.s->snap_stats[0],
                    ss.s->snap_stats[0] * 4096 / 1048576.0);
+            printf("         D3D9 objects kept alive: %u kept in all, %u destroyed later, %u held now, %u untracked\n", ss.s->zombie_stats[0], ss.s->zombie_stats[1], ss.s->zombie_stats[2], ss.s->zombie_stats[3]);
             (void)t0;
         }
         printf("loading slot 0 and running 300 frames...\n");
