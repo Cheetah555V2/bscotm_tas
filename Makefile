@@ -22,7 +22,7 @@ $B/app.o: src/app.rc src/app.manifest | $B
 $B/bscotm_tas.exe: src/main.cpp src/engine.cpp src/movie.cpp src/common.h src/engine.h src/movie.h $B/app.o
 	$(CXX) $(CXXFLAGS) -mwindows -municode src/main.cpp src/engine.cpp src/movie.cpp $B/app.o -o $@ $(LDFLAGS) -lcomctl32 -lcomdlg32 -lole32 -lwindowscodecs -luuid
 
-$B/bscotm_hook.dll: src/hook.cpp src/common.h | $B
+$B/bscotm_hook.dll: src/hook.cpp src/common.h src/savestate.h | $B
 	$(CXX) $(CXXFLAGS) -shared src/hook.cpp -o $@ $(LDFLAGS)
 
 # Test tools (not in the release zip): `build.bat tools`; tools\verify.ps1 builds and runs them.

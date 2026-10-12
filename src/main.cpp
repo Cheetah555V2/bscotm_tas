@@ -3113,7 +3113,7 @@ void FrameAdvance() {
         SetMsg(L"The game stopped responding to frame advance.");
         return;
     }
-    A.reached = row + 1;
+    A.reached = std::max(A.reached, row + 1);      // never shrinks the greenzone: after a savestate load it still reaches past the game
     SetCursorRow(row, false);
     SetMsg(L"Frame " + std::to_wstring(row + 1) + L" advanced.");
 }
