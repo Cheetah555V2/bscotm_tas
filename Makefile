@@ -26,10 +26,13 @@ $B/bscotm_hook.dll: src/hook.cpp src/common.h src/savestate.h | $B
 	$(CXX) $(CXXFLAGS) -shared src/hook.cpp -o $@ $(LDFLAGS)
 
 # Test tools (not in the release zip): `build.bat tools`; tools\verify.ps1 builds and runs them.
-tools: $B/sstest.exe $B/dumpdiff.exe
+tools: $B/sstest.exe $B/dumpdiff.exe $B/movie_test.exe
 
 $B/sstest.exe: tools/sstest.cpp src/engine.cpp src/movie.cpp src/common.h src/engine.h src/movie.h | $B
 	$(CXX) $(CXXFLAGS) -municode tools/sstest.cpp src/engine.cpp src/movie.cpp -o $@ $(LDFLAGS) -lpsapi
+
+$B/movie_test.exe: tools/movie_test.cpp src/movie.cpp src/movie.h src/common.h | $B
+	$(CXX) $(CXXFLAGS) tools/movie_test.cpp src/movie.cpp -o $@ $(LDFLAGS)
 
 $B/dumpdiff.exe: tools/dumpdiff.cpp | $B
 	$(CXX) $(CXXFLAGS) tools/dumpdiff.cpp -o $@ $(LDFLAGS)

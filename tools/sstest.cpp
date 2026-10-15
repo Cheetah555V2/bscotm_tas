@@ -15,8 +15,10 @@
 
 static const char* FIELD[HIST_FIELDS] = {"health", "wpoints", "score", "xspeed", "yspeed", "x", "y", "invis"};
 
+static bool HistLost;     // the history ring (HIST_MAX samples) wrapped before it was read: the first frames of a run are gone, so nothing can be compared
 static void Grab(Session& ss, uint32_t from, std::vector<HistEntry>& out) {
     uint32_t n = ss.s->hist_n;
+    if (n - from > HIST_MAX) { HistLost = true; from = n - HIST_MAX; }
     out.clear();
     for (uint32_t i = from; i < n; i++) out.push_back(ss.s->hist_buf[i % HIST_MAX]);
 }
@@ -256,7 +258,9 @@ int wmain(int argc, wchar_t** argv) {
         else if (k == L"--other") otherPath = v;      // --variant 3: the second run plays this movie instead (same length), e.g. a controller version of the first
         else if (k == L"--dump") dumprow = _wtoi(v.c_str());
         else if (k == L"--dumpfile") { char b[512]; WideCharToMultiByte(CP_ACP, 0, v.c_str(), -1, b, 512, nullptr, nullptr); dumppath = b; }
+        else { wprintf(L"unknown option %ls (every option takes a value, see tools/sstest.cpp)\n", k.c_str()); return 2; }
     }
+    if ((argc - 2) % 2) { wprintf(L"the last option has no value: %ls\n", argv[argc - 1]); return 2; }
     std::string err;
     Movie m;
     if (!m.Load(moviePath, err)) { printf("movie: %s\n", err.c_str()); return 2; }
@@ -298,7 +302,7 @@ int wmain(int argc, wchar_t** argv) {
             RunResult rr2 = RunJob(q, cb2, &s2);
             if (!rr2.ok || !s2.Active()) { printf("%s: launch failed: %s\n", name, rr2.error.c_str()); return r; }
             uint32_t from = 0;
-            auto grab = [&]() { uint32_t n = s2.s->hist_n; for (uint32_t i = from; i < n; i++) r.h.push_back(s2.s->hist_buf[i % HIST_MAX]); from = n; };
+            auto grab = [&]() { uint32_t n = s2.s->hist_n; if (n - from > HIST_MAX) { HistLost = true; from = n - HIST_MAX; } for (uint32_t i = from; i < n; i++) r.h.push_back(s2.s->hist_buf[i % HIST_MAX]); from = n; };
             uint32_t row = s2.Row(), k = 0;
             bool loaded = false;
             while (row < cmpupto) {
@@ -357,6 +361,7 @@ int wmain(int argc, wchar_t** argv) {
             size_t ok = Compare(x.h, y.h, same);
             printf("%s vs %s: %zu matching frames before %s\n", x.name.c_str(), y.name.c_str(), ok, same ? "the end (IDENTICAL)" : "the first difference (above)");
             if (!same && verdict == 0) verdict = 1;
+            if (x.h.empty() || y.h.empty() || ok * 10 < std::min(x.h.size(), y.h.size()) * 9) { puts("  too few frames could be compared: this proves nothing"); if (verdict == 0) verdict = 2; }
         };
         if (a.ok && b.ok && cmpvariant == 3) {      // thread experiment: how often did each side sleep / wait per marker, in the two runs?
             static const char* TN[4] = {"other threads' Sleep", "other threads' Wait", "marker thread's Sleep", "marker thread's Wait"};
@@ -376,7 +381,8 @@ int wmain(int argc, wchar_t** argv) {
         if (a.ok && b.ok) diff(a, b);
         if (a.ok && c.ok) diff(a, c);
         if (!a.ok || !b.ok || (cmpvariant == 0 && !c.ok)) verdict = 2;
-        printf("VERDICT: %s\n", verdict == 0 ? "PASS" : verdict == 1 ? "FAIL (runs differ)" : "FAIL (a run did not complete)");
+        if (HistLost && verdict == 0) { puts("the value history wrapped (more than 32768 samples in a run): the first frames were lost, so the comparison is not complete"); verdict = 2; }
+        printf("VERDICT: %s\n", verdict == 0 ? "PASS" : verdict == 1 ? "FAIL (runs differ)" : "FAIL (a run did not complete, or too little was compared)");
         return verdict;
     }
 
@@ -535,7 +541,9 @@ int wmain(int argc, wchar_t** argv) {
             bool same;
             size_t ok = Compare(ref, got, same);
             printf("  ran on: %zu samples, %zu matching frames before %s\n", got.size(), ok, same ? "the end (IDENTICAL)" : "the first difference");
-            if (same) good++;
+            bool enough = !got.empty() && ok * 10 >= got.size() * 9;
+            if (!enough) puts("  too few frames could be compared: this rep proves nothing");
+            if (same && enough) good++;
         }
         printf("result: %d / %u identical\n", good, reps);
 

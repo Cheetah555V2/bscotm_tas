@@ -46,7 +46,10 @@ typedef std::vector<std::string> Notes;   // UTF-8, parallel to the frames
 
 // One undoable edit = a list of "replace range" operations (frames and their notes).
 struct Splice { size_t pos; Frames oldv, newv; Notes oldn, newn; };
-struct Step   { std::vector<Splice> parts; int cur_before = 0, cur_after = 0; };
+// The movie settings that act at the game's start. A change to them is part of an undo step too (the grid alone would undo to the old
+// inputs under the new seed / controller).
+struct Settings { bool has_seed = false; uint32_t seed = 0; bool controller = false; };
+struct Step   { std::vector<Splice> parts; int cur_before = 0, cur_after = 0; bool setChanged = false; Settings setOld, setNew; };
 
 struct App {
     HWND wnd = nullptr, grid = nullptr, status = nullptr, cbBase = nullptr, cbPre = nullptr;
@@ -291,7 +294,7 @@ void EnsureRows(Step& st, size_t n) {
 void Commit(Step& st) {
     if (A.rrPending && !st.parts.empty()) A.movie.rerecords++;
     A.rrPending = false;
-    if (st.parts.empty()) return;
+    if (st.parts.empty() && !st.setChanged) return;
     st.cur_after = A.cursor;
     A.undo.push_back(std::move(st));
     if (A.undo.size() > 500) A.undo.erase(A.undo.begin());
@@ -313,9 +316,29 @@ int ApplyRecording(Step& st, size_t at, const Frames& rec) {
     return (int)(at + rec.size());
 }
 
+Settings CurSettings() { return {A.movie.has_seed, A.movie.seed, A.movie.controller}; }
+// The seed and the controller act when the game starts: after a change the running game and its savestates no longer match.
+void ApplySettings(const Settings& s) {
+    A.movie.has_seed = s.has_seed;
+    A.movie.seed = s.seed;
+    A.movie.controller = s.controller;
+    A.dirty = true;
+    A.reached = 0; StaleStatesAfter(-1);
+    InvalidateRect(A.grid, nullptr, TRUE);
+    UpdateScroll(); UpdateStatus();
+}
+// Changes the settings as one undoable step (together with whatever `st` already holds).
+void ChangeSettings(Step& st, const Settings& now) {
+    st.setChanged = true;
+    st.setOld = CurSettings();
+    st.setNew = now;
+    ApplySettings(now);
+}
+
 void RunStep(const Step& st, bool undo) {
     size_t lo = (size_t)-1;
     A.dirty = true;
+    if (st.setChanged) ApplySettings(undo ? st.setOld : st.setNew);
     if (undo) {
         for (auto it = st.parts.rbegin(); it != st.parts.rend(); ++it) {
             Replace(it->pos, it->newv.size(), it->oldv, it->oldn);
@@ -715,11 +738,11 @@ void EditSeed() {
         }
     }
     if (has == A.movie.has_seed && (!has || (uint32_t)v == A.movie.seed)) return;
-    A.movie.has_seed = has;
-    A.movie.seed = (uint32_t)v;
-    A.dirty = true;
-    A.reached = 0; StaleStatesAfter(-1);
-    InvalidateRect(A.grid, nullptr, FALSE);
+    {
+        Step st; st.cur_before = A.cursor;
+        ChangeSettings(st, Settings{has, (uint32_t)v, A.movie.controller});
+        Commit(st);
+    }
     UpdateTitle(); UpdateStatus();
     SetMsg(has ? L"RNG seed " + std::to_wstring(A.movie.seed) + L". Rewind (F6) to restart the game with it."
                : L"RNG seed removed: the game uses the real clock. Rewind (F6) to restart it.");
@@ -739,10 +762,11 @@ void ToggleController() {
                                        L"(they stay in the movie, hidden, and come back when you turn the controller on again).\n\nTurn the controller off?",
                                 L"Controller", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
     }
-    A.movie.controller = on;
-    A.dirty = true;
-    A.reached = 0; StaleStatesAfter(-1);
-    InvalidateRect(A.grid, nullptr, TRUE);
+    {
+        Step st; st.cur_before = A.cursor;
+        ChangeSettings(st, Settings{A.movie.has_seed, A.movie.seed, on});
+        Commit(st);
+    }
     UpdateScroll(); UpdateTitle(); UpdateStatus();
     SetMsg(on ? L"Controller on: the game sees one Xbox 360 pad (the pA ... RT columns); recording reads your pad. Rewind (F6) to restart the game with it."
               : L"Controller off: the game sees no controller. Rewind (F6) to restart it.");
@@ -1377,8 +1401,13 @@ void SaveBranch(int idx) {
         }
     } else {
         if (idx >= (int)A.movie.branches.size()) return;
+        const std::string oldName = A.movie.branches[idx].name, oldSaved = A.movie.branches[idx].saved;
         std::wstring q = L"Overwrite \"" + W(A.movie.branches[idx].name) + L"\" with the current movie (frame " + std::to_wstring(b.frame) + L")?";
         if (MessageBoxW(BrWnd ? BrWnd : A.wnd, q.c_str(), L"Update branch", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        if (idx >= (int)A.movie.branches.size() || A.movie.branches[idx].name != oldName || A.movie.branches[idx].saved != oldSaved) {      // the list changed while the box was open
+            SetMsg(L"The branch list changed while the box was open: nothing was overwritten.");
+            return;
+        }
         b.name = A.movie.branches[idx].name;
         if (BranchStateLive(A.movie.branches[idx])) A.ssManual[A.movie.branches[idx].slot] = false;     // its old state goes
     }
@@ -1419,13 +1448,7 @@ void LoadBranch(int idx) {
         DoSplice(st, d, n - d, Frames(b.frames.begin() + d, b.frames.end()), &nn);
     }
     bool settings = b.has_seed != A.movie.has_seed || (b.has_seed && b.seed != A.movie.seed) || b.controller != A.movie.controller;
-    if (settings) {             // the RNG seed and the controller act at the game's start: it has to be relaunched
-        A.movie.has_seed = b.has_seed;
-        A.movie.seed = b.seed;
-        A.movie.controller = b.controller;
-        A.dirty = true;
-        A.reached = 0; StaleStatesAfter(-1);
-    }
+    if (settings) ChangeSettings(st, Settings{b.has_seed, b.seed, b.controller});     // the RNG seed and the controller act at the game's start: it has to be relaunched; undoable with the rest
     A.cursor = A.anchor = (int)std::min<size_t>(b.frame ? b.frame - 1 : 0, (size_t)std::max(0, Size() - 1));
     Commit(st);
     UpdateScroll(); UpdateTitle(); UpdateStatus();
@@ -1458,7 +1481,12 @@ void LoadBranch(int idx) {
 void RenameBranch(int idx) {
     if (idx < 0 || idx >= (int)A.movie.branches.size()) return;
     std::wstring t = W(A.movie.branches[idx].name);
+    const std::string oldName = A.movie.branches[idx].name, oldSaved = A.movie.branches[idx].saved;
     if (!AskText(L"Rename branch", L"Name:", t) || t.empty()) return;
+    if (idx >= (int)A.movie.branches.size() || A.movie.branches[idx].name != oldName || A.movie.branches[idx].saved != oldSaved) {      // the list changed while the dialog was open
+        SetMsg(L"The branch list changed while the dialog was open: nothing was renamed.");
+        return;
+    }
     A.movie.branches[idx].name = U8(t);
     A.dirty = true;
     UpdateTitle();
@@ -1468,7 +1496,12 @@ void RenameBranch(int idx) {
 void DeleteBranch(int idx) {
     if (idx < 0 || idx >= (int)A.movie.branches.size()) return;
     std::wstring q = L"Delete branch \"" + W(A.movie.branches[idx].name) + L"\"? This cannot be undone.";
+    const std::string oldName = A.movie.branches[idx].name, oldSaved = A.movie.branches[idx].saved;
     if (MessageBoxW(BrWnd ? BrWnd : A.wnd, q.c_str(), L"Delete branch", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    if (idx >= (int)A.movie.branches.size() || A.movie.branches[idx].name != oldName || A.movie.branches[idx].saved != oldSaved) {     // the list changed while the box was open
+        SetMsg(L"The branch list changed while the box was open: nothing was deleted.");
+        return;
+    }
     if (BranchStateLive(A.movie.branches[idx])) A.ssManual[A.movie.branches[idx].slot] = false;      // its slot goes back to the automatic states
     A.movie.branches.erase(A.movie.branches.begin() + idx);
     A.dirty = true;
@@ -3688,7 +3721,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
-        if (!TranslateAcceleratorW(w, ha, &m)) {
+        // The editor's shortcuts belong to the main window: in a tool window (Help, Branches, Notes ...) Ctrl+A / Ctrl+X / Ctrl+Z
+        // would act on the movie, and F2 could never reach the Branches window's own rename.
+        bool mine = GetAncestor(m.hwnd, GA_ROOT) == w;
+        if (!mine || !TranslateAcceleratorW(w, ha, &m)) {
             TranslateMessage(&m);
             DispatchMessageW(&m);
         }

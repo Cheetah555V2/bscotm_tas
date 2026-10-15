@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h>
 
 namespace {
 
@@ -22,6 +23,7 @@ struct J {
 struct Parser {
     const char *p, *e;
     bool ok = true;
+    int depth = 0;                    // nesting of the value being read: a file of 100 000 "[" must not overflow the stack
     void ws() { while (p < e && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++; }
     bool lit(const char* w) {
         size_t n = strlen(w);
@@ -31,7 +33,19 @@ struct Parser {
     void utf8(std::string& o, unsigned c) {
         if (c < 0x80) o += (char)c;
         else if (c < 0x800) { o += (char)(0xC0 | c >> 6); o += (char)(0x80 | (c & 63)); }
-        else { o += (char)(0xE0 | c >> 12); o += (char)(0x80 | ((c >> 6) & 63)); o += (char)(0x80 | (c & 63)); }
+        else if (c < 0x10000) { o += (char)(0xE0 | c >> 12); o += (char)(0x80 | ((c >> 6) & 63)); o += (char)(0x80 | (c & 63)); }
+        else { o += (char)(0xF0 | c >> 18); o += (char)(0x80 | ((c >> 12) & 63)); o += (char)(0x80 | ((c >> 6) & 63)); o += (char)(0x80 | (c & 63)); }
+    }
+    // Four hex digits at q (all of them: strtoul would also take " 1f", "+1f" and non-hex text as 0); -1 if they are not.
+    static int hex4(const char* q) {
+        int v = 0;
+        for (int i = 0; i < 4; i++) {
+            char c = q[i];
+            int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (d < 0) return -1;
+            v = v << 4 | d;
+        }
+        return v;
     }
     bool str(std::string& o) {
         if (p >= e || *p != '"') return ok = false;
@@ -46,9 +60,15 @@ struct Parser {
                 case 'f': o += '\f'; break;
                 case 'u': {
                     if (e - p < 5) return ok = false;
-                    char h[5] = {p[1], p[2], p[3], p[4], 0};
-                    utf8(o, (unsigned)strtoul(h, nullptr, 16));
+                    int c = hex4(p + 1);
+                    if (c < 0) return ok = false;
                     p += 4;
+                    if (c >= 0xD800 && c < 0xDC00) {               // a high surrogate: Python writes non-BMP characters (emoji) as a pair
+                        int lo = e - p >= 7 && p[1] == '\\' && p[2] == 'u' ? hex4(p + 3) : -1;
+                        if (lo >= 0xDC00 && lo < 0xE000) { c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00); p += 6; }
+                        else c = 0xFFFD;
+                    } else if (c >= 0xDC00 && c < 0xE000) c = 0xFFFD;   // a lone low surrogate
+                    utf8(o, (unsigned)c);
                     break;
                 }
                 default: o += *p;
@@ -61,6 +81,8 @@ struct Parser {
     bool val(J& j) {
         ws();
         if (p >= e) return ok = false;
+        struct Depth { int& d; explicit Depth(int& x) : d(x) { ++d; } ~Depth() { --d; } } depthGuard(depth);
+        if (depth > 64) return ok = false;
         switch (*p) {
             case '{':
                 j.t = J::Obj; p++; ws();
@@ -96,12 +118,17 @@ struct Parser {
             case 't': j.t = J::Bool; j.n = 1; return lit("true");
             case 'f': j.t = J::Bool; return lit("false");
             case 'n': return lit("null");
-            default: {
+            default: {                      // a JSON number only: strtod would also take inf, nan, hex and a leading +
+                char buf[64];
+                size_t n = 0;
+                while (p + n < e && n < sizeof buf - 1 && ((p[n] >= '0' && p[n] <= '9') || p[n] == '-' || p[n] == '+' || p[n] == '.' || p[n] == 'e' || p[n] == 'E')) { buf[n] = p[n]; n++; }
+                buf[n] = 0;
+                if (!n || buf[0] == '+') return ok = false;
                 char* end;
                 j.t = J::Num;
-                j.n = strtod(p, &end);
-                if (end == p) return ok = false;
-                p = end;
+                j.n = strtod(buf, &end);
+                if (end == buf) return ok = false;
+                p += end - buf;
                 return true;
             }
         }
@@ -115,7 +142,7 @@ int BitFromKey(const std::string& k) {
     for (int i = 0; i < NUM_KEYS; i++) if (k == KEYS[i].name) return i;
     char* end;
     long vk = strtol(k.c_str(), &end, 10);
-    if (end != k.c_str() && !*end)
+    if (end != k.c_str() && !*end && vk > 0)             // controller keys have vk 0: "0" is not one of them
         for (int i = 0; i < NUM_KEYS; i++) if (KEYS[i].vk == vk) return i;
     return -1;
 }
@@ -174,6 +201,7 @@ void ReadNotes(const J* nt, size_t n, std::vector<std::string>& notes) {
         const J* fn = e.get("frame");
         const J* tx = e.get("text");
         if (!fn || !tx || fn->t != J::Num || tx->t != J::Str) continue;
+        if (!(fn->n >= 1 && fn->n <= 2147483647.0)) continue;
         long idx = (long)fn->n - 1;
         const J* bm = e.get("bookmark");
         if (idx >= 0 && (size_t)idx < notes.size()) notes[idx] = (bm && Truthy(*bm) ? std::string(1, kBookmarkFlag) : std::string()) + tx->s;
@@ -209,6 +237,8 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
     Parser ps{buf.data(), buf.data() + buf.size()};
     J root;
     if (!ps.val(root) || root.t != J::Obj) { err = "not a valid JSON movie"; return false; }
+    ps.ws();
+    if (ps.p != ps.e) { err = "not a valid JSON movie (text after the end)"; return false; }
     const J* fmt = root.get("format");
     if (!fmt || fmt->s != "bscotm-tas") { err = "not a bscotm-tas file"; return false; }
     const J* fr = root.get("frames");
@@ -226,16 +256,20 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
     const J* sd = root.get("rng_seed");
     if (sd && sd->t == J::Num && sd->n >= 0 && sd->n <= 4294967295.0) { has_seed = true; seed = (uint32_t)sd->n; }
     const J* cv = root.get("clock_version");
-    clock_version = cv && cv->t == J::Num ? (int)cv->n : 0;
+    clock_version = cv && cv->t == J::Num && cv->n >= 0 && cv->n <= 1000 ? (int)cv->n : 0;
     const J* rr = root.get("rerecord_count");
     rerecords = rr && rr->t == J::Num && rr->n > 0 && rr->n < 4294967295.0 ? (uint32_t)rr->n : 0;
     const J* ct = root.get("controller");     // the game sees a (virtual) controller: see Movie::controller
     controller = ct && Truthy(*ct);
     Expand(*fr, frames);
+    if (frames.size() > MAX_FRAMES - 4) { err = "too many frames (the editor handles up to 1,048,572)"; return false; }
     ReadNotes(root.get("notes"), frames.size(), notes);
     prelude.clear();
     const J* pf = root.get("prelude_frames");
-    if (pf && pf->t == J::Arr) Expand(*pf, prelude);
+    if (pf && pf->t == J::Arr) {
+        Expand(*pf, prelude);
+        if (prelude.size() > MAX_FRAMES / 2) { err = "the prelude is too long"; return false; }
+    }
     branches.clear();
     const J* br = root.get("branches");      // optional: [{"name", "saved", "frame", "rng_seed", "controller", "frames", "notes"}]
     if (br && br->t == J::Arr)
@@ -246,11 +280,13 @@ bool Movie::Load(const std::wstring& path, std::string& err) {
             const J* s;
             if ((s = e.get("name")) && s->t == J::Str) b.name = s->s;
             if ((s = e.get("saved")) && s->t == J::Str) b.saved = s->s;
-            if ((s = e.get("frame")) && s->t == J::Num && s->n >= 0) b.frame = (uint32_t)s->n;
+            if ((s = e.get("frame")) && s->t == J::Num && s->n >= 0 && s->n <= 4294967295.0) b.frame = (uint32_t)s->n;
             if ((s = e.get("rng_seed")) && s->t == J::Num && s->n >= 0 && s->n <= 4294967295.0) { b.has_seed = true; b.seed = (uint32_t)s->n; }
             b.controller = (s = e.get("controller")) && Truthy(*s);
             if ((s = e.get("thumb")) && s->t == J::Str) b.thumb = s->s;
             Expand(*bf, b.frames);
+            if (b.frames.size() > MAX_FRAMES - 4) { err = "a branch is too long"; return false; }
+            if (b.frame > b.frames.size()) b.frame = (uint32_t)b.frames.size();     // a hand-edited row past the end would index out of range
             ReadNotes(e.get("notes"), b.frames.size(), b.notes);
             branches.push_back(std::move(b));
         }
@@ -263,7 +299,10 @@ bool Movie::MaybeStaleClock() const {
 }
 
 bool Movie::Save(const std::wstring& path, std::string& err) const {
-    FILE* f = _wfopen(path.c_str(), L"wb");
+    // Written to a temporary file next to the movie and moved over it at the end: a full disk, a dropped drive or a crash half way
+    // through must not leave a truncated movie in place of the good one.
+    const std::wstring tmp = path + L".tmp";
+    FILE* f = _wfopen(tmp.c_str(), L"wb");
     if (!f) { err = "cannot write file"; return false; }
     KeyMask used = 0;
     for (KeyMask m : frames) used |= m;
@@ -313,6 +352,13 @@ bool Movie::Save(const std::wstring& path, std::string& err) const {
         fputc(']', f);
     }
     fputc('}', f);
-    if (fclose(f) != 0) { err = "write failed"; return false; }
+    bool bad = ferror(f) != 0 || fflush(f) != 0;
+    if (fclose(f) != 0) bad = true;
+    if (bad) { DeleteFileW(tmp.c_str()); err = "write failed (disk full?); the movie on disk is unchanged"; return false; }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmp.c_str());
+        err = "cannot replace the movie file (is it open in another program?); the movie on disk is unchanged";
+        return false;
+    }
     return true;
 }

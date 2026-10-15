@@ -70,6 +70,14 @@ $sstest = Join-Path $build 'sstest.exe'
 $dll = Join-Path $build 'bscotm_hook.dll'
 foreach ($f in $sstest, $dll) { if (-not (Test-Path $f)) { Fail "missing $f (run build.bat all tools)" } }
 
+# The movie file reader / writer needs no game: a quick check before the long ones.
+$movieTest = Join-Path $build 'movie_test.exe'
+if (Test-Path $movieTest) {
+    & $movieTest > (Join-Path $build 'verify-movie-test.log')
+    if ($LASTEXITCODE -ne 0) { Fail "movie_test failed, see build\verify-movie-test.log" }
+    Write-Host ("{0,-24} PASS" -f "Movie file reader/writer")
+}
+
 # ---- checks -----------------------------------------------------------------------------------------------------
 $n = $frames - 5                             # compare up to here
 $late = [Math]::Max(500, $n - 900)
