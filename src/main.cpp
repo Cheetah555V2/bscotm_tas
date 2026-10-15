@@ -258,7 +258,9 @@ bool IsBm(const std::string& s) { return !s.empty() && s[0] == BM_FLAG; }
 std::string NoteBody(const std::string& s) { return IsBm(s) ? s.substr(1) : s; }
 bool RowIsBm(int row) { return IsBm(NoteAt(row)); }
 
+static unsigned MovieGen;           // bumped on every change of the movie's inputs (Replace, a new or opened movie): caches keyed on the inputs use it
 void Replace(size_t pos, size_t oldlen, const Frames& nv, const Notes& nn) {
+    MovieGen++;
     Frames& f = A.movie.frames;
     Notes& n = A.movie.notes;
     n.resize(f.size());
@@ -1328,12 +1330,30 @@ static void UpdateGhost() {
 
 static void UpdatePicture() {
     int sel = BrSelected();
-    if (sel == BrPicFor && BrPic) return;
+    const std::string* th = sel >= 0 && sel < (int)A.movie.branches.size() ? &A.movie.branches[sel].thumb : nullptr;
+    static const char* shownData; static size_t shownSize;      // which picture BrPic was decoded from: the list is refreshed on every edit, the PNG must not be decoded again each time
+    if (sel == BrPicFor && BrPic && th && th->data() == shownData && th->size() == shownSize) return;
     if (BrPic) { DeleteObject(BrPic); BrPic = nullptr; }
     BrPicFor = sel;
-    if (sel >= 0 && sel < (int)A.movie.branches.size() && !A.movie.branches[sel].thumb.empty())
-        BrPic = DecodePng(A.movie.branches[sel].thumb, BrPicW, BrPicH);
+    if (th && !th->empty()) {
+        BrPic = DecodePng(*th, BrPicW, BrPicH);
+        shownData = th->data(); shownSize = th->size();
+    }
     if (BrWnd) InvalidateRect(BrWnd, nullptr, TRUE);
+}
+
+// First row where a branch differs from the movie. O(rows) per branch, and the list is refreshed on every edit, so the answer is kept
+// until the movie or that branch's inputs change (a branch is replaced as a whole, never edited in place).
+static int BranchDiff(size_t i, const Branch& b) {
+    struct Entry { const KeyMask* data = nullptr; size_t size = 0; unsigned gen = ~0u; int diff = 0; };
+    static std::vector<Entry> cache;
+    if (cache.size() <= i) cache.resize(i + 1);
+    Entry& e = cache[i];
+    if (e.data != b.frames.data() || e.size != b.frames.size() || e.gen != MovieGen) {
+        e.data = b.frames.data(); e.size = b.frames.size(); e.gen = MovieGen;
+        e.diff = FirstDiff(A.movie.frames, b.frames);
+    }
+    return e.diff;
 }
 
 void RefreshBranchList(int select) {
@@ -1349,7 +1369,7 @@ void RefreshBranchList(int select) {
         it.iItem = (int)i;
         it.pszText = (LPWSTR)name.c_str();
         SendMessageW(BrList, LVM_INSERTITEMW, 0, (LPARAM)&it);
-        int d = FirstDiff(A.movie.frames, b.frames);
+        int d = BranchDiff(i, b);
         std::wstring cols[] = {
             std::to_wstring(b.frame), std::to_wstring(b.frames.size()),
             d < 0 ? std::wstring(L"same inputs") : L"frame " + std::to_wstring(d + 1),
@@ -1364,7 +1384,6 @@ void RefreshBranchList(int select) {
     }
     SendMessageW(BrList, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(BrList, nullptr, TRUE);
-    BrPicFor = -2;              // the branch at that index may be another one now
     UpdatePicture();
     UpdateGhost();
 }
@@ -1832,6 +1851,9 @@ static Shm* OpenLogShm();
 bool PickFile(bool save, const wchar_t* filter, const wchar_t* ext, std::wstring& io, const std::wstring& dir);
 struct HistRow { int frame; uint32_t v[HIST_FIELDS]; };
 static std::vector<HistRow> Hist;
+static unsigned HistEpoch;                                      // bumped whenever rows are removed: the cached ranges below are then stale
+struct HistRange { size_t rows = 0; unsigned epoch = 0; bool any = false; double mn = 1e300, mx = -1e300; };
+static HistRange HistRanges[HIST_FIELDS];                       // per field: min and max over the first `rows` rows, kept up to date as rows are added
 static uint32_t HistLast;
 static const wchar_t* const HIST_NAMES[HIST_FIELDS] = {L"Health", L"Weapon points", L"Score", L"X speed", L"Y speed", L"X position", L"Y position", L"Invisibility"};
 static const bool HIST_FLOAT[HIST_FIELDS] = {false, false, false, true, true, true, true, true};
@@ -1856,7 +1878,7 @@ void RefreshHistory() {
     if (!s) return;
     s->hist_on = A.histOn ? 1 : 0;
     uint32_t n = s->hist_n;
-    if (n < HistLast) { Hist.clear(); HistLast = 0; }              // the game was relaunched: new history
+    if (n < HistLast) { Hist.clear(); HistEpoch++; HistLast = 0; }  // the game was relaunched: new history
     if (n - HistLast > HIST_MAX) HistLast = n - HIST_MAX;           // fell behind (old samples were overwritten)
     if (n == HistLast) return;
     for (uint32_t i = HistLast; i < n; i++) {
@@ -1869,7 +1891,7 @@ void RefreshHistory() {
         Hist.push_back(r);
     }
     HistLast = n;
-    if (Hist.size() > 400000) Hist.erase(Hist.begin(), Hist.begin() + 100000);
+    if (Hist.size() > 400000) { Hist.erase(Hist.begin(), Hist.begin() + 100000); HistEpoch++; }
     RefreshGraph();
 }
 
@@ -1950,8 +1972,10 @@ static void PaintGraph(HWND h) {
         }
         int lx = pr.left + S(4);
         for (int f : sel) {
-            double mn = 1e300, mx = -1e300;
-            for (const HistRow& r : Hist) { double v; if (HistValue(r, f, v)) { mn = std::min(mn, v); mx = std::max(mx, v); } }
+            HistRange& hr = HistRanges[f];            // a repaint on every mouse move must not rescan up to 400 000 rows per field
+            if (hr.epoch != HistEpoch || hr.rows > Hist.size()) hr = HistRange{0, HistEpoch, false, 1e300, -1e300};
+            for (; hr.rows < Hist.size(); hr.rows++) { double v; if (HistValue(Hist[hr.rows], f, v)) { hr.mn = std::min(hr.mn, v); hr.mx = std::max(hr.mx, v); } }
+            double mn = hr.mn, mx = hr.mx;
             if (mn > mx) continue;
             if (mx - mn < 1e-9) { mn -= 1; mx += 1; }
             HPEN pen = CreatePen(PS_SOLID, 2, GRAPH_COLORS[f]);
@@ -2190,14 +2214,25 @@ void RefreshRngLog() {
     if (n - LogLast > RNG_LOG_MAX) LogLast = n - RNG_LOG_MAX; // fell behind (old entries are overwritten)
     if (n == LogLast) return;
     SendMessageW(A.rngList, WM_SETREDRAW, FALSE, 0);
-    for (uint32_t i = LogLast; i < n; i++) {
+    // Keep the newest 20000 rows. Trimming one row at a time was O(rows) per row (a vector erase and a ListView delete at the front), seconds
+    // of frozen editor when a fast-forward logged thousands of draws: drop the surplus in one go instead.
+    const size_t kKeep = 20000;
+    size_t incoming = n - LogLast, firstNew = 0;
+    if (incoming > kKeep) firstNew = incoming - kKeep;               // the oldest of these would be trimmed at once
+    size_t total = RngRows.size() + (incoming - firstNew), excess = total > kKeep ? total - kKeep : 0;
+    size_t oldDrop = std::min(excess, RngRows.size());
+    RngRows.erase(RngRows.begin(), RngRows.begin() + oldDrop);
+    bool rebuild = oldDrop > 64;
+    if (rebuild) ListView_DeleteAllItems(A.rngList);
+    else for (size_t k = 0; k < oldDrop; k++) ListView_DeleteItem(A.rngList, 0);
+    for (uint32_t i = LogLast + (uint32_t)firstNew + (uint32_t)(excess - oldDrop); i < n; i++) {
         const RngLogEntry& e = s->rng_log_buf[i & (RNG_LOG_MAX - 1)];
         RngRow r{e.frame, e.eip, e.ret, e.range, e.w, e.kind};
         RngRows.push_back(r);
-        RngAddRow(r);
+        if (!rebuild) RngAddRow(r);
     }
+    if (rebuild) for (const RngRow& r : RngRows) RngAddRow(r);
     LogLast = n;
-    while (RngRows.size() > 20000) { RngRows.erase(RngRows.begin()); ListView_DeleteItem(A.rngList, 0); }
     SendMessageW(A.rngList, WM_SETREDRAW, TRUE, 0);
     ListView_EnsureVisible(A.rngList, ListView_GetItemCount(A.rngList) - 1, FALSE);
     InvalidateRect(A.rngList, nullptr, TRUE);
@@ -2602,7 +2637,7 @@ void LoadPath(const std::wstring& p) {
     Movie m;
     std::string err;
     if (!m.Load(p, err)) { MessageBoxW(A.wnd, W(err).c_str(), L"Open failed", MB_ICONERROR); return; }
-    A.movie = std::move(m);
+    A.movie = std::move(m); MovieGen++;
     A.path = p;
     A.dirty = false;
     A.undo.clear(); A.redo.clear();
@@ -2665,7 +2700,7 @@ bool ConfirmDiscard() {
 
 void FileNew() {
     if (A.busy || !ConfirmDiscard()) return;
-    A.movie = Movie();
+    A.movie = Movie(); MovieGen++;
     A.path.clear(); A.dirty = false;
     A.undo.clear(); A.redo.clear();
     A.cursor = A.anchor = A.top = A.reached = 0; StaleStatesAfter(-1);

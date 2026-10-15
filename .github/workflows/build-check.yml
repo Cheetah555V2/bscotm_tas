@@ -1,0 +1,31 @@
+name: build-check
+
+# Every pull request (and every push to cpp / main) must still build the editor, the hook DLL and the test tools, and the
+# movie file reader/writer test (tools/movie_test.cpp, no game needed) must pass. The replay check that needs the game is a
+# separate, opt-in workflow (replay-check.yml).
+on:
+  pull_request:
+  push:
+    branches: [cpp, main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up 32-bit MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          update: false
+          install: mingw-w64-i686-gcc make
+
+      - name: Build the editor, the hook and the test tools
+        shell: msys2 {0}
+        run: make all tools
+
+      - name: Movie file reader/writer test
+        shell: pwsh
+        run: ./build/movie_test.exe

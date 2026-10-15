@@ -105,6 +105,8 @@ static int64_t FcServe() {
     return t;
 }
 
+// The clock the game sees for a real counter value. In frame-clock mode the answer is the frame time and the real value is not needed, so it
+// must not be run through VNow (which takes the clock lock) first: the clock is read many times per frame.
 static int64_t Quant(int64_t v) {
     uint32_t hz = S->quant_hz;
     if (!hz) return v;
@@ -135,6 +137,10 @@ static int64_t Quant(int64_t v) {
     }
     if (v < V0) return v;
     return V0 + (v - V0) / step * step;
+}
+static inline int64_t QuantReal(int64_t real) {
+    if (S->quant_hz && S->quant_lock == 3 && FcOn) return FcServe();      // what Quant would do: the real value is not needed
+    return Quant(VNow(real));
 }
 // At every frame marker: start the frame-locked clock at the first one; later keep it from running behind what the game was told.
 static void LockAtMarker(uint32_t f, int64_t vnow) {
@@ -167,7 +173,7 @@ static void LockAtMarker(uint32_t f, int64_t vnow) {
 static BOOL WINAPI H_Qpc(LARGE_INTEGER* o) {
     FcCaller = (uint32_t)(uintptr_t)__builtin_return_address(0);
     BOOL r = R_Qpc(o);
-    if (r && (S->speed_mask & SPEED_QPC)) o->QuadPart = Quant(VNow(o->QuadPart));
+    if (r && (S->speed_mask & SPEED_QPC)) o->QuadPart = QuantReal(o->QuadPart);
     return r;
 }
 
@@ -177,7 +183,7 @@ static DWORD WINAPI H_Tgt() {
     if (!(S->speed_mask & SPEED_MMTIME)) return r;
     LARGE_INTEGER q;
     R_Qpc(&q);
-    return T0ms + (DWORD)((Quant(VNow(q.QuadPart)) - V0) * 1000 / Freq);
+    return T0ms + (DWORD)((QuantReal(q.QuadPart) - V0) * 1000 / Freq);
 }
 
 // RNG seed: the game seeds its generator from the Unix time at launch. Its static C runtime reads the
@@ -202,7 +208,7 @@ static void WINAPI H_Ft(FILETIME* f) {
     if (!(S->speed_mask & SPEED_FILETIME)) return;
     LARGE_INTEGER q;
     R_Qpc(&q);
-    uint64_t t = Ft0 + (uint64_t)((Quant(VNow(q.QuadPart)) - V0) * 10000000 / Freq);
+    uint64_t t = Ft0 + (uint64_t)((QuantReal(q.QuadPart) - V0) * 10000000 / Freq);
     f->dwLowDateTime = (DWORD)t;
     f->dwHighDateTime = (DWORD)(t >> 32);
 }
