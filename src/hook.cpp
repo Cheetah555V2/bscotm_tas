@@ -52,9 +52,7 @@ static int64_t VNow(int64_t real) {
 // marker they are snapped down to a grid of 1/quant_hz s; from then on time is frame-locked: it advances only at frame
 // markers, by exactly one grid step each, so the time the game measures between two frames is the same on every run,
 // at every speed, with or without pauses. (A pure function of the frame number, so a savestate load gives the same clock.)
-static volatile LONG LockOn;
-static int64_t LockBase, LockServed, LockMarkReal;
-static uint32_t LockF0;
+static int64_t LockMarkReal;                        // real time of the last frame marker: a wait for a marker that never comes must not hang the game
 
 // Frame clock (Shm::quant_lock = 3). Every clock the game reads is a function of the frame number: from the first frame
 // marker on, time advances only at a marker, by exactly one frame (FcA ticks: the shortest time the game's limiter accepts
@@ -112,63 +110,12 @@ static int64_t Quant(int64_t v) {
     if (!hz) return v;
     if (S->quant_lock == 3 && FcOn) return FcServe();
     int64_t step = Freq / hz;
-    if (S->quant_lock == 2) {           // clamp: the clock may run at most quant_lock grid steps ahead of what the last frame marker was served (stalls cannot lengthen a measured frame)
-        if (v < V0) return v;
-        int64_t g = V0 + (v - V0) / step * step;
-        if (!LockOn) return g;
-        EnterCriticalSection(&Cs);
-        int64_t cap = LockServed + (int64_t)S->quant_lock * step, r = g;
-        LARGE_INTEGER rn; R_Qpc(&rn);
-        if (g > cap && rn.QuadPart - LockMarkReal < Freq * 4) r = cap;      // no marker for 4 s of real time (a hung or very long load): let the clock run; any release costs determinism
-        if (r < LockServed) r = LockServed;
-        LeaveCriticalSection(&Cs);
-        return r;
-    }
-    if (LockOn) {
-        int64_t t = LockBase + (int64_t)(int32_t)(S->frame - LockF0) * step;
-        if (!S->paused) {           // no marker for a while (loading, a menu transition): let time run on the grid so nothing stalls
-            LARGE_INTEGER n;
-            R_Qpc(&n);
-            int64_t since = n.QuadPart - LockMarkReal, grace = Freq / 33;
-            if (since > grace) t += (since - grace) * Speed() / 1000 / step * step;
-        }
-        if (t < LockServed) t = LockServed; else LockServed = t;
-        return t;
-    }
     if (v < V0) return v;
     return V0 + (v - V0) / step * step;
 }
 static inline int64_t QuantReal(int64_t real) {
     if (S->quant_hz && S->quant_lock == 3 && FcOn) return FcServe();      // what Quant would do: the real value is not needed
     return Quant(VNow(real));
-}
-// At every frame marker: start the frame-locked clock at the first one; later keep it from running behind what the game was told.
-static void LockAtMarker(uint32_t f, int64_t vnow) {
-    if (!S->quant_hz || !S->quant_lock) return;
-    int64_t step = Freq / S->quant_hz;
-    if (S->quant_lock >= 2) {
-        int64_t t = Quant(vnow);
-        if (!LockOn) { LockServed = t; MemoryBarrier(); LockOn = 1; return; }
-        EnterCriticalSection(&Cs);
-        if (t > LockServed) LockServed = t;
-        { LARGE_INTEGER mn; R_Qpc(&mn); LockMarkReal = mn.QuadPart; }
-        LeaveCriticalSection(&Cs);
-        return;
-    }
-    LARGE_INTEGER n;
-    R_Qpc(&n);
-    if (!LockOn) {
-        LockBase = V0 + (vnow - V0) / step * step;
-        LockF0 = f;
-        LockServed = LockBase;
-        LockMarkReal = n.QuadPart;
-        MemoryBarrier();
-        LockOn = 1;
-        return;
-    }
-    int64_t t = LockBase + (int64_t)(int32_t)(f - LockF0) * step;
-    if (LockServed > t) LockBase += (LockServed - t + step - 1) / step * step;     // time never runs backwards
-    LockMarkReal = n.QuadPart;
 }
 static BOOL WINAPI H_Qpc(LARGE_INTEGER* o) {
     FcCaller = (uint32_t)(uintptr_t)__builtin_return_address(0);
@@ -354,7 +301,7 @@ static void LockstepWait() {
     InterlockedIncrement(&LsEpoch);
     LsParked = 1;
     MemoryBarrier();
-    if (!FcMode()) { R_Wait(LsSem, 100); LsParked = 0; return; }
+
     for (int i = 0; i < 20000 && LsGo == LsTaken; i++) YieldProcessor();     // ~1-2 ms
     while (LsGo == LsTaken) {
         LsBlocked = 1;
@@ -400,14 +347,6 @@ static void FcRelease(int64_t from, int64_t to) {
         S->fc_diag[1]++;
     }
 }
-static void LockstepRelease(uint32_t n) {
-    for (uint32_t k = 0; k < n && LsParked; k++) {
-        LONG e0 = LsEpoch;
-        ReleaseSemaphore(LsSem, 1, nullptr);
-        LARGE_INTEGER a, b; R_Qpc(&a);
-        while (LsEpoch == e0) { R_Qpc(&b); if (b.QuadPart - a.QuadPart > Freq * 5) return; SwitchToThread(); }
-    }
-}
 static void  WINAPI H_Sleep(DWORD ms) {
     if (ms) NoteSleep();
     NoteThr(0);
@@ -418,8 +357,7 @@ static void  WINAPI H_Sleep(DWORD ms) {
         (!LsTid || LsTid == (LONG)GetCurrentThreadId())) {
         LsTid = (LONG)GetCurrentThreadId();
         LockstepWait();
-    } else if (!FcMode() && S->lockstep && LsSem && ms && ms <= 16 && (LONG)GetCurrentThreadId() != MarkerTid && IsSleeper(GetCurrentThreadId())) LockstepWait();
-    else PreciseWait(ms, [&](DWORD t) { R_Sleep(t); return (DWORD)WAIT_TIMEOUT; });
+    } else PreciseWait(ms, [&](DWORD t) { R_Sleep(t); return (DWORD)WAIT_TIMEOUT; });
     GateLeave(g, true);
 }
 static DWORD WINAPI H_Wait(HANDLE h, DWORD ms) {
@@ -540,7 +478,7 @@ static volatile LONG ZPassThrough;                   // set while IDirect3DDevic
 // Kept objects are given back once no saved state can bring them back: ZSerial counts deaths and saves; an object
 // that died (ZSeq) before the oldest saved slot was taken (ZSlot) is only a dangling pointer in every restorable
 // memory image, and the game never touches such a pointer (it did not the first time either).
-struct ZZombie { void* obj; ZClass* z; uint32_t seq; uint32_t born; bool live; bool defpool; };   // born: ZSerial at creation (0 = before tracking); live: the game still owns it; seq: ZSerial when the game released it
+struct ZZombie { void* obj; ZClass* z; uint32_t seq; uint32_t born; bool live; bool defpool; uint32_t made; };   // born: ZSerial at creation (0 = before tracking); live: the game still owns it; seq: ZSerial when the game released it
 static const int ZMAX = 65536;
 static ZZombie* ZList;                               // VirtualAlloc'd on first use; when full, further objects are simply never freed
 static int ZCount;
@@ -599,10 +537,10 @@ static void ZTrack(void* obj, const void* caller, int slot, const uintptr_t* arg
     AcquireSRWLockExclusive(&ZLock);
     ZEnsureList();
     if (ZList) {
-        uint32_t born = orphanable ? ++ZSerial : 0;
+        uint32_t made = ++ZSerial, born = orphanable ? made : 0;
         ZZombie* e = ZLookup(obj);                   // the address of an object that was really destroyed since can come back
-        if (e) { *e = {obj, z, 0, born, true, def}; }
-        else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, 0, born, true, def};
+        if (e) { *e = {obj, z, 0, born, true, def, made}; }
+        else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, 0, born, true, def, made};
     }
     ReleaseSRWLockExclusive(&ZLock);
 }
@@ -622,7 +560,7 @@ static void ZKeep(void* obj, ZClass* z) {
     if (ZList) {
         ZZombie* e = ZLookup(obj);                   // known: died before, was brought back by a restore, died again; or tracked since its creation
         if (e) { e->live = false; e->seq = ++ZSerial; }
-        else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, ++ZSerial, 0, false, false};
+        else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, ++ZSerial, 0, false, false, 0};
         else InterlockedIncrement(&ZombieUntracked);
     }
     InterlockedIncrement(&ZombieKept);
@@ -666,9 +604,10 @@ static void ZBeforeRestore(int slot, bool threadsParked) {
     int n = 0;
     AcquireSRWLockExclusive(&ZLock);
     uint32_t t = ZSlot[slot];
-    int keep = 0;
+    int keep = 0, leftAlone = 0;
     for (int i = 0; i < ZCount; i++) {
         ZZombie e = ZList[i];
+        if (e.born == 0 && e.made > t) leftAlone++;           // made after the state, but not one we may destroy: unreachable now, and it stays
         if (e.born > t && v && threadsParked) { v[n++] = {e.obj, e.z}; continue; }     // with a game thread still running (a loader in a D3D call) nothing is destroyed: the object leaks instead
         if (e.born > t) { ZList[keep++] = e; continue; }
         if (!e.live && e.seq > t) e.live = true;
@@ -676,6 +615,7 @@ static void ZBeforeRestore(int slot, bool threadsParked) {
     }
     ZCount = keep;
     ZFreeBelow = 0;                                  // a pending free was worked out for the old situation
+    if (S) S->zombie_stats[6] = (uint32_t)leftAlone;
     ZPublish();
     ReleaseSRWLockExclusive(&ZLock);
     for (int k = 0; k < n; k++) { v[k].z->release(v[k].obj); InterlockedIncrement(&ZombieOrphans); }
@@ -1647,7 +1587,7 @@ static void SnapAfterCopy(const snap::Slot& sn) {
     if (FcMode()) {                         // frame clock: back to the saved frame's time; the re-run marker must not wake the music thread again
         FcAdj = sn.aux[0]; FcNow = FcLastServed = sn.aux[1];
         FcFellBack = 0; FcSkipRelease = true; FcRealNext = 0;
-    } else { LockBase = sn.aux[0]; LockServed = sn.aux[1]; }     // the frame-locked clock continues from the saved moment
+    }
     { LARGE_INTEGER lq; R_Qpc(&lq); LockMarkReal = lq.QuadPart; }
     RealBase = q.QuadPart;
     CurSpeed = 1000;
@@ -1712,7 +1652,7 @@ static void HandleSnap(Shm* s, uint32_t f, int64_t frozen) {
         XaPause();
         DWORD hp1 = GetTickCount();
         if (FcMode()) { snap::Aux[0] = FcAdj; snap::Aux[1] = FcNow; }      // frame clock: the time of the frame it is held at
-        else { snap::Aux[0] = LockBase; snap::Aux[1] = LockServed; }
+
         bool ok = snap::Save((int)slot, frozen, f - 1);
         DWORD hp2 = GetTickCount();
         if (ok && DebugLog()) WriteThreadInfo();
@@ -1844,11 +1784,10 @@ static void Marker(Shm* s) {
     uint32_t f = s->frame + 1;
     s->frame = f;
     if (FcMode()) FcMarker(f);
-    else { LARGE_INTEGER qq; R_Qpc(&qq); LockAtMarker(f, VNow(qq.QuadPart)); }     // frame-locked clock: starts at the first marker
+
     RngCheck();
     MarkerTid = (LONG)GetCurrentThreadId();
     if (f < 12288) for (int i = 0; i < 4; i++) s->thr_log[i][f] = (uint16_t)ThrCnt[i];
-    if (s->lockstep) LockstepRelease(s->lockstep);
     if (s->quant_hz) {      // diagnosis: how many grid steps passed since the previous marker
         static int64_t prevq;
         LARGE_INTEGER qq; R_Qpc(&qq);
@@ -2104,7 +2043,7 @@ static void LogExit(const char* what, UINT code, HANDLE target) {
     DWORD w;
     uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
     uintptr_t* sp = (uintptr_t*)__builtin_frame_address(0);
-    wsprintfA(b, "%s(code %u, target %p) tid %lu marker %u virt-locked %d\r\n", what, code, (void*)target, GetCurrentThreadId(), S ? S->frame : 0, (int)LockOn);
+    wsprintfA(b, "%s(code %u, target %p) tid %lu marker %u frame-clock %d\r\n", what, code, (void*)target, GetCurrentThreadId(), S ? S->frame : 0, (int)FcOn);
     WriteFile(f, b, lstrlenA(b), &w, nullptr);
     for (int i = 0; i < 48; i++) {
         uintptr_t v = sp[i];
