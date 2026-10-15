@@ -86,8 +86,13 @@ struct Session {
 // the frame after `target` and hands the live session over in *keep.
 RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep = nullptr);
 
+// Called while a Session call waits for the game (a save or load can take a while when its threads are slow to stop): the editor sets it
+// to peek at its message queue, which keeps Windows from marking the editor "Not Responding". Nothing is dispatched.
+extern void (*SessionIdleHook)();
+
 bool GameRunning();
-void KillGame();
+// Closes every running COTM.exe. False if one could not be closed.
+bool KillGame();
 
 // Copies the game's save files into <baselines>\<id>. The game must be closed.
 bool SaveBaseline(const std::wstring& exe, const std::wstring& dir, std::string& err);
