@@ -131,6 +131,6 @@ struct Shm {
                                         // controller, 2 = it sees one virtual Xbox 360 pad fed from keys[] (play) or the real pad (record, live)
     volatile uint32_t pad_diag[4];      // hook -> host: [0] real pads found, [1] virtual pad reads, [2] reads that used the real pad,
                                         // [3] the game asked for the controllers (EnumDevices calls)
-    volatile uint32_t zombie_stats[4];  // hook -> host, D3D9 objects kept alive for savestates: [0] kept (the game released the last reference), [1] destroyed for real later, [2] kept right now, [3] not tracked (list full, never destroyed)
+    volatile uint32_t zombie_stats[6];  // hook -> host, D3D9 objects kept alive for savestates: [4] orphans destroyed on a load (created after the state was saved), [5] reserved; [0] kept (the game released the last reference), [1] destroyed for real later, [2] kept right now, [3] not tracked (list full, never destroyed)
     KeyMask keys[MAX_FRAMES];
 };

@@ -261,6 +261,7 @@ struct GThread { DWORD tid; HANDLE h; volatile LONG idle, quiet; };    // idle: 
 static GThread GT[128];
 static volatile LONG NGT;
 static volatile LONG GateClosed;
+static SRWLOCK GtLock = SRWLOCK_INIT;                    // guards GT[] and NGT: threads register from any thread, the save thread scans
 static DWORD GateTls = TLS_OUT_OF_INDEXES;
 
 static GThread* GateMe() {
@@ -268,8 +269,12 @@ static GThread* GateMe() {
     GThread* g = (GThread*)TlsGetValue(GateTls);
     if (g) return g;
     DWORD me = GetCurrentThreadId();
-    for (LONG i = 0; i < NGT; i++) if (GT[i].tid == me) { TlsSetValue(GateTls, &GT[i]); return &GT[i]; }
-    return nullptr;
+    GThread* found = nullptr;
+    AcquireSRWLockShared(&GtLock);
+    for (LONG i = 0; i < NGT; i++) if (GT[i].tid == me) { found = &GT[i]; break; }
+    ReleaseSRWLockShared(&GtLock);
+    if (found) TlsSetValue(GateTls, found);
+    return found;
 }
 static inline void GateEnter(GThread* g, bool quiet = false) { if (g) { g->quiet = quiet; g->idle = 1; MemoryBarrier(); } }
 static void GateLeave(GThread* g, bool quiet = false) {          // about to run game code again; quiet: it came out of a plain Sleep
@@ -286,18 +291,27 @@ static void GateLeave(GThread* g, bool quiet = false) {          // about to run
 }
 static void GateRegister(HANDLE game_handle, DWORD tid) {
     HANDLE d;
-    if (NGT >= 128 || !DuplicateHandle(GetCurrentProcess(), game_handle, GetCurrentProcess(), &d, SYNCHRONIZE, FALSE, 0)) return;
-    GT[NGT].tid = tid; GT[NGT].h = d; GT[NGT].idle = 0;
-    MemoryBarrier();
-    NGT++;
+    if (!DuplicateHandle(GetCurrentProcess(), game_handle, GetCurrentProcess(), &d, SYNCHRONIZE, FALSE, 0)) return;
+    AcquireSRWLockExclusive(&GtLock);
+    LONG slot = -1;
+    for (LONG i = 0; i < NGT; i++)                       // the game starts short-lived loader threads all the time: reuse the entry of one that has exited
+        if (WaitForSingleObject(GT[i].h, 0) == WAIT_OBJECT_0) { slot = i; break; }
+    if (slot >= 0) CloseHandle(GT[slot].h);
+    else if (NGT < 128) slot = NGT;
+    if (slot < 0) { ReleaseSRWLockExclusive(&GtLock); CloseHandle(d); return; }
+    GT[slot].tid = tid; GT[slot].h = d; GT[slot].idle = 0; GT[slot].quiet = 0;
+    if (slot == NGT) NGT++;
+    ReleaseSRWLockExclusive(&GtLock);
 }
 static bool ParkAll() {
     GateClosed = 1;
     MemoryBarrier();
     for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 2000;) {
         bool all = true;
+        AcquireSRWLockShared(&GtLock);
         for (LONG i = 0; i < NGT; i++)
             if (!(GT[i].idle && GT[i].quiet) && WaitForSingleObject(GT[i].h, 0) != WAIT_OBJECT_0) all = false;     // a thread in a wait is not enough: it may be half way through a job
+        ReleaseSRWLockShared(&GtLock);
         if (all) return true;
         Sleep(0);
     }
@@ -306,7 +320,9 @@ static bool ParkAll() {
 static void UnparkAll() { GateClosed = 0; MemoryBarrier(); }
 static DWORD GameTidList(DWORD* out, DWORD max) {
     DWORD n = 0;
+    AcquireSRWLockShared(&GtLock);
     for (LONG i = 0; i < NGT && n < max; i++) out[n++] = GT[i].tid;
+    ReleaseSRWLockShared(&GtLock);
     return n;
 }
 
@@ -513,10 +529,12 @@ static volatile LONG NZC;
 static volatile LONG ZombieKept;                     // releases swallowed (statistics)
 static volatile LONG ZombieFreed;                    // kept objects finally destroyed (statistics)
 static volatile LONG ZombieUntracked;                // kept but not listed because the list was full
+static volatile LONG ZombieOrphans;                  // objects created after a save that a load made unreachable, destroyed (statistics)
+static volatile LONG ZPassThrough;                   // set while IDirect3DDevice9::Reset runs: Direct3D then releases its own references through the same vtable, and swallowing those would keep the resources alive and make the Reset fail
 // Kept objects are given back once no saved state can bring them back: ZSerial counts deaths and saves; an object
 // that died (ZSeq) before the oldest saved slot was taken (ZSlot) is only a dangling pointer in every restorable
 // memory image, and the game never touches such a pointer (it did not the first time either).
-struct ZZombie { void* obj; ZClass* z; uint32_t seq; };
+struct ZZombie { void* obj; ZClass* z; uint32_t seq; uint32_t born; bool live; bool defpool; };   // born: ZSerial at creation (0 = before tracking); live: the game still owns it; seq: ZSerial when the game released it
 static const int ZMAX = 65536;
 static ZZombie* ZList;                               // VirtualAlloc'd on first use; when full, further objects are simply never freed
 static int ZCount;
@@ -532,35 +550,150 @@ static ZClass* ZFind(void* obj) {
 static void ZPublish() {                       // caller holds ZLock
     if (!S) return;
     S->zombie_stats[0] = (uint32_t)ZombieKept; S->zombie_stats[1] = (uint32_t)ZombieFreed;
-    S->zombie_stats[2] = (uint32_t)ZCount; S->zombie_stats[3] = (uint32_t)ZombieUntracked;
+    S->zombie_stats[2] = (uint32_t)ZCount; S->zombie_stats[3] = (uint32_t)ZombieUntracked; S->zombie_stats[4] = (uint32_t)ZombieOrphans;
+}
+static ZZombie* ZLookup(void* obj) {                 // caller holds ZLock
+    for (int i = ZCount; i-- > 0;) if (ZList[i].obj == obj) return &ZList[i];
+    return nullptr;
+}
+static void ZEnsureList() { if (!ZList) ZList = (ZZombie*)VirtualAlloc(nullptr, ZMAX * sizeof(ZZombie), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); }
+// The game created a D3D object: remember it, with the serial it was born at. A load of a state saved before that moment
+// makes it unreachable (the restored memory has no pointer to it), see ZBeforeRestore.
+static bool InGameExe(const void* addr) {
+    static uintptr_t size;
+    if (!size) {
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)ExeBase;
+        size = ((const IMAGE_NT_HEADERS*)(ExeBase + dos->e_lfanew))->OptionalHeader.SizeOfImage;
+    }
+    return (uintptr_t)addr >= ExeBase && (uintptr_t)addr < ExeBase + size;
+}
+// Is a device-created object in D3DPOOL_DEFAULT (video memory)? Those must all be gone before IDirect3DDevice9::Reset can succeed.
+static bool IsDefaultPool(int slot, const uintptr_t* a) {
+    switch (slot) {
+        case 23: return a[5] == 0;                   // CreateTexture: Pool is the 6th argument
+        case 24: return a[6] == 0;                   // CreateVolumeTexture
+        case 25: return a[4] == 0;                   // CreateCubeTexture
+        case 26: case 27: case 36: return a[3] == 0; // CreateVertexBuffer / IndexBuffer / OffscreenPlainSurface
+        case 28: case 29: return true;               // render targets and depth buffers are always DEFAULT
+    }
+    return false;
+}
+static void ZTrack(void* obj, const void* caller, int slot, const uintptr_t* args) {
+    // Every created object is listed (live) so that its pool is known when the game releases it. Only some may be destroyed
+    // by a load (`born` set): made inside a library (d3dx9 ...) an object may be internal (a sprite's buffer, a font's glyph
+    // texture) that the library keeps in memory a restore does not touch. The textures the game loads through the library
+    // are what its memory points to, and they are most of the memory a load would leak, so MANAGED ones count too. Measured on
+    // a movie that crosses a stage change: the game's own objects plus library MANAGED textures are safe (flat memory over 40
+    // loads, replays identical); also taking DEFAULT-pool library textures crashed d3d9 after a load, and SYSTEMMEM / SCRATCH
+    // ones crashed the Steam overlay.
+    bool orphanable = InGameExe(caller) || (slot == 23 && args[5] == 1 /* D3DPOOL_MANAGED */);
+    bool def = IsDefaultPool(slot, args);
+    ZClass* z = ZFind(obj);
+    if (!z) return;
+    AcquireSRWLockExclusive(&ZLock);
+    ZEnsureList();
+    if (ZList) {
+        uint32_t born = orphanable ? ++ZSerial : 0;
+        ZZombie* e = ZLookup(obj);                   // the address of an object that was really destroyed since can come back
+        if (e) { *e = {obj, z, 0, born, true, def}; }
+        else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, 0, born, true, def};
+    }
+    ReleaseSRWLockExclusive(&ZLock);
+}
+// The game dropped its own reference to an object that something else (the device, a library) still holds: the game no
+// longer owns it, so a load must not release anything for it.
+static void ZForget(void* obj) {
+    AcquireSRWLockExclusive(&ZLock);
+    if (ZList) {
+        ZZombie* e = ZLookup(obj);
+        if (e && e->live) *e = ZList[--ZCount];
+    }
+    ReleaseSRWLockExclusive(&ZLock);
 }
 static void ZKeep(void* obj, ZClass* z) {
     AcquireSRWLockExclusive(&ZLock);
-    if (!ZList) ZList = (ZZombie*)VirtualAlloc(nullptr, ZMAX * sizeof(ZZombie), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    ZEnsureList();
     if (ZList) {
-        int i = ZCount;
-        while (i-- > 0) if (ZList[i].obj == obj) break;     // died before, was brought back by a restore, died again
-        if (i >= 0) ZList[i].seq = ++ZSerial;
-        else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, ++ZSerial};
+        ZZombie* e = ZLookup(obj);                   // known: died before, was brought back by a restore, died again; or tracked since its creation
+        if (e) { e->live = false; e->seq = ++ZSerial; }
+        else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, ++ZSerial, 0, false, false};
         else InterlockedIncrement(&ZombieUntracked);
     }
     InterlockedIncrement(&ZombieKept);
     ZPublish();
     ReleaseSRWLockExclusive(&ZLock);
 }
+// Real releases happen outside ZLock: destroying one D3D object can release others, which comes back through H_ZRelease and
+// takes the lock again.
+struct ZVictim { void* obj; ZClass* z; };
 static void ZDrain() {
     if (!ZFreeBelow) return;
+    ZVictim v[256];
+    for (;;) {
+        int n = 0;
+        AcquireSRWLockExclusive(&ZLock);
+        uint32_t below = ZFreeBelow;
+        int keep = 0, i = 0;
+        for (; i < ZCount && n < 256; i++) {
+            if (!ZList[i].live && ZList[i].seq <= below) v[n++] = {ZList[i].obj, ZList[i].z};
+            else ZList[keep++] = ZList[i];
+        }
+        for (; i < ZCount; i++) ZList[keep++] = ZList[i];       // the rest is looked at in the next round
+        ZCount = keep;
+        if (n < 256) ZFreeBelow = 0;
+        ZPublish();
+        ReleaseSRWLockExclusive(&ZLock);
+        for (int k = 0; k < n; k++) { v[k].z->release(v[k].obj); InterlockedIncrement(&ZombieFreed); }
+        if (n < 256) return;
+    }
+}
+// Called with the game frozen (the other threads parked), before the memory of `slot` is put back. Per object:
+//  - created after that save: the restored memory has no pointer to it, nothing will ever release it. Give back the
+//    reference the game held (a live one) or the one we kept (a released one). Anything the device itself still holds
+//    keeps it alive until the game binds something else; we never release more than the game's own reference.
+//  - created before the save and released after it: alive again in the restored memory, and the game will release it a
+//    second time. It must not be destroyed before that: it is live again; ZKeep stamps it when the game releases it.
+//  - released before the save: stays released.
+static void ZBeforeRestore(int slot, bool threadsParked) {
+    static ZVictim* v;
+    if (!v) v = (ZVictim*)VirtualAlloc(nullptr, ZMAX * sizeof(ZVictim), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    int n = 0;
     AcquireSRWLockExclusive(&ZLock);
-    uint32_t below = ZFreeBelow;
-    ZFreeBelow = 0;
+    uint32_t t = ZSlot[slot];
     int keep = 0;
     for (int i = 0; i < ZCount; i++) {
-        if (ZList[i].seq <= below) { ZList[i].z->release(ZList[i].obj); InterlockedIncrement(&ZombieFreed); }
+        ZZombie e = ZList[i];
+        if (e.born > t && v && threadsParked) { v[n++] = {e.obj, e.z}; continue; }     // with a game thread still running (a loader in a D3D call) nothing is destroyed: the object leaks instead
+        if (e.born > t) { ZList[keep++] = e; continue; }
+        if (!e.live && e.seq > t) e.live = true;
+        ZList[keep++] = e;
+    }
+    ZCount = keep;
+    ZFreeBelow = 0;                                  // a pending free was worked out for the old situation
+    ZPublish();
+    ReleaseSRWLockExclusive(&ZLock);
+    for (int k = 0; k < n; k++) { v[k].z->release(v[k].obj); InterlockedIncrement(&ZombieOrphans); }
+}
+// IDirect3DDevice9::Reset fails while any DEFAULT-pool resource is alive, and the hook keeps released ones alive: give all of them
+// back just before a Reset (a window resize or a fullscreen toggle makes the game call it). A state saved earlier may point at
+// them, and a Reset invalidates the device's resources anyway, so no saved state is safe to load after this: they are dropped.
+static int ZReleaseAllReleased() {
+    static ZVictim* v;
+    if (!v) v = (ZVictim*)VirtualAlloc(nullptr, ZMAX * sizeof(ZVictim), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    int n = 0;
+    AcquireSRWLockExclusive(&ZLock);
+    int keep = 0;
+    for (int i = 0; i < ZCount; i++) {
+        if (v && !ZList[i].live) v[n++] = {ZList[i].obj, ZList[i].z};     // every released object: surfaces fetched from textures are not created by a call we hook, so their pool is unknown
         else ZList[keep++] = ZList[i];
     }
     ZCount = keep;
+    for (int i = 0; i < 8; i++) { ZSlot[i] = 0; snap::Slots[i].valid = false; }
+    ZFreeBelow = 0;
     ZPublish();
     ReleaseSRWLockExclusive(&ZLock);
+    for (int k = 0; k < n; k++) v[k].z->release(v[k].obj);
+    return n;
 }
 // Called with the game frozen, right after a save into `slot`.
 static void ZOnSave(int slot) {
@@ -574,24 +707,31 @@ static void ZOnSave(int slot) {
 static ULONG __stdcall H_ZRelease(void* self) {
     ZClass* z = ZFind(self);
     if (!z) return 0;
+    if (ZPassThrough) return z->release(self);
     ZDrain();                                        // on a game thread that releases D3D objects anyway
     ULONG c = z->addref(self);                       // the count including this temporary reference
     if (c <= 2) { z->release(self); ZKeep(self, z); return 0; }
     z->release(self);
+    if (InGameExe(__builtin_return_address(0))) ZForget(self);       // the game's own Release, but not the last reference
     return z->release(self);
 }
 static void ZPatch(void* obj) {
     if (!obj || ZFind(obj) || NZC >= 64) return;
-    void** vt = *(void***)obj;
-    DWORD old;
-    if (!VirtualProtect(&vt[1], 8, PAGE_READWRITE, &old)) return;
-    ZC[NZC].vt = vt;
-    ZC[NZC].addref = (ULONG (__stdcall*)(void*))vt[1];
-    ZC[NZC].release = (ULONG (__stdcall*)(void*))vt[2];
-    MemoryBarrier();
-    NZC++;
-    vt[2] = (void*)H_ZRelease;
-    VirtualProtect(&vt[1], 8, old, &old);
+    AcquireSRWLockExclusive(&ZLock);                 // two threads creating the first object of a class: the second must not take our wrapper for the original Release
+    if (!ZFind(obj) && NZC < 64) {
+        void** vt = *(void***)obj;
+        DWORD old;
+        if (VirtualProtect(&vt[1], 8, PAGE_READWRITE, &old)) {
+            ZC[NZC].vt = vt;
+            ZC[NZC].addref = (ULONG (__stdcall*)(void*))vt[1];
+            ZC[NZC].release = (ULONG (__stdcall*)(void*))vt[2];
+            MemoryBarrier();
+            NZC++;
+            vt[2] = (void*)H_ZRelease;
+            VirtualProtect(&vt[1], 8, old, &old);
+        }
+    }
+    ReleaseSRWLockExclusive(&ZLock);
 }
 // Render command 29 (handler exe+0x29F6F0) releases two objects: cmd+0xC -> +0x14 -> objects at +4 and +8, each through
 // its vtable slot 2 (Release). They are not made by a device method the hook covers above, so on the title screen (about
@@ -626,23 +766,23 @@ static void InstallCmdRelease() {
     VirtualProtect(&CmdTab[CMD_RELEASE], 4, old, &old);
 }
 static void* DevOrig[128];                           // original device methods by vtable slot
-#define ZPOST(out) do { void** pp = (void**)(out); if (hr == 0 && pp && *pp) ZPatch(*pp); } while (0)
+#define ZPOST(out, slot, a) do { void** pp = (void**)(out); if (hr == 0 && pp && *pp) { ZPatch(*pp); ZTrack(*pp, __builtin_return_address(0), slot, a); } } while (0)
 #define ZH1(name, slot, o) static HRESULT __stdcall name(void* d, uintptr_t a0) { HRESULT hr = ((HRESULT (__stdcall*)(void*, uintptr_t))DevOrig[slot])(d, a0); \
-    uintptr_t a[] = {a0}; ZPOST(a[o]); return hr; }
+    uintptr_t a[] = {a0}; ZPOST(a[o], slot, a); return hr; }
 #define ZH2(name, slot, o) static HRESULT __stdcall name(void* d, uintptr_t a0, uintptr_t a1) { HRESULT hr = ((HRESULT (__stdcall*)(void*, uintptr_t, uintptr_t))DevOrig[slot])(d, a0, a1); \
-    uintptr_t a[] = {a0, a1}; ZPOST(a[o]); return hr; }
+    uintptr_t a[] = {a0, a1}; ZPOST(a[o], slot, a); return hr; }
 #define ZH6(name, slot, o) static HRESULT __stdcall name(void* d, uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5) { \
     HRESULT hr = ((HRESULT (__stdcall*)(void*, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))DevOrig[slot])(d, a0, a1, a2, a3, a4, a5); \
-    uintptr_t a[] = {a0, a1, a2, a3, a4, a5}; ZPOST(a[o]); return hr; }
+    uintptr_t a[] = {a0, a1, a2, a3, a4, a5}; ZPOST(a[o], slot, a); return hr; }
 #define ZH7(name, slot, o) static HRESULT __stdcall name(void* d, uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6) { \
     HRESULT hr = ((HRESULT (__stdcall*)(void*, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))DevOrig[slot])(d, a0, a1, a2, a3, a4, a5, a6); \
-    uintptr_t a[] = {a0, a1, a2, a3, a4, a5, a6}; ZPOST(a[o]); return hr; }
+    uintptr_t a[] = {a0, a1, a2, a3, a4, a5, a6}; ZPOST(a[o], slot, a); return hr; }
 #define ZH8(name, slot, o) static HRESULT __stdcall name(void* d, uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7) { \
     HRESULT hr = ((HRESULT (__stdcall*)(void*, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))DevOrig[slot])(d, a0, a1, a2, a3, a4, a5, a6, a7); \
-    uintptr_t a[] = {a0, a1, a2, a3, a4, a5, a6, a7}; ZPOST(a[o]); return hr; }
+    uintptr_t a[] = {a0, a1, a2, a3, a4, a5, a6, a7}; ZPOST(a[o], slot, a); return hr; }
 #define ZH9(name, slot, o) static HRESULT __stdcall name(void* d, uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8) { \
     HRESULT hr = ((HRESULT (__stdcall*)(void*, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))DevOrig[slot])(d, a0, a1, a2, a3, a4, a5, a6, a7, a8); \
-    uintptr_t a[] = {a0, a1, a2, a3, a4, a5, a6, a7, a8}; ZPOST(a[o]); return hr; }
+    uintptr_t a[] = {a0, a1, a2, a3, a4, a5, a6, a7, a8}; ZPOST(a[o], slot, a); return hr; }
 // argument index of the out pointer (IDirect3DXxx9** pp) is the third parameter of each macro
 ZH8(Z_CreateTexture, 23, 6)          // Width Height Levels Usage Format Pool ppTexture pSharedHandle
 ZH9(Z_CreateVolumeTexture, 24, 7)    // W H Depth Levels Usage Format Pool ppVolumeTexture pSharedHandle
@@ -658,13 +798,47 @@ ZH2(Z_CreateVertexDecl, 86, 1)       // pVertexElements ppDecl
 ZH2(Z_CreateVertexShader, 91, 1)     // pFunction ppShader
 ZH2(Z_CreatePixelShader, 106, 1)     // pFunction ppShader
 ZH2(Z_CreateQuery, 118, 1)           // Type ppQuery
+// IDirect3DDevice9::Reset (slot 16) fails while any DEFAULT-pool resource is alive, and with savestates on the hook keeps
+// released resources alive. Counted and logged (a rare event) to see whether the game ever does this: %TEMP%\bscotm_reset.txt.
+static volatile LONG ResetCalls, ResetFailed;
+static void* R_Reset;
+static HRESULT __stdcall H_ResetDev(void* d, void* pp) {
+    int released = ZReleaseAllReleased();
+    ZPassThrough = 1;
+    HRESULT hr = ((HRESULT (__stdcall*)(void*, void*))R_Reset)(d, pp);
+    ZPassThrough = 0;
+    AcquireSRWLockExclusive(&ZLock);                 // the Reset destroyed or recreated resources behind our back: the list no longer matches the objects, start over
+    ZCount = 0;
+    ZPublish();
+    ReleaseSRWLockExclusive(&ZLock);
+    InterlockedIncrement(&ResetCalls);
+    if (hr) InterlockedIncrement(&ResetFailed);
+    if (S) S->zombie_stats[5] = (uint32_t)ResetCalls | ((uint32_t)ResetFailed << 16);
+    char path[MAX_PATH + 32], line[192];
+    GetTempPathA(MAX_PATH, path);
+    strcat(path, "bscotm_reset.txt");
+    HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        int liveDef = 0, liveAll = 0;
+        AcquireSRWLockShared(&ZLock);
+        for (int i = 0; i < ZCount; i++) if (ZList[i].live) { liveAll++; if (ZList[i].defpool) liveDef++; }
+        ReleaseSRWLockShared(&ZLock);
+        DWORD* ppd = (DWORD*)pp;                      // D3DPRESENT_PARAMETERS: BackBufferWidth, BackBufferHeight, ...
+        wsprintfA(line, "Reset #%ld hr %08X (back buffer %lux%lu); %d released objects given back first; the game still owns %d tracked objects, %d of them default-pool\r\n",
+                  ResetCalls, (unsigned)hr, ppd ? ppd[0] : 0, ppd ? ppd[1] : 0, released, liveAll, liveDef);
+        WriteFile(f, line, lstrlenA(line), &w, nullptr);
+        CloseHandle(f);
+    }
+    return hr;
+}
 static void PatchDeviceCreators(void* dev) {
     void** vt = *(void***)dev;
     struct { int slot; void* hook; } t[] = {
         {23, (void*)Z_CreateTexture}, {24, (void*)Z_CreateVolumeTexture}, {25, (void*)Z_CreateCubeTexture}, {26, (void*)Z_CreateVertexBuffer},
         {27, (void*)Z_CreateIndexBuffer}, {28, (void*)Z_CreateRenderTarget}, {29, (void*)Z_CreateDepthStencil}, {36, (void*)Z_CreateOffscreen},
         {59, (void*)Z_CreateStateBlock}, {61, (void*)Z_EndStateBlock}, {86, (void*)Z_CreateVertexDecl}, {91, (void*)Z_CreateVertexShader},
-        {106, (void*)Z_CreatePixelShader}, {118, (void*)Z_CreateQuery},
+        {106, (void*)Z_CreatePixelShader}, {118, (void*)Z_CreateQuery}
     };
     for (auto& e : t) {
         if (DevOrig[e.slot]) continue;                  // shared vtable, already done
@@ -680,7 +854,7 @@ static void PatchDevice(void* dev) {
     void** vt = *(void***)dev;
     struct { int slot; void* hook; void* real; } t[] = {
         {17, (void*)H_Present, &R_Present}, {43, (void*)H_Clear, &R_Clear}, {81, (void*)H_Dp, &R_Dp},
-        {82, (void*)H_Dip, &R_Dip}, {83, (void*)H_Dpup, &R_Dpup}, {84, (void*)H_Dipup, &R_Dipup},
+        {82, (void*)H_Dip, &R_Dip}, {83, (void*)H_Dpup, &R_Dpup}, {84, (void*)H_Dipup, &R_Dipup}, {16, (void*)H_ResetDev, &R_Reset},
     };
     for (auto& e : t) {
         if (*(void**)e.real) continue;                  // already patched (shared vtable)
@@ -785,9 +959,10 @@ static DWORD WINAPI ArmThread(LPVOID arg) {         // runs on a helper thread s
     return 0;
 }
 static void ArmAll(uint32_t addr) {
+    if (addr) RngWatch = addr;                       // the handler ignores a hit it does not know about, and the game dies of the unhandled single step: it must know the address before any thread is armed
     HANDLE h = CreateThread(nullptr, 0, ArmThread, (LPVOID)(uintptr_t)addr, 0, nullptr);
     if (h) { WaitForSingleObject(h, 5000); CloseHandle(h); }
-    RngWatch = addr;
+    RngWatch = addr;                                 // disarming: only now that no thread can still hit it
 }
 static bool RngLogWanted() {
     return S->rng_log && (S->draw_from == 0 || S->frame + 300 >= S->draw_from);
@@ -826,8 +1001,10 @@ static LONG CALLBACK RngVeh(EXCEPTION_POINTERS* e) {
             }
         }
     }
-    uint32_t i = InterlockedIncrement((volatile LONG*)&S->rng_log_n) - 1;
+    uint32_t i = S->rng_log_n;                       // write the entry first, then publish it: the editor reads up to rng_log_n at any moment
     S->rng_log_buf[i & (RNG_LOG_MAX - 1)] = en;
+    MemoryBarrier();
+    S->rng_log_n = i + 1;
     c->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -849,14 +1026,11 @@ static bool XaIsRealVoice(uintptr_t a);
 static void XaFindInternal(HANDLE f, uintptr_t obj);
 static void DumpFirstCreates(HANDLE f);
 static void XaDumpEvents(HANDLE f, uint32_t cb, uint32_t realv);
-static LONG CALLBACK CrashVeh(PEXCEPTION_POINTERS ep) {
+static LONG WriteCrashLog(PEXCEPTION_POINTERS ep, const char* file) {
     DWORD c = ep->ExceptionRecord->ExceptionCode;
-    if (c != 0xC0000005 && c != 0xC0000094 && c != 0xC000001D && c != 0xC0000096 && c != 0xC00000FD && c != 0xC0000374 && c != 0xC0000409) return EXCEPTION_CONTINUE_SEARCH;
-    static volatile LONG once;
-    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
     char path[MAX_PATH + 32];
     GetTempPathA(MAX_PATH, path);
-    strcat(path, "bscotm_crash.txt");
+    strcat(path, file);
     HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return EXCEPTION_CONTINUE_SEARCH;
     uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
@@ -949,6 +1123,21 @@ static LONG CALLBACK CrashVeh(PEXCEPTION_POINTERS ep) {
     wsprintfA(b, "fault address module: %s\r\n", mn0[0] ? mn0 : "(none: not inside any module)");
     put(b);
     CloseHandle(f);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// First fatal-looking exception (it may be one the game handles itself): %TEMP%\bscotm_crash.txt.
+static LONG CALLBACK CrashVeh(PEXCEPTION_POINTERS ep) {
+    DWORD c = ep->ExceptionRecord->ExceptionCode;
+    if (c != 0xC0000005 && c != 0xC0000094 && c != 0xC000001D && c != 0xC0000096 && c != 0xC00000FD && c != 0xC0000374 && c != 0xC0000409) return EXCEPTION_CONTINUE_SEARCH;
+    static volatile LONG once;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    return WriteCrashLog(ep, "bscotm_crash.txt");
+}
+// The exception that really ends the game: %TEMP%\bscotm_crash_final.txt. The latch above can have been used up by an
+// access violation the game handled, so the crash that matters would otherwise go unlogged.
+static LONG WINAPI CrashFinal(PEXCEPTION_POINTERS ep) {
+    WriteCrashLog(ep, "bscotm_crash_final.txt");
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -1150,13 +1339,13 @@ static void XaCrashInfo(void* cb, char* out, int n) {
         live++;
         if (v.cb == cb) {
             found++;
+            if (lstrlenA(out) + 150 + 320 > n) continue;        // keep room for the summary below: `out` is a fixed buffer and cb is whatever edx held
             wsprintfA(out + lstrlenA(out), "voice#%d proxy %08X real %08X created %u destroyed %u real_dead %d recreatable %d; ", i, (unsigned)(uintptr_t)&v.px, (unsigned)(uintptr_t)v.px.real,
                       v.created, v.destroyed, (int)v.real_dead, (int)v.recreatable);
         }
     }
     wsprintfA(out + lstrlenA(out), "%d voices match cb, %d live, XaSerial %u, slot0 serial %u, shim calls %ld forwarded %ld, gate %ld, TABLE OVERFLOWS %ld, LOST VOICES %ld", found, live, XaSerial,
               SlotSerial[0], ShimCalls, ShimForwarded, XaCbGate, XaOverflow, XaLost);
-    (void)n;
 }
 
 static void XaReap() {                       // forget destroyed voices that no saved slot can bring back
@@ -1461,7 +1650,10 @@ static void SnapAfterCopy(const snap::Slot& sn) {
     s->advance = 0;
     s->hold = 1;
     s->paused = 0;
+    EnterCriticalSection(&ThCs);            // the threads the game started after the save are gone: drop our handles to them
+    for (int i = 0; i < NPending; i++) CloseHandle(Pending[i]);
     NPending = 0;
+    LeaveCriticalSection(&ThCs);
     XaEv(9, nullptr, nullptr, nullptr);
     for (auto& v : Voices)                  // the game's memory is the saved one again: its callbacks are valid for the voices it knows
         if (v.in_use && !v.real_dead) { v.cb_alive = 1; v.inflight = 0; }
@@ -1530,11 +1722,12 @@ static void HandleSnap(Shm* s, uint32_t f, int64_t frozen) {
         UnparkAll();
         s->snap_result = (ok && dt <= 20) ? 1 : 2;
     } else if (cmd == 2 && snap::Slots[slot].valid) {
-        ParkAll();                  // game worker threads must be idle before voices are destroyed: one may be using a voice we are about to kill
+        bool parked = ParkAll();    // game worker threads must be idle before voices are destroyed: one may be using a voice we are about to kill
         XaCbGate = 1;               // from here on no callback reaches the game until the memory is back
         MemoryBarrier();
         for (auto& v : Voices) if (v.in_use) XaWaitIdle(&v);
         XaBeforeRestore((int)slot);
+        ZBeforeRestore((int)slot, parked);
         XaPause();
         snap::Restore(&snap::Slots[slot], SnapAfterCopy);      // does not return
     } else {
@@ -1957,6 +2150,7 @@ static void Init() {
             snap::FindSections(exe);
             GateTls = TlsAlloc();                   // the gate is only used by savestates
             AddVectoredExceptionHandler(1, CrashVeh);
+            SetUnhandledExceptionFilter(CrashFinal);
             snap::ParkHook = ParkAll;
             snap::UnparkHook = UnparkAll;
             snap::GameTids = GameTidList;

@@ -62,6 +62,7 @@ if (Get-Process COTM -ErrorAction SilentlyContinue) { Fail "the game is running;
 if (-not $NoBuild) {
     Write-Host "building..."
     # cmd needs its own cd (Push-Location does not change it) and the full path (the current folder may not be searched)
+    New-Item -ItemType Directory -Force $build | Out-Null     # the log below is written before the build makes the folder
     & cmd /c "cd /d `"$repo`" && `"$repo\build.bat`" all tools > build\verify-build.log 2>&1"
     if ($LASTEXITCODE -ne 0) { Fail "build failed, see build\verify-build.log" }
 }
