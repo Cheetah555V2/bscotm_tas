@@ -442,9 +442,9 @@ static __attribute__((used, noinline)) void DoRestore() {
     for (int i = 0; i < 4; i++) RestoreCtx[i] = sn.regs[i];
     RestoreCtx[4] = sn.stack_esp;
     __asm__ volatile("mov %0, %%fs:0" : : "r"(sn.fs0));
+    if (AfterCopy) AfterCopy(sn);       // the hook's clock state is rewritten here: the game's other threads must still be stopped
     Thaw();
     if (UnparkHook) UnparkHook();
-    if (AfterCopy) AfterCopy(sn);
     RestoreJump();
     __builtin_unreachable();
 }

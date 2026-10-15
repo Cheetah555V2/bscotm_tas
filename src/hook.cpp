@@ -261,6 +261,7 @@ struct GThread { DWORD tid; HANDLE h; volatile LONG idle, quiet; };    // idle: 
 static GThread GT[128];
 static volatile LONG NGT;
 static volatile LONG GateClosed;
+static SRWLOCK GtLock = SRWLOCK_INIT;                    // guards GT[] and NGT: threads register from any thread, the save thread scans
 static DWORD GateTls = TLS_OUT_OF_INDEXES;
 
 static GThread* GateMe() {
@@ -268,8 +269,12 @@ static GThread* GateMe() {
     GThread* g = (GThread*)TlsGetValue(GateTls);
     if (g) return g;
     DWORD me = GetCurrentThreadId();
-    for (LONG i = 0; i < NGT; i++) if (GT[i].tid == me) { TlsSetValue(GateTls, &GT[i]); return &GT[i]; }
-    return nullptr;
+    GThread* found = nullptr;
+    AcquireSRWLockShared(&GtLock);
+    for (LONG i = 0; i < NGT; i++) if (GT[i].tid == me) { found = &GT[i]; break; }
+    ReleaseSRWLockShared(&GtLock);
+    if (found) TlsSetValue(GateTls, found);
+    return found;
 }
 static inline void GateEnter(GThread* g, bool quiet = false) { if (g) { g->quiet = quiet; g->idle = 1; MemoryBarrier(); } }
 static void GateLeave(GThread* g, bool quiet = false) {          // about to run game code again; quiet: it came out of a plain Sleep
@@ -286,18 +291,27 @@ static void GateLeave(GThread* g, bool quiet = false) {          // about to run
 }
 static void GateRegister(HANDLE game_handle, DWORD tid) {
     HANDLE d;
-    if (NGT >= 128 || !DuplicateHandle(GetCurrentProcess(), game_handle, GetCurrentProcess(), &d, SYNCHRONIZE, FALSE, 0)) return;
-    GT[NGT].tid = tid; GT[NGT].h = d; GT[NGT].idle = 0;
-    MemoryBarrier();
-    NGT++;
+    if (!DuplicateHandle(GetCurrentProcess(), game_handle, GetCurrentProcess(), &d, SYNCHRONIZE, FALSE, 0)) return;
+    AcquireSRWLockExclusive(&GtLock);
+    LONG slot = -1;
+    for (LONG i = 0; i < NGT; i++)                       // the game starts short-lived loader threads all the time: reuse the entry of one that has exited
+        if (WaitForSingleObject(GT[i].h, 0) == WAIT_OBJECT_0) { slot = i; break; }
+    if (slot >= 0) CloseHandle(GT[slot].h);
+    else if (NGT < 128) slot = NGT;
+    if (slot < 0) { ReleaseSRWLockExclusive(&GtLock); CloseHandle(d); return; }
+    GT[slot].tid = tid; GT[slot].h = d; GT[slot].idle = 0; GT[slot].quiet = 0;
+    if (slot == NGT) NGT++;
+    ReleaseSRWLockExclusive(&GtLock);
 }
 static bool ParkAll() {
     GateClosed = 1;
     MemoryBarrier();
     for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 2000;) {
         bool all = true;
+        AcquireSRWLockShared(&GtLock);
         for (LONG i = 0; i < NGT; i++)
             if (!(GT[i].idle && GT[i].quiet) && WaitForSingleObject(GT[i].h, 0) != WAIT_OBJECT_0) all = false;     // a thread in a wait is not enough: it may be half way through a job
+        ReleaseSRWLockShared(&GtLock);
         if (all) return true;
         Sleep(0);
     }
@@ -306,7 +320,9 @@ static bool ParkAll() {
 static void UnparkAll() { GateClosed = 0; MemoryBarrier(); }
 static DWORD GameTidList(DWORD* out, DWORD max) {
     DWORD n = 0;
+    AcquireSRWLockShared(&GtLock);
     for (LONG i = 0; i < NGT && n < max; i++) out[n++] = GT[i].tid;
+    ReleaseSRWLockShared(&GtLock);
     return n;
 }
 
@@ -592,16 +608,21 @@ static ULONG __stdcall H_ZRelease(void* self) {
 }
 static void ZPatch(void* obj) {
     if (!obj || ZFind(obj) || NZC >= 64) return;
-    void** vt = *(void***)obj;
-    DWORD old;
-    if (!VirtualProtect(&vt[1], 8, PAGE_READWRITE, &old)) return;
-    ZC[NZC].vt = vt;
-    ZC[NZC].addref = (ULONG (__stdcall*)(void*))vt[1];
-    ZC[NZC].release = (ULONG (__stdcall*)(void*))vt[2];
-    MemoryBarrier();
-    NZC++;
-    vt[2] = (void*)H_ZRelease;
-    VirtualProtect(&vt[1], 8, old, &old);
+    AcquireSRWLockExclusive(&ZLock);                 // two threads creating the first object of a class: the second must not take our wrapper for the original Release
+    if (!ZFind(obj) && NZC < 64) {
+        void** vt = *(void***)obj;
+        DWORD old;
+        if (VirtualProtect(&vt[1], 8, PAGE_READWRITE, &old)) {
+            ZC[NZC].vt = vt;
+            ZC[NZC].addref = (ULONG (__stdcall*)(void*))vt[1];
+            ZC[NZC].release = (ULONG (__stdcall*)(void*))vt[2];
+            MemoryBarrier();
+            NZC++;
+            vt[2] = (void*)H_ZRelease;
+            VirtualProtect(&vt[1], 8, old, &old);
+        }
+    }
+    ReleaseSRWLockExclusive(&ZLock);
 }
 // Render command 29 (handler exe+0x29F6F0) releases two objects: cmd+0xC -> +0x14 -> objects at +4 and +8, each through
 // its vtable slot 2 (Release). They are not made by a device method the hook covers above, so on the title screen (about
@@ -795,9 +816,10 @@ static DWORD WINAPI ArmThread(LPVOID arg) {         // runs on a helper thread s
     return 0;
 }
 static void ArmAll(uint32_t addr) {
+    if (addr) RngWatch = addr;                       // the handler ignores a hit it does not know about, and the game dies of the unhandled single step: it must know the address before any thread is armed
     HANDLE h = CreateThread(nullptr, 0, ArmThread, (LPVOID)(uintptr_t)addr, 0, nullptr);
     if (h) { WaitForSingleObject(h, 5000); CloseHandle(h); }
-    RngWatch = addr;
+    RngWatch = addr;                                 // disarming: only now that no thread can still hit it
 }
 static bool RngLogWanted() {
     return S->rng_log && (S->draw_from == 0 || S->frame + 300 >= S->draw_from);
@@ -836,8 +858,10 @@ static LONG CALLBACK RngVeh(EXCEPTION_POINTERS* e) {
             }
         }
     }
-    uint32_t i = InterlockedIncrement((volatile LONG*)&S->rng_log_n) - 1;
+    uint32_t i = S->rng_log_n;                       // write the entry first, then publish it: the editor reads up to rng_log_n at any moment
     S->rng_log_buf[i & (RNG_LOG_MAX - 1)] = en;
+    MemoryBarrier();
+    S->rng_log_n = i + 1;
     c->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -1160,13 +1184,13 @@ static void XaCrashInfo(void* cb, char* out, int n) {
         live++;
         if (v.cb == cb) {
             found++;
+            if (lstrlenA(out) + 150 + 320 > n) continue;        // keep room for the summary below: `out` is a fixed buffer and cb is whatever edx held
             wsprintfA(out + lstrlenA(out), "voice#%d proxy %08X real %08X created %u destroyed %u real_dead %d recreatable %d; ", i, (unsigned)(uintptr_t)&v.px, (unsigned)(uintptr_t)v.px.real,
                       v.created, v.destroyed, (int)v.real_dead, (int)v.recreatable);
         }
     }
     wsprintfA(out + lstrlenA(out), "%d voices match cb, %d live, XaSerial %u, slot0 serial %u, shim calls %ld forwarded %ld, gate %ld, TABLE OVERFLOWS %ld, LOST VOICES %ld", found, live, XaSerial,
               SlotSerial[0], ShimCalls, ShimForwarded, XaCbGate, XaOverflow, XaLost);
-    (void)n;
 }
 
 static void XaReap() {                       // forget destroyed voices that no saved slot can bring back
@@ -1471,7 +1495,10 @@ static void SnapAfterCopy(const snap::Slot& sn) {
     s->advance = 0;
     s->hold = 1;
     s->paused = 0;
+    EnterCriticalSection(&ThCs);            // the threads the game started after the save are gone: drop our handles to them
+    for (int i = 0; i < NPending; i++) CloseHandle(Pending[i]);
     NPending = 0;
+    LeaveCriticalSection(&ThCs);
     XaEv(9, nullptr, nullptr, nullptr);
     for (auto& v : Voices)                  // the game's memory is the saved one again: its callbacks are valid for the voices it knows
         if (v.in_use && !v.real_dead) { v.cb_alive = 1; v.inflight = 0; }
