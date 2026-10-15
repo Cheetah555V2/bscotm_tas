@@ -562,6 +562,16 @@ static void ZDrain() {
     ZPublish();
     ReleaseSRWLockExclusive(&ZLock);
 }
+// Called with the game frozen, before the memory of `slot` is put back. Objects the game released after that save are
+// alive again in the restored memory (the game holds pointers to them and will release them a second time), so they must
+// not be destroyed until that second release: park them at the highest serial. ZKeep re-stamps them then.
+static void ZBeforeRestore(int slot) {
+    AcquireSRWLockExclusive(&ZLock);
+    uint32_t t = ZSlot[slot];
+    for (int i = 0; i < ZCount; i++) if (ZList[i].seq > t) ZList[i].seq = 0xFFFFFFFFu;
+    ZFreeBelow = 0;                                  // a pending free was worked out for the old situation
+    ReleaseSRWLockExclusive(&ZLock);
+}
 // Called with the game frozen, right after a save into `slot`.
 static void ZOnSave(int slot) {
     AcquireSRWLockExclusive(&ZLock);
@@ -1535,6 +1545,7 @@ static void HandleSnap(Shm* s, uint32_t f, int64_t frozen) {
         MemoryBarrier();
         for (auto& v : Voices) if (v.in_use) XaWaitIdle(&v);
         XaBeforeRestore((int)slot);
+        ZBeforeRestore((int)slot);
         XaPause();
         snap::Restore(&snap::Slots[slot], SnapAfterCopy);      // does not return
     } else {

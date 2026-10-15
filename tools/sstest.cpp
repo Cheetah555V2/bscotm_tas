@@ -222,7 +222,7 @@ int wmain(int argc, wchar_t** argv) {
     if (argc < 2) { puts("usage: sstest movie.bscotm --exe X --dll X --baseline X --prelude X [--at N] [--gap N] [--reps N] [--speed N]"); return 2; }
     RunParams p;
     std::wstring moviePath = argv[1], preludePath, otherPath;
-    uint32_t at = 2000, gap = 300, reps = 3, speed = 24000, altoff = 0, alts = 3, soak = 0, cmpupto = 0, cmpchunk = 2000, cmpvariant = 0, nostates = 0, peekat = 0, cntfrom = 0, cntto = 0, dropcb = 0, rngscan = 0, maskarg = 0, dumprow = 0, quant = 60, lockarg = 3, lockstep = 0, loadatarg = 0, histarg = 1, padarg = 2; std::string dumppath = "dump.bin";
+    uint32_t at = 2000, gap = 300, reps = 3, speed = 24000, altoff = 0, alts = 3, soak = 0, thrash = 0, cmpupto = 0, cmpchunk = 2000, cmpvariant = 0, nostates = 0, peekat = 0, cntfrom = 0, cntto = 0, dropcb = 0, rngscan = 0, maskarg = 0, dumprow = 0, quant = 60, lockarg = 3, lockstep = 0, loadatarg = 0, histarg = 1, padarg = 2; std::string dumppath = "dump.bin";
     for (int i = 2; i + 1 < argc; i += 2) {
         std::wstring k = argv[i], v = argv[i + 1];
         if (k == L"--exe") p.exe = v;
@@ -236,6 +236,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (k == L"--altoff") altoff = _wtoi(v.c_str());
         else if (k == L"--alts") alts = _wtoi(v.c_str());
         else if (k == L"--soak") soak = _wtoi(v.c_str());
+        else if (k == L"--thrash") thrash = _wtoi(v.c_str());
         else if (k == L"--cmp") cmpupto = _wtoi(v.c_str());
         else if (k == L"--cmpchunk") cmpchunk = _wtoi(v.c_str());
         else if (k == L"--variant") cmpvariant = _wtoi(v.c_str());
@@ -448,6 +449,25 @@ int wmain(int argc, wchar_t** argv) {
         KillGame();
         return 0;
     }
+
+    if (thrash) {       // load after objects were released: save before a stage change (slot 0) and after it (slot 1), then load slot 0,
+                        // run a little, overwrite slot 0 and run through the stage change again, several times
+        const uint32_t A = thrash;
+        if (!RunTo(ss, p.movie, A, speed) || !ss.SaveState(0)) { puts("FAIL: first save"); ss.Close(); KillGame(); return 1; }
+        if (!RunTo(ss, p.movie, A + 700, speed) || !ss.SaveState(1)) { puts("FAIL: second save"); ss.Close(); KillGame(); return 1; }
+        printf("saved rows %u and %u; D3D kept %u, destroyed %u, held %u\n", A, A + 700, ss.s->zombie_stats[0], ss.s->zombie_stats[1], ss.s->zombie_stats[2]);
+        for (int rep = 1; rep <= 4; rep++) {
+            if (!ss.LoadState(0)) { printf("FAIL: LoadState (rep %d)\n", rep); ss.Close(); KillGame(); return 1; }
+            if (!RunTo(ss, p.movie, A + 100, speed) || !ss.SaveState(0)) { printf("FAIL: save over slot 0 (rep %d)\n", rep); ss.Close(); KillGame(); return 1; }
+            if (!RunTo(ss, p.movie, A + 900, speed)) { printf("FAIL: crashed or hung running through the stage change after load %d\n", rep); ss.Close(); KillGame(); return 1; }
+            printf("rep %d ok; D3D kept %u, destroyed %u, held %u\n", rep, ss.s->zombie_stats[0], ss.s->zombie_stats[1], ss.s->zombie_stats[2]);
+        }
+        puts("VERDICT: PASS (no crash or hang)");
+        ss.Close();
+        KillGame();
+        return 0;
+    }
+
 
     if (soak) {         // memory use over a long movie: run forward, save a state into a rotating slot every `soak` frames
         auto mem = [&](const char* tag, uint32_t row, DWORD ms) {
