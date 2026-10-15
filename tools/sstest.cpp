@@ -463,7 +463,7 @@ int wmain(int argc, wchar_t** argv) {
             if (!RunTo(ss, p.movie, A + 900, speed)) { printf("FAIL: crashed or hung running through the stage change after load %d\n", rep); ss.Close(); KillGame(); return 1; }
             PROCESS_MEMORY_COUNTERS_EX pm{};
             GetProcessMemoryInfo(ss.proc, (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm);
-            printf("rep %d ok; D3D kept %u, destroyed %u, held %u; game private %.0f MB\n", rep, ss.s->zombie_stats[0], ss.s->zombie_stats[1], ss.s->zombie_stats[2], pm.PrivateUsage / 1048576.0);
+            printf("rep %d ok; D3D kept %u, destroyed %u, held %u, orphans destroyed %u; game private %.0f MB, state pool %.0f MB\n", rep, ss.s->zombie_stats[0], ss.s->zombie_stats[1], ss.s->zombie_stats[2], ss.s->zombie_stats[4], pm.PrivateUsage / 1048576.0, ss.s->snap_stats[0] * 4096 / 1048576.0);
         }
         puts("VERDICT: PASS (no crash or hang)");
         ss.Close();
