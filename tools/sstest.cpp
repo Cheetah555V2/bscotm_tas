@@ -456,11 +456,14 @@ int wmain(int argc, wchar_t** argv) {
         if (!RunTo(ss, p.movie, A, speed) || !ss.SaveState(0)) { puts("FAIL: first save"); ss.Close(); KillGame(); return 1; }
         if (!RunTo(ss, p.movie, A + 700, speed) || !ss.SaveState(1)) { puts("FAIL: second save"); ss.Close(); KillGame(); return 1; }
         printf("saved rows %u and %u; D3D kept %u, destroyed %u, held %u\n", A, A + 700, ss.s->zombie_stats[0], ss.s->zombie_stats[1], ss.s->zombie_stats[2]);
-        for (int rep = 1; rep <= 4; rep++) {
+        const int thrashReps = reps > 3 ? (int)reps : 4;             // --reps N: more rounds, to see whether memory grows with every load
+        for (int rep = 1; rep <= thrashReps; rep++) {
             if (!ss.LoadState(0)) { printf("FAIL: LoadState (rep %d)\n", rep); ss.Close(); KillGame(); return 1; }
             if (!RunTo(ss, p.movie, A + 100, speed) || !ss.SaveState(0)) { printf("FAIL: save over slot 0 (rep %d)\n", rep); ss.Close(); KillGame(); return 1; }
             if (!RunTo(ss, p.movie, A + 900, speed)) { printf("FAIL: crashed or hung running through the stage change after load %d\n", rep); ss.Close(); KillGame(); return 1; }
-            printf("rep %d ok; D3D kept %u, destroyed %u, held %u\n", rep, ss.s->zombie_stats[0], ss.s->zombie_stats[1], ss.s->zombie_stats[2]);
+            PROCESS_MEMORY_COUNTERS_EX pm{};
+            GetProcessMemoryInfo(ss.proc, (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm);
+            printf("rep %d ok; D3D kept %u, destroyed %u, held %u; game private %.0f MB\n", rep, ss.s->zombie_stats[0], ss.s->zombie_stats[1], ss.s->zombie_stats[2], pm.PrivateUsage / 1048576.0);
         }
         puts("VERDICT: PASS (no crash or hang)");
         ss.Close();
