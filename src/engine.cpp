@@ -56,15 +56,17 @@ static bool FindGamePid(DWORD* pid) {
 
 bool GameRunning() { DWORD pid; return FindGamePid(&pid); }
 
-void KillGame() {
+bool KillGame() {
     DWORD pid;
-    while (FindGamePid(&pid)) {
+    for (int tries = 0; FindGamePid(&pid); tries++) {
+        if (tries >= 5) return false;                 // it will not die: the caller must not go on as if it were gone
         HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
-        if (!h) return;
+        if (!h) return false;                         // no right to close it (it runs elevated, or it is another user's)
         TerminateProcess(h, 0);
         WaitForSingleObject(h, 5000);
         CloseHandle(h);
     }
+    return true;
 }
 
 // Returns nullptr on success, else a short description of what failed.
@@ -89,15 +91,18 @@ static const char* Inject(HANDLE proc, const std::wstring& dll) {
 }
 
 // ---- session ----------------------------------------------------------------
+void (*SessionIdleHook)() = nullptr;
+static inline void Idle() { if (SessionIdleHook) SessionIdleHook(); }
+
 bool Session::Alive() const { return proc && WaitForSingleObject(proc, 0) != WAIT_OBJECT_0; }
 
 uint32_t Session::Row() const {
-    if (!s || !s->paused) return (uint32_t)-1;
+    if (!s || !s->paused || s->paused - 1 < pre) return (uint32_t)-1;       // frozen inside the prelude: no movie row yet
     return s->paused - 1 - pre;
 }
 
 bool Session::Step(KeyMask keys) {
-    if (!s || !s->paused) return false;
+    if (!s || !s->paused || s->paused > MAX_FRAMES) return false;
     uint32_t f = s->paused;
     s->keys[f - 1] = keys;
     MemoryBarrier();
@@ -105,13 +110,13 @@ bool Session::Step(KeyMask keys) {
     for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 3000;) {
         if (s->paused == f + 1) return true;
         if (!Alive()) return false;
-        Sleep(1);
+        Sleep(1); Idle();
     }
     return false;
 }
 
 bool Session::BeginSteps(const KeyMask* keys, uint32_t n, uint32_t speed_milli) {
-    if (!s || !s->paused || !n || s->paused - 1 + n > MAX_FRAMES) return false;
+    if (!s || !s->paused || !n || n > MAX_FRAMES || s->paused - 1 + n > MAX_FRAMES) return false;
     uint32_t f = s->paused;
     for (uint32_t i = 0; i < n; i++) s->keys[f - 1 + i] = keys[i];
     step_start = f;
@@ -140,7 +145,7 @@ int Session::PollSteps() {
 
 void Session::AbortSteps() {
     s->advance = 0;
-    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 3000 && !s->paused && Alive();) Sleep(1);
+    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 3000 && !s->paused && Alive();) { Sleep(1); Idle(); }
     s->speed_milli = 1000;
 }
 
@@ -157,12 +162,12 @@ bool Session::SaveState(int slot) {
         for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 10000;) {
             if (!s->snap_cmd) { answered = true; break; }
             if (!Alive()) return false;
-            Sleep(1);
+            Sleep(1); Idle();
         }
         if (!answered) return false;
         if (s->snap_result == 1) return true;
         if (s->snap_diag[0] != 0xFFFFFFFFu) return false;       // a real failure, not "busy"
-        Sleep(250);
+        for (int k = 0; k < 5; k++) { Sleep(50); Idle(); }
     }
     return false;
 }
@@ -183,7 +188,7 @@ bool Session::LoadState(int slot) {
         if (!s->snap_cmd && s->paused == want) return s->snap_result == 1;
         if (!s->snap_cmd && s->snap_result == 2) return false;
         if (!Alive()) return false;
-        Sleep(1);
+        Sleep(1); Idle();
     }
     return false;
 }
@@ -209,7 +214,7 @@ bool Session::StopRecording(Frames& out) {
     for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 3000;) {
         if (s->paused) { frozen = true; break; }
         if (!Alive()) break;
-        Sleep(1);
+        Sleep(1); Idle();
     }
     uint32_t end = s->rec_count;
     out.clear();
@@ -246,7 +251,7 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     if (p.target > p.movie.size()) { r.error = "Target is past the end of the movie."; return r; }
 
     report(PH_LAUNCH, 0);
-    KillGame();
+    if (!KillGame()) { r.error = "A running COTM.exe could not be closed (is it elevated, or another user's?). Close it and try again."; return r; }
     if (!p.baseline.empty()) {
         if (!p.backup_dir.empty()) CopySaves(DirOf(p.exe), p.backup_dir);
         CopySaves(p.baseline, DirOf(p.exe));
@@ -258,6 +263,10 @@ RunResult RunJob(const RunParams& p, const RunCallbacks& cb, Session* keep) {
     if (!ss.map) { r.error = "CreateFileMapping failed."; return r; }
     Shm* s = ss.s = (Shm*)MapViewOfFile(ss.map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
     if (!s) { ss.Close(); r.error = "MapViewOfFile failed."; return r; }
+    {   // the name is shared: a block left by a build with a smaller layout would be overrun by the memset below
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(s, &mbi, sizeof mbi) || mbi.RegionSize < sizeof(Shm)) { ss.Close(); r.error = "The game link block has the wrong size (another bscotm_tas build is running?)."; return r; }
+    }
     memset(s, 0, sizeof(Shm));
     s->magic = SHM_MAGIC;
     s->rng_on = p.seeded ? 1 : 0;       // set before the game starts: it reads the clock during start-up

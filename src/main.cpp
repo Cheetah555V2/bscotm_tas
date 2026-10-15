@@ -3742,6 +3742,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) acc[i] = ACCEL{keys[i].f, keys[i].k, keys[i].c};
     HACCEL ha = CreateAcceleratorTableW(acc, (int)(sizeof keys / sizeof keys[0]));
 
+    SessionIdleHook = [] { MSG q; PeekMessageW(&q, nullptr, 0, 0, PM_NOREMOVE); };      // see engine.h
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
         // The editor's shortcuts belong to the main window: in a tool window (Help, Branches, Notes ...) Ctrl+A / Ctrl+X / Ctrl+Z
