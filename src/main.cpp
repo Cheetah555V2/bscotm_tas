@@ -906,6 +906,12 @@ void PaintTo(int row) {     // paint dragCol from the last row to `row`
     A.dragRow = row;
 }
 
+// Ends a paint-drag or a row selection: the painted cells become one undo step. Safe to call when nothing is going on.
+void EndPaintDrag() {
+    if (A.dragging) Commit(A.drag);
+    A.dragging = A.selecting = false;
+}
+
 LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_PAINT: PaintGrid(h); return 0;
@@ -941,9 +947,12 @@ LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_LBUTTONUP:
-            if (A.dragging) Commit(A.drag);
-            A.dragging = A.selecting = false;
+            EndPaintDrag();
             ReleaseCapture();
+            return 0;
+        case WM_CAPTURECHANGED:             // Alt-Tab, a dialog or a menu took the mouse away mid-drag: what was painted is committed, not left half done
+        case WM_CANCELMODE:
+            EndPaintDrag();
             return 0;
         case WM_RBUTTONUP: {
             int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
@@ -2772,6 +2781,12 @@ void StartJob(bool record, uint32_t target, bool fresh, bool realtime = false, b
     EnableUi();
     SetMsg(L"Launching the game...");
     A.thread = CreateThread(nullptr, 0, JobThread, j, 0, nullptr);
+    if (!A.thread) {                    // no thread: nothing will ever report back, so do not stay busy
+        delete j;
+        A.busy = false;
+        EnableUi();
+        SetMsg(L"Could not start the worker thread (out of resources?).");
+    }
 }
 
 // ---- verify fast-forward ------------------------------------------------------------------------
@@ -2923,6 +2938,12 @@ void VerifyFastForward() {
     EnableUi();
     SetMsg(L"Verifying...");
     A.thread = CreateThread(nullptr, 0, VerifyThread, va, 0, nullptr);
+    if (!A.thread) {
+        delete va;
+        A.busy = false;
+        EnableUi();
+        SetMsg(L"Could not start the worker thread (out of resources?).");
+    }
 }
 
 void OnVerifyDone(std::wstring* report) {
@@ -3503,6 +3524,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_COMMAND:
+            EndPaintDrag();                 // a shortcut pressed mid-drag (Ctrl+Z ...) must see the painted cells as one finished step
             switch (LOWORD(wp)) {
                 case IDM_NEW: FileNew(); break;
                 case IDM_OPEN: FileOpen(); break;
@@ -3552,6 +3574,7 @@ LRESULT CALLBACK MainProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_RNGLOG: ShowRngLog(); break;
                 case IDM_PLAY: StartJob(false, (uint32_t)Size(), false, true); break;
                 case IDM_REWIND:
+                    if (Size() && A.cursor >= Size()) SetCursorRow(Size() - 1, false);       // the empty row past the end: the run to the cursor would add a blank frame
                     if (Size() && RewindWithState(std::min(A.cursor, Size() - 1))) break;
                     StartJob(false, (uint32_t)std::min(A.cursor + 1, Size()), false, false, true);
                     break;
