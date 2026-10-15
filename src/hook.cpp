@@ -530,10 +530,11 @@ static volatile LONG ZombieKept;                     // releases swallowed (stat
 static volatile LONG ZombieFreed;                    // kept objects finally destroyed (statistics)
 static volatile LONG ZombieUntracked;                // kept but not listed because the list was full
 static volatile LONG ZombieOrphans;                  // objects created after a save that a load made unreachable, destroyed (statistics)
+static volatile LONG ZPassThrough;                   // set while IDirect3DDevice9::Reset runs: Direct3D then releases its own references through the same vtable, and swallowing those would keep the resources alive and make the Reset fail
 // Kept objects are given back once no saved state can bring them back: ZSerial counts deaths and saves; an object
 // that died (ZSeq) before the oldest saved slot was taken (ZSlot) is only a dangling pointer in every restorable
 // memory image, and the game never touches such a pointer (it did not the first time either).
-struct ZZombie { void* obj; ZClass* z; uint32_t seq; uint32_t born; bool live; };   // born: ZSerial at creation (0 = before tracking); live: the game still owns it; seq: ZSerial when the game released it
+struct ZZombie { void* obj; ZClass* z; uint32_t seq; uint32_t born; bool live; bool defpool; };   // born: ZSerial at creation (0 = before tracking); live: the game still owns it; seq: ZSerial when the game released it
 static const int ZMAX = 65536;
 static ZZombie* ZList;                               // VirtualAlloc'd on first use; when full, further objects are simply never freed
 static int ZCount;
@@ -566,22 +567,36 @@ static bool InGameExe(const void* addr) {
     }
     return (uintptr_t)addr >= ExeBase && (uintptr_t)addr < ExeBase + size;
 }
+// Is a device-created object in D3DPOOL_DEFAULT (video memory)? Those must all be gone before IDirect3DDevice9::Reset can succeed.
+static bool IsDefaultPool(int slot, const uintptr_t* a) {
+    switch (slot) {
+        case 23: return a[5] == 0;                   // CreateTexture: Pool is the 6th argument
+        case 24: return a[6] == 0;                   // CreateVolumeTexture
+        case 25: return a[4] == 0;                   // CreateCubeTexture
+        case 26: case 27: case 36: return a[3] == 0; // CreateVertexBuffer / IndexBuffer / OffscreenPlainSurface
+        case 28: case 29: return true;               // render targets and depth buffers are always DEFAULT
+    }
+    return false;
+}
 static void ZTrack(void* obj, const void* caller, int slot, const uintptr_t* args) {
-    // Made inside a library (d3dx9 ...): it may be an internal object (a sprite's buffer, a font's glyph texture) that the library
-    // keeps in memory a restore does not touch, so a load must not destroy it. The textures the game loads through the library are
-    // what its memory points to, and they are most of the memory a load would leak, so MANAGED ones are tracked too. Measured on
-    // a movie that crosses a stage change: the game's own objects plus library MANAGED textures are safe (flat memory over 40 loads,
-    // replays identical); also taking DEFAULT-pool library textures crashed d3d9 after a load, and SYSTEMMEM / SCRATCH ones crashed
-    // the Steam overlay.
-    if (!InGameExe(caller) && !(slot == 23 && args[5] == 1/* D3DPOOL_MANAGED */)) return;
+    // Every created object is listed (live) so that its pool is known when the game releases it. Only some may be destroyed
+    // by a load (`born` set): made inside a library (d3dx9 ...) an object may be internal (a sprite's buffer, a font's glyph
+    // texture) that the library keeps in memory a restore does not touch. The textures the game loads through the library
+    // are what its memory points to, and they are most of the memory a load would leak, so MANAGED ones count too. Measured on
+    // a movie that crosses a stage change: the game's own objects plus library MANAGED textures are safe (flat memory over 40
+    // loads, replays identical); also taking DEFAULT-pool library textures crashed d3d9 after a load, and SYSTEMMEM / SCRATCH
+    // ones crashed the Steam overlay.
+    bool orphanable = InGameExe(caller) || (slot == 23 && args[5] == 1 /* D3DPOOL_MANAGED */);
+    bool def = IsDefaultPool(slot, args);
     ZClass* z = ZFind(obj);
     if (!z) return;
     AcquireSRWLockExclusive(&ZLock);
     ZEnsureList();
     if (ZList) {
+        uint32_t born = orphanable ? ++ZSerial : 0;
         ZZombie* e = ZLookup(obj);                   // the address of an object that was really destroyed since can come back
-        if (e) { e->z = z; e->seq = 0; e->born = ++ZSerial; e->live = true; }
-        else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, 0, ++ZSerial, true};
+        if (e) { *e = {obj, z, 0, born, true, def}; }
+        else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, 0, born, true, def};
     }
     ReleaseSRWLockExclusive(&ZLock);
 }
@@ -601,7 +616,7 @@ static void ZKeep(void* obj, ZClass* z) {
     if (ZList) {
         ZZombie* e = ZLookup(obj);                   // known: died before, was brought back by a restore, died again; or tracked since its creation
         if (e) { e->live = false; e->seq = ++ZSerial; }
-        else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, ++ZSerial, 0, false};
+        else if (ZCount < ZMAX) ZList[ZCount++] = {obj, z, ++ZSerial, 0, false, false};
         else InterlockedIncrement(&ZombieUntracked);
     }
     InterlockedIncrement(&ZombieKept);
@@ -659,6 +674,27 @@ static void ZBeforeRestore(int slot, bool threadsParked) {
     ReleaseSRWLockExclusive(&ZLock);
     for (int k = 0; k < n; k++) { v[k].z->release(v[k].obj); InterlockedIncrement(&ZombieOrphans); }
 }
+// IDirect3DDevice9::Reset fails while any DEFAULT-pool resource is alive, and the hook keeps released ones alive: give all of them
+// back just before a Reset (a window resize or a fullscreen toggle makes the game call it). A state saved earlier may point at
+// them, and a Reset invalidates the device's resources anyway, so no saved state is safe to load after this: they are dropped.
+static int ZReleaseAllReleased() {
+    static ZVictim* v;
+    if (!v) v = (ZVictim*)VirtualAlloc(nullptr, ZMAX * sizeof(ZVictim), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    int n = 0;
+    AcquireSRWLockExclusive(&ZLock);
+    int keep = 0;
+    for (int i = 0; i < ZCount; i++) {
+        if (v && !ZList[i].live) v[n++] = {ZList[i].obj, ZList[i].z};     // every released object: surfaces fetched from textures are not created by a call we hook, so their pool is unknown
+        else ZList[keep++] = ZList[i];
+    }
+    ZCount = keep;
+    for (int i = 0; i < 8; i++) { ZSlot[i] = 0; snap::Slots[i].valid = false; }
+    ZFreeBelow = 0;
+    ZPublish();
+    ReleaseSRWLockExclusive(&ZLock);
+    for (int k = 0; k < n; k++) v[k].z->release(v[k].obj);
+    return n;
+}
 // Called with the game frozen, right after a save into `slot`.
 static void ZOnSave(int slot) {
     AcquireSRWLockExclusive(&ZLock);
@@ -671,6 +707,7 @@ static void ZOnSave(int slot) {
 static ULONG __stdcall H_ZRelease(void* self) {
     ZClass* z = ZFind(self);
     if (!z) return 0;
+    if (ZPassThrough) return z->release(self);
     ZDrain();                                        // on a game thread that releases D3D objects anyway
     ULONG c = z->addref(self);                       // the count including this temporary reference
     if (c <= 2) { z->release(self); ZKeep(self, z); return 0; }
@@ -761,13 +798,47 @@ ZH2(Z_CreateVertexDecl, 86, 1)       // pVertexElements ppDecl
 ZH2(Z_CreateVertexShader, 91, 1)     // pFunction ppShader
 ZH2(Z_CreatePixelShader, 106, 1)     // pFunction ppShader
 ZH2(Z_CreateQuery, 118, 1)           // Type ppQuery
+// IDirect3DDevice9::Reset (slot 16) fails while any DEFAULT-pool resource is alive, and with savestates on the hook keeps
+// released resources alive. Counted and logged (a rare event) to see whether the game ever does this: %TEMP%\bscotm_reset.txt.
+static volatile LONG ResetCalls, ResetFailed;
+static void* R_Reset;
+static HRESULT __stdcall H_ResetDev(void* d, void* pp) {
+    int released = ZReleaseAllReleased();
+    ZPassThrough = 1;
+    HRESULT hr = ((HRESULT (__stdcall*)(void*, void*))R_Reset)(d, pp);
+    ZPassThrough = 0;
+    AcquireSRWLockExclusive(&ZLock);                 // the Reset destroyed or recreated resources behind our back: the list no longer matches the objects, start over
+    ZCount = 0;
+    ZPublish();
+    ReleaseSRWLockExclusive(&ZLock);
+    InterlockedIncrement(&ResetCalls);
+    if (hr) InterlockedIncrement(&ResetFailed);
+    if (S) S->zombie_stats[5] = (uint32_t)ResetCalls | ((uint32_t)ResetFailed << 16);
+    char path[MAX_PATH + 32], line[192];
+    GetTempPathA(MAX_PATH, path);
+    strcat(path, "bscotm_reset.txt");
+    HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        int liveDef = 0, liveAll = 0;
+        AcquireSRWLockShared(&ZLock);
+        for (int i = 0; i < ZCount; i++) if (ZList[i].live) { liveAll++; if (ZList[i].defpool) liveDef++; }
+        ReleaseSRWLockShared(&ZLock);
+        DWORD* ppd = (DWORD*)pp;                      // D3DPRESENT_PARAMETERS: BackBufferWidth, BackBufferHeight, ...
+        wsprintfA(line, "Reset #%ld hr %08X (back buffer %lux%lu); %d released objects given back first; the game still owns %d tracked objects, %d of them default-pool\r\n",
+                  ResetCalls, (unsigned)hr, ppd ? ppd[0] : 0, ppd ? ppd[1] : 0, released, liveAll, liveDef);
+        WriteFile(f, line, lstrlenA(line), &w, nullptr);
+        CloseHandle(f);
+    }
+    return hr;
+}
 static void PatchDeviceCreators(void* dev) {
     void** vt = *(void***)dev;
     struct { int slot; void* hook; } t[] = {
         {23, (void*)Z_CreateTexture}, {24, (void*)Z_CreateVolumeTexture}, {25, (void*)Z_CreateCubeTexture}, {26, (void*)Z_CreateVertexBuffer},
         {27, (void*)Z_CreateIndexBuffer}, {28, (void*)Z_CreateRenderTarget}, {29, (void*)Z_CreateDepthStencil}, {36, (void*)Z_CreateOffscreen},
         {59, (void*)Z_CreateStateBlock}, {61, (void*)Z_EndStateBlock}, {86, (void*)Z_CreateVertexDecl}, {91, (void*)Z_CreateVertexShader},
-        {106, (void*)Z_CreatePixelShader}, {118, (void*)Z_CreateQuery},
+        {106, (void*)Z_CreatePixelShader}, {118, (void*)Z_CreateQuery}
     };
     for (auto& e : t) {
         if (DevOrig[e.slot]) continue;                  // shared vtable, already done
@@ -783,7 +854,7 @@ static void PatchDevice(void* dev) {
     void** vt = *(void***)dev;
     struct { int slot; void* hook; void* real; } t[] = {
         {17, (void*)H_Present, &R_Present}, {43, (void*)H_Clear, &R_Clear}, {81, (void*)H_Dp, &R_Dp},
-        {82, (void*)H_Dip, &R_Dip}, {83, (void*)H_Dpup, &R_Dpup}, {84, (void*)H_Dipup, &R_Dipup},
+        {82, (void*)H_Dip, &R_Dip}, {83, (void*)H_Dpup, &R_Dpup}, {84, (void*)H_Dipup, &R_Dipup}, {16, (void*)H_ResetDev, &R_Reset},
     };
     for (auto& e : t) {
         if (*(void**)e.real) continue;                  // already patched (shared vtable)
@@ -955,14 +1026,11 @@ static bool XaIsRealVoice(uintptr_t a);
 static void XaFindInternal(HANDLE f, uintptr_t obj);
 static void DumpFirstCreates(HANDLE f);
 static void XaDumpEvents(HANDLE f, uint32_t cb, uint32_t realv);
-static LONG CALLBACK CrashVeh(PEXCEPTION_POINTERS ep) {
+static LONG WriteCrashLog(PEXCEPTION_POINTERS ep, const char* file) {
     DWORD c = ep->ExceptionRecord->ExceptionCode;
-    if (c != 0xC0000005 && c != 0xC0000094 && c != 0xC000001D && c != 0xC0000096 && c != 0xC00000FD && c != 0xC0000374 && c != 0xC0000409) return EXCEPTION_CONTINUE_SEARCH;
-    static volatile LONG once;
-    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
     char path[MAX_PATH + 32];
     GetTempPathA(MAX_PATH, path);
-    strcat(path, "bscotm_crash.txt");
+    strcat(path, file);
     HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return EXCEPTION_CONTINUE_SEARCH;
     uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
@@ -1055,6 +1123,21 @@ static LONG CALLBACK CrashVeh(PEXCEPTION_POINTERS ep) {
     wsprintfA(b, "fault address module: %s\r\n", mn0[0] ? mn0 : "(none: not inside any module)");
     put(b);
     CloseHandle(f);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// First fatal-looking exception (it may be one the game handles itself): %TEMP%\bscotm_crash.txt.
+static LONG CALLBACK CrashVeh(PEXCEPTION_POINTERS ep) {
+    DWORD c = ep->ExceptionRecord->ExceptionCode;
+    if (c != 0xC0000005 && c != 0xC0000094 && c != 0xC000001D && c != 0xC0000096 && c != 0xC00000FD && c != 0xC0000374 && c != 0xC0000409) return EXCEPTION_CONTINUE_SEARCH;
+    static volatile LONG once;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    return WriteCrashLog(ep, "bscotm_crash.txt");
+}
+// The exception that really ends the game: %TEMP%\bscotm_crash_final.txt. The latch above can have been used up by an
+// access violation the game handled, so the crash that matters would otherwise go unlogged.
+static LONG WINAPI CrashFinal(PEXCEPTION_POINTERS ep) {
+    WriteCrashLog(ep, "bscotm_crash_final.txt");
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -2067,6 +2150,7 @@ static void Init() {
             snap::FindSections(exe);
             GateTls = TlsAlloc();                   // the gate is only used by savestates
             AddVectoredExceptionHandler(1, CrashVeh);
+            SetUnhandledExceptionFilter(CrashFinal);
             snap::ParkHook = ParkAll;
             snap::UnparkHook = UnparkAll;
             snap::GameTids = GameTidList;

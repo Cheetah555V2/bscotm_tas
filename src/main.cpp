@@ -95,6 +95,7 @@ struct App {
     bool ssManual[8] = {};        // slots saved by hand (never evicted automatically)
     bool ssStale[8] = {};         // slots saved before an edit to an earlier row: never loaded again, only overwritten
     uint32_t ssGen[8] = {};       // changes whenever a slot is written (0 = empty): a branch's state is live while its slot still has its number
+    uint32_t ssReset[8] = {};     // the game's Reset count (a window resize or fullscreen toggle) when each slot was saved: a Reset drops every saved state
     uint32_t ssCounter = 0;
     int ghost = -1;               // the branch whose inputs the grid compares with (Branches window: "Show differences in the grid"), -1 = none
     int  chunkFrom = 0;           // first row of the batch being run (Run to cursor runs in pieces so states can be saved between them)
@@ -1264,8 +1265,9 @@ static uint32_t BranchFrame() {
 }
 
 // The branch's savestate still exists in the running game (same slot, not written since).
+static uint32_t ResetsSeen() { return A.sess.s ? (A.sess.s->zombie_stats[5] & 0xFFFF) : 0; }      // IDirect3DDevice9::Reset calls the hook has seen
 static bool BranchStateLive(const Branch& b) {
-    return b.slot >= 0 && b.slot < 8 && b.slotGen && A.ssGen[b.slot] == b.slotGen && StatesOn() && A.sess.StateRow(b.slot) == (int)b.frame;
+    return b.slot >= 0 && b.slot < 8 && b.slotGen && A.ssGen[b.slot] == b.slotGen && A.ssReset[b.slot] == ResetsSeen() && StatesOn() && A.sess.StateRow(b.slot) == (int)b.frame;
 }
 
 // A branch keeps its savestate in this slot. Such a slot is never reused for another state, even when an edit makes it
@@ -2930,7 +2932,7 @@ bool StatesOn() {
 
 bool StateValid(int slot) {
     int r = A.sess.StateRow(slot);
-    return r >= 0 && r <= A.reached && !A.ssStale[slot];
+    return r >= 0 && r <= A.reached && !A.ssStale[slot] && A.ssReset[slot] == ResetsSeen();
 }
 
 int NumStates() {
@@ -3000,6 +3002,7 @@ int SaveStateSlot(bool manual) {
     A.ssManual[slot] = manual || keep;
     A.ssStale[slot] = false;
     A.ssGen[slot] = ++A.ssCounter;
+    A.ssReset[slot] = ResetsSeen();
     return slot;
 }
 bool SaveStateAt(bool manual) { return SaveStateSlot(manual) >= 0; }
